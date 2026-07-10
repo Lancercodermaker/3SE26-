@@ -1,0 +1,33 @@
+sdr_receiver_py_wrapper_competition:
+  ros__parameters:
+    run_mode: competition
+    publish_ros_outputs: true
+    debug_accept_ros_control: false
+    context_topic: /judge/radar_context
+    enable_fallback_topics: true
+    fallback_self_id: 0
+    max_jam_break_level: 3
+    key_publish_min_interval_sec: 0.5
+    key_retry_limit: -1
+    profile_path: ""
+    match_slot: bo3_game1
+    front_end_id: front_end_A
+    enable_micro_tune: false
+    micro_tune_max_hz: 0.0
+    micro_tune_step_hz: 0.0
+    micro_tune_timeout_sec: 0.0
+    status_period_sec: 1.0
+    iq_source_path: ""
+    iq_source_loop: true
+    iq_source_throttle: true
+    iq_source_center_hz: 0.0
+    iq_source_start_offset_sec: 0.0
+    iq_source_sample_rate: 0
+    initial_rf_bw_hz: 0
+    initial_info_filter: ""
+    record_iq: true
+    iq_record_dir: ~/sdr_iq_records
+    iq_record_prefix: competition
+    iq_record_max_sec: 900.0
+    iq_record_max_bytes: 17179869184
+    iq_record_every_n: 1

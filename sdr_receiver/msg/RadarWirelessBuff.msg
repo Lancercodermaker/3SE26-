@@ -1,0 +1,36 @@
+# Command ID: 0x0A05
+# Radar Wireless Link: opponent buffs
+std_msgs/Header header
+uint16 command_id
+bool valid
+
+uint8 hero_hp_recovery
+uint16 hero_cooling_rate
+uint8 hero_defense
+uint8 hero_negative_defense
+uint16 hero_attack
+
+uint8 engineer_hp_recovery
+uint16 engineer_cooling_rate
+uint8 engineer_defense
+uint8 engineer_negative_defense
+uint16 engineer_attack
+
+uint8 infantry3_hp_recovery
+uint16 infantry3_cooling_rate
+uint8 infantry3_defense
+uint8 infantry3_negative_defense
+uint16 infantry3_attack
+
+uint8 infantry4_hp_recovery
+uint16 infantry4_cooling_rate
+uint8 infantry4_defense
+uint8 infantry4_negative_defense
+uint16 infantry4_attack
+
+uint8 sentry_hp_recovery
+uint16 sentry_cooling_rate
+uint8 sentry_defense
+uint8 sentry_negative_defense
+uint16 sentry_attack
+uint8 sentry_posture

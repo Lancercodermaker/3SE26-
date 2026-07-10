@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Runtime artifacts and captures
+*.c64
+*.jsonl
+*.log
+rx_logs/
+
+# ROS 2 / colcon outputs
+install/
+log/
+

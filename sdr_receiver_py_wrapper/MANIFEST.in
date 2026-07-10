@@ -1,0 +1,9 @@
+include package.xml
+include README.md
+include requirements.txt
+include resource/sdr_receiver_py_wrapper
+recursive-include launch *.py
+recursive-include config *.yaml
+recursive-include docs *.md
+recursive-include sdr_receiver_py_wrapper/vendor *.py
+recursive-include test *.py

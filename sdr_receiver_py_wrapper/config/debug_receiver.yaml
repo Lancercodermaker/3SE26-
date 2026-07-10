@@ -1,0 +1,21 @@
+sdr_receiver_py_wrapper_debug:
+  ros__parameters:
+    run_mode: debug
+    publish_ros_outputs: true
+    debug_accept_ros_control: false
+    enable_micro_tune: false
+    status_period_sec: 1.0
+    iq_source_path: ""
+    iq_source_loop: true
+    iq_source_throttle: true
+    iq_source_center_hz: 0.0
+    iq_source_start_offset_sec: 0.0
+    iq_source_sample_rate: 0
+    initial_rf_bw_hz: 0
+    initial_info_filter: ""
+    record_iq: false
+    iq_record_dir: ~/sdr_iq_records
+    iq_record_prefix: debug
+    iq_record_max_sec: 0.0
+    iq_record_max_bytes: 0
+    iq_record_every_n: 1

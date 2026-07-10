@@ -1,0 +1,88 @@
+version: 1
+max_jam_break_level: 3
+allow_competition_micro_tune: false
+
+profile_sets:
+  bo3_game1:
+    front_end_A:
+      context:
+        venue: "replace-before-match"
+        front_end_model: "ad9363-zynq7010"
+      RED:
+        JAM_L1_KEY:
+          rx_lo: 432200000
+          digital_shift: 0
+          rf_bw: 1250000
+          gain: 22
+          filter: L1_default
+        JAM_L2_KEY:
+          rx_lo: 432580000
+          digital_shift: 80000
+          rf_bw: 660000
+          gain: 40
+          filter: hist248
+        JAM_L3_KEY:
+          rx_lo: 433000000
+          digital_shift: 200000
+          rf_bw: 760000
+          gain: 24
+          filter: l3tight
+        INFO_UNDER_L1:
+          rx_lo: 433200000
+          digital_shift: 0
+          rf_bw: 540000
+          gain: 40
+          filter: info_default
+        INFO_UNDER_L2:
+          rx_lo: 433280000
+          digital_shift: 80000
+          rf_bw: 660000
+          gain: 40
+          filter: hist248
+        INFO_UNDER_L3:
+          rx_lo: 433280000
+          digital_shift: 80000
+          rf_bw: 760000
+          gain: 24
+          filter: l3tight
+      BLUE:
+        JAM_L1_KEY:
+          rx_lo: 434920000
+          digital_shift: 0
+          rf_bw: 1250000
+          gain: 22
+          filter: L1_default
+        JAM_L2_KEY:
+          rx_lo: 434540000
+          digital_shift: -80000
+          rf_bw: 660000
+          gain: 40
+          filter: hist248
+        JAM_L3_KEY:
+          rx_lo: 434120000
+          digital_shift: -200000
+          rf_bw: 760000
+          gain: 24
+          filter: l3tight
+        INFO_UNDER_L1:
+          rx_lo: 433920000
+          digital_shift: 0
+          rf_bw: 540000
+          gain: 40
+          filter: info_default
+        INFO_UNDER_L2:
+          rx_lo: 433840000
+          digital_shift: -80000
+          rf_bw: 660000
+          gain: 40
+          filter: hist248
+        INFO_UNDER_L3:
+          rx_lo: 433840000
+          digital_shift: -80000
+          rf_bw: 760000
+          gain: 24
+          filter: l3tight
+  bo3_game2:
+    front_end_B: {}
+  bo3_game3:
+    front_end_C: {}

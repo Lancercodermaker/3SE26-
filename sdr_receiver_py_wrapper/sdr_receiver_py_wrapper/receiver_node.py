@@ -1,0 +1,777 @@
+from __future__ import annotations
+
+import json
+import numbers
+import os
+from pathlib import Path
+import sys
+import threading
+import time
+from typing import Optional
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String, UInt8
+
+from sdr_receiver.msg import JamCode, RadarContext as RadarContextMsg, RadarWirelessFrame
+
+from .competition_controller import CompetitionController, ControllerDecision, RadarContext
+from .original_receiver_adapter import ReceiverCoreAdapter
+from .patches import JamKeyEvent, PatchCallbacks, RawFrameEvent, TargetChangeEvent
+from .profile_import import AdaptiveProfileLoadError, load_adaptive_profile
+
+
+DEFAULT_ORIGINAL_SCRIPT = "auto"
+
+
+class IqRecorder:
+    def __init__(
+        self,
+        *,
+        record_dir: str,
+        prefix: str,
+        max_sec: float,
+        max_bytes: int,
+        every_n: int,
+        metadata_provider,
+        prefix_provider=None,
+    ) -> None:
+        self.record_dir = Path(os.path.expandvars(str(record_dir))).expanduser()
+        self.record_dir.mkdir(parents=True, exist_ok=True)
+        self.prefix = self._sanitize_prefix(prefix or "sdr_iq")
+        self.prefix_provider = prefix_provider
+        self.max_sec = float(max_sec)
+        self.max_bytes = int(max_bytes)
+        self.every_n = max(1, int(every_n))
+        self.metadata_provider = metadata_provider
+        self.lock = threading.RLock()
+        self.path: Optional[Path] = None
+        self.meta_path: Optional[Path] = None
+        self.handle = None
+        self.start_wall = 0.0
+        self.last_wall = 0.0
+        self.chunks_seen = 0
+        self.chunks_written = 0
+        self.samples_written = 0
+        self.bytes_written = 0
+        self.last_peak = 0.0
+        self.last_rms = 0.0
+        self.stopped_reason = ""
+
+    def write(self, raw_iq: np.ndarray) -> None:
+        with self.lock:
+            if self.stopped_reason:
+                return
+            self.chunks_seen += 1
+            if (self.chunks_seen - 1) % self.every_n != 0:
+                return
+
+            arr = np.asarray(raw_iq, dtype=np.complex64)
+            if arr.size == 0:
+                return
+            now = time.time()
+            if self.handle is None:
+                self._open(now)
+
+            if self.max_sec > 0.0 and now - self.start_wall >= self.max_sec:
+                self.stopped_reason = f"max_sec {self.max_sec:.1f} reached"
+                self.close()
+                return
+            next_bytes = int(arr.nbytes)
+            if self.max_bytes > 0 and self.bytes_written + next_bytes > self.max_bytes:
+                self.stopped_reason = f"max_bytes {self.max_bytes} reached"
+                self.close()
+                return
+
+            abs_arr = np.abs(arr)
+            self.last_peak = float(np.max(abs_arr))
+            self.last_rms = float(np.sqrt(np.mean(abs_arr ** 2)))
+            self.handle.write(arr.tobytes(order="C"))
+            self.handle.flush()
+            self.last_wall = now
+            self.chunks_written += 1
+            self.samples_written += int(arr.size)
+            self.bytes_written += next_bytes
+
+    def close(self) -> None:
+        with self.lock:
+            if self.handle is not None:
+                self.handle.close()
+                self.handle = None
+            if self.path is not None and self.meta_path is not None:
+                self._write_metadata()
+
+    def status(self) -> dict:
+        with self.lock:
+            return {
+                "enabled": True,
+                "path": None if self.path is None else str(self.path),
+                "metadata_path": None if self.meta_path is None else str(self.meta_path),
+                "chunks_seen": self.chunks_seen,
+                "chunks_written": self.chunks_written,
+                "samples_written": self.samples_written,
+                "bytes_written": self.bytes_written,
+                "last_peak": self.last_peak,
+                "last_rms": self.last_rms,
+                "stopped_reason": self.stopped_reason,
+            }
+
+    def _open(self, now: float) -> None:
+        self.record_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+        prefix = self.prefix
+        if self.prefix_provider is not None:
+            try:
+                prefix = self._sanitize_prefix(self.prefix_provider() or self.prefix)
+            except Exception:
+                prefix = self.prefix
+        self.path = self.record_dir / f"{prefix}_{stamp}.c64"
+        self.meta_path = self.record_dir / f"{prefix}_{stamp}.json"
+        self.start_wall = now
+        self.last_wall = now
+        self.handle = self.path.open("wb")
+
+    @staticmethod
+    def _sanitize_prefix(prefix: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(prefix or "sdr_iq"))
+
+    def _write_metadata(self) -> None:
+        extra = {}
+        try:
+            extra = dict(self.metadata_provider() or {})
+        except Exception as exc:
+            extra = {"metadata_error": str(exc)}
+        payload = {
+            **extra,
+            "format": "numpy.complex64 little-endian interleaved IQ",
+            "iq_path": str(self.path),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.start_wall or time.time())),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())),
+            "chunks_seen": self.chunks_seen,
+            "chunks_written": self.chunks_written,
+            "samples_written": self.samples_written,
+            "bytes_written": self.bytes_written,
+            "last_peak": self.last_peak,
+            "last_rms": self.last_rms,
+            "every_n": self.every_n,
+            "max_sec": self.max_sec,
+            "max_bytes": self.max_bytes,
+            "stopped_reason": self.stopped_reason,
+        }
+        self.meta_path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _radar_info_to_level(raw: int) -> int:
+    return (int(raw) >> 3) & 0x03
+
+
+def _radar_info_to_key_mutable(raw: int) -> bool:
+    return ((int(raw) >> 5) & 0x01) != 0
+
+
+class SdrReceiverPyWrapperNode(Node):
+    def __init__(self) -> None:
+        super().__init__("sdr_receiver_py_wrapper")
+
+        self._declare_parameters()
+        self.run_mode = str(self.get_parameter("run_mode").value).lower()
+        if self.run_mode not in ("debug", "competition"):
+            raise ValueError("run_mode must be 'debug' or 'competition'")
+
+        self.publish_ros_outputs = bool(self.get_parameter("publish_ros_outputs").value)
+        self.debug_accept_ros_control = bool(self.get_parameter("debug_accept_ros_control").value)
+        self.start_receiver = bool(self.get_parameter("start_receiver").value)
+        self.import_allow_adi_stub = bool(self.get_parameter("import_allow_adi_stub").value)
+        self.iq_source_path = str(self.get_parameter("iq_source_path").value).strip()
+        self.context_topic = str(self.get_parameter("context_topic").value)
+        self.enable_fallback_topics = bool(self.get_parameter("enable_fallback_topics").value)
+        self.fallback_self_id = int(self.get_parameter("fallback_self_id").value)
+        self.profile_config = self._load_profile_config(str(self.get_parameter("profile_path").value))
+        self.iq_recorder = self._create_iq_recorder()
+        self.latest_context: Optional[RadarContext] = None
+        self._fallback_msg_self_id = 0
+        self._fallback_self_color = -1
+        self._fallback_match_time = 0
+        self._fallback_radar_info_raw = 0
+        self._fallback_jam_level = 0
+        self._fallback_key_mutable = False
+        self._fallback_referee_online = False
+
+        self.controller = CompetitionController(
+            max_jam_break_level=int(self.get_parameter("max_jam_break_level").value),
+            key_publish_min_interval_sec=float(
+                self.get_parameter("key_publish_min_interval_sec").value
+            ),
+            key_retry_limit=int(self.get_parameter("key_retry_limit").value),
+        )
+
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.jam_code_pub = self.create_publisher(JamCode, "/sdr/jam_code", qos)
+        self.raw_frame_pub = self.create_publisher(
+            RadarWirelessFrame, "/sdr/radar_wireless/raw_frame", qos
+        )
+        self.status_pub = self.create_publisher(String, "/sdr/status", 10)
+
+        self.context_sub = self.create_subscription(
+            RadarContextMsg,
+            self.context_topic,
+            self._on_radar_context,
+            qos,
+        )
+        self._fallback_match_sub = None
+        self._fallback_radar_info_sub = None
+        if self.enable_fallback_topics:
+            self._setup_fallback_subscriptions(qos)
+
+        callbacks = PatchCallbacks(
+            on_jam_key=self._on_jam_key,
+            on_raw_frame=self._on_raw_frame,
+            on_target_change=self._on_target_change,
+            on_raw_iq=self._on_raw_iq if self.iq_recorder is not None else None,
+        )
+        original_script_path = str(self.get_parameter("original_script_path").value)
+        self.adapter = ReceiverCoreAdapter(original_script_path, logger=self._log_from_patch)
+        self.adapter.load(allow_adi_import_stub=self.import_allow_adi_stub or bool(self.iq_source_path))
+        self.adapter.apply_patches(run_mode=self.run_mode, callbacks=callbacks)
+        if self.iq_source_path:
+            self.adapter.configure_iq_file_source(
+                path=self.iq_source_path,
+                loop=bool(self.get_parameter("iq_source_loop").value),
+                throttle=bool(self.get_parameter("iq_source_throttle").value),
+                center_hz=float(self.get_parameter("iq_source_center_hz").value),
+                start_offset_sec=float(self.get_parameter("iq_source_start_offset_sec").value),
+                sample_rate_hz=int(self.get_parameter("iq_source_sample_rate").value),
+            )
+        self._apply_initial_receiver_settings()
+
+        status_period = float(self.get_parameter("status_period_sec").value)
+        self.status_timer = self.create_timer(status_period, self._publish_status)
+
+        if self.start_receiver:
+            self.adapter.start()
+
+        self.get_logger().info(
+            "sdr_receiver_py_wrapper ready: "
+            f"mode={self.run_mode} publish_ros_outputs={self.publish_ros_outputs} "
+            f"context_topic={self.context_topic} start_receiver={self.start_receiver}"
+        )
+        if self.run_mode == "debug" and not sys.stdin.isatty():
+            self.get_logger().warn(
+                "debug keyboard is not connected to a TTY. "
+                "ros2 launch usually does not forward stdin; use ros2 run/direct executable "
+                "for interactive keyboard control, or set initial_team/initial_target/initial_rx_gain."
+            )
+
+    def destroy_node(self) -> bool:
+        try:
+            self.adapter.stop()
+            self.adapter.restore_patches()
+            if self.iq_recorder is not None:
+                self.iq_recorder.close()
+        finally:
+            return super().destroy_node()
+
+    def _declare_parameters(self) -> None:
+        self.declare_parameter("run_mode", "debug")
+        self.declare_parameter("original_script_path", DEFAULT_ORIGINAL_SCRIPT)
+        self.declare_parameter("publish_ros_outputs", True)
+        self.declare_parameter("debug_accept_ros_control", False)
+        self.declare_parameter("start_receiver", True)
+        self.declare_parameter("import_allow_adi_stub", False)
+        self.declare_parameter("iq_source_path", "")
+        self.declare_parameter("iq_source_loop", True)
+        self.declare_parameter("iq_source_throttle", True)
+        self.declare_parameter("iq_source_center_hz", 0.0)
+        self.declare_parameter("iq_source_start_offset_sec", 0.0)
+        self.declare_parameter("iq_source_sample_rate", 0)
+        self.declare_parameter("context_topic", "/judge/radar_context")
+        self.declare_parameter("enable_fallback_topics", True)
+        self.declare_parameter("fallback_self_id", 0)
+        self.declare_parameter("max_jam_break_level", 3)
+        self.declare_parameter("key_publish_min_interval_sec", 0.5)
+        self.declare_parameter("key_retry_limit", -1)
+        self.declare_parameter("status_period_sec", 1.0)
+        self.declare_parameter("enable_micro_tune", False)
+        self.declare_parameter("micro_tune_max_hz", 0.0)
+        self.declare_parameter("micro_tune_step_hz", 0.0)
+        self.declare_parameter("micro_tune_timeout_sec", 0.0)
+        self.declare_parameter("profile_path", "")
+        self.declare_parameter("match_slot", "bo3_game1")
+        self.declare_parameter("front_end_id", "front_end_A")
+        self.declare_parameter("initial_team", "")
+        self.declare_parameter("initial_target", "")
+        self.declare_parameter("initial_rx_gain", -1)
+        self.declare_parameter("initial_rf_bw_hz", 0)
+        self.declare_parameter("initial_freq_offset_hz", 0)
+        self.declare_parameter("initial_info_filter", "")
+        self.declare_parameter("initial_info_l2_rescue", False)
+        self.declare_parameter("initial_info_l3_rescue", False)
+        self.declare_parameter("record_iq", False)
+        self.declare_parameter("iq_record_dir", str(Path.home() / "sdr_iq_records"))
+        self.declare_parameter("iq_record_prefix", "sdr_capture")
+        self.declare_parameter("iq_record_max_sec", 0.0)
+        self.declare_parameter("iq_record_max_bytes", 0)
+        self.declare_parameter("iq_record_every_n", 1)
+
+    def _setup_fallback_subscriptions(self, qos: QoSProfile) -> None:
+        match_info_type = self._resolve_match_info_type()
+        if match_info_type is not None:
+            self._fallback_match_sub = self.create_subscription(
+                match_info_type,
+                "/match_info",
+                self._on_match_info,
+                qos,
+            )
+            self.get_logger().info("fallback /match_info subscription enabled")
+        else:
+            self.get_logger().warn(
+                "vision_interface.msg.MatchInfo is not importable; "
+                "fallback self_id requires /judge/radar_context or fallback_self_id"
+            )
+
+        self._fallback_radar_info_sub = self.create_subscription(
+            UInt8,
+            "/judge/radar_info",
+            self._on_radar_info,
+            qos,
+        )
+        self.get_logger().info("fallback /judge/radar_info subscription enabled")
+
+    def _load_profile_config(self, raw_path: str) -> dict:
+        try:
+            profile = load_adaptive_profile(raw_path)
+        except AdaptiveProfileLoadError as exc:
+            self.get_logger().warn(f"profile_path ignored: {exc}")
+            return {}
+
+        if profile is None:
+            return {}
+        self.get_logger().info(f"loaded adaptive profile: {profile.get('source_path', raw_path)}")
+        return profile
+
+    def _create_iq_recorder(self) -> Optional[IqRecorder]:
+        if not bool(self.get_parameter("record_iq").value):
+            return None
+        return IqRecorder(
+            record_dir=str(self.get_parameter("iq_record_dir").value),
+            prefix=str(self.get_parameter("iq_record_prefix").value),
+            max_sec=float(self.get_parameter("iq_record_max_sec").value),
+            max_bytes=int(self.get_parameter("iq_record_max_bytes").value),
+            every_n=int(self.get_parameter("iq_record_every_n").value),
+            metadata_provider=self._iq_record_metadata,
+            prefix_provider=self._iq_record_prefix,
+        )
+
+    def _iq_record_metadata(self) -> dict:
+        status = self.adapter.get_stats_snapshot()
+        config = self.adapter.get_core_config_snapshot()
+        radio = self.adapter.get_current_radio_snapshot()
+        own_team = self._current_own_team()
+        rx_team = self._current_team()
+        return {
+            **config,
+            "run_mode": self.run_mode,
+            "own_team": own_team,
+            "rx_team": rx_team,
+            "team": rx_team,
+            "core_team": status.get("team"),
+            "target": status.get("target"),
+            "radio": radio,
+            "rx_lo_hz": radio.get("rx_lo_hz"),
+            "rf_bandwidth_hz": radio.get("rf_bandwidth_hz"),
+            "rx_gain": status.get("rx_gain"),
+            "gain_ceiling": status.get("gain_ceiling"),
+            "adc_rms": status.get("adc_rms"),
+            "rf_state": status.get("rf_state"),
+            "profile_path": str(self.get_parameter("profile_path").value),
+            "profile": self.profile_config,
+        }
+
+    def _iq_record_prefix(self) -> str:
+        base = str(self.get_parameter("iq_record_prefix").value or "sdr_iq").strip() or "sdr_iq"
+        if self.run_mode != "competition":
+            return base
+        own_team = self._current_own_team()
+        rx_team = self._current_team()
+        if own_team in ("RED", "BLUE") and rx_team in ("RED", "BLUE"):
+            return f"{base}_own_{own_team}_vs_{rx_team}"
+        return f"{base}_AUTO"
+
+    @staticmethod
+    def _resolve_match_info_type():
+        try:
+            from vision_interface.msg import MatchInfo
+
+            return MatchInfo
+        except Exception:
+            return None
+
+    def _on_radar_context(self, msg: RadarContextMsg) -> None:
+        context = RadarContext(
+            self_id=int(msg.self_id),
+            self_color=int(msg.self_color),
+            radar_info_raw=int(msg.radar_info_raw),
+            jam_level=int(msg.jam_level),
+            key_mutable=bool(msg.key_mutable),
+            game_progress=int(msg.game_progress),
+            match_time=int(msg.match_time),
+            referee_online=bool(msg.referee_online),
+            source=self.context_topic,
+        )
+        self._accept_context(context)
+
+    def _apply_initial_receiver_settings(self) -> None:
+        team = str(self.get_parameter("initial_team").value).strip().upper()
+        target = str(self.get_parameter("initial_target").value).strip().upper()
+        gain = int(self.get_parameter("initial_rx_gain").value)
+        rf_bw_hz = int(self.get_parameter("initial_rf_bw_hz").value)
+        freq_offset_hz = int(self.get_parameter("initial_freq_offset_hz").value)
+        info_filter = str(self.get_parameter("initial_info_filter").value).strip()
+        info_l2_rescue = bool(self.get_parameter("initial_info_l2_rescue").value)
+        info_l3_rescue = bool(self.get_parameter("initial_info_l3_rescue").value)
+
+        if team:
+            self.adapter.set_team(team)
+            self.get_logger().info(f"initial receiver team set to {team}")
+        offset_team = team or self.adapter.get_stats_snapshot().get("team") or "RED"
+        offset_target = target or self.adapter.get_stats_snapshot().get("target") or "INFO"
+        if freq_offset_hz:
+            self.adapter.apply_frequency_offset(str(offset_team), str(offset_target), freq_offset_hz)
+            self.get_logger().info(
+                f"initial frequency offset set to {offset_team}-{offset_target} {freq_offset_hz} Hz"
+            )
+        if target:
+            if target == "INFO" and (rf_bw_hz > 0 or info_filter or gain >= 0 or freq_offset_hz):
+                rescue = "L2" if info_l2_rescue else ("L3" if info_l3_rescue else "")
+                self.adapter.set_radio_profile(
+                    team=str(offset_team),
+                    target="INFO",
+                    gain=gain if gain >= 0 else None,
+                    rf_bw=rf_bw_hz if rf_bw_hz > 0 else None,
+                    freq_offset_hz=freq_offset_hz,
+                    rescue=rescue,
+                    filter_name=info_filter,
+                )
+            else:
+                self.adapter.set_target(
+                    target,
+                    info_l2_rescue=info_l2_rescue,
+                    info_l3_rescue=info_l3_rescue,
+                )
+            self.get_logger().info(f"initial receiver target set to {target}")
+        if gain >= 0:
+            gain_target = target or self.adapter.get_stats_snapshot().get("target") or "INFO"
+            self.adapter.set_manual_gain(str(gain_target), gain)
+            self.get_logger().info(f"initial receiver gain set to {gain_target}={gain}")
+
+    def _on_match_info(self, msg) -> None:
+        self._fallback_msg_self_id = int(getattr(msg, "self_id", 0))
+        self._fallback_self_color = int(getattr(msg, "self_color", -1))
+        self._fallback_match_time = int(getattr(msg, "match_time", 0))
+
+        has_radar_context_fields = any(
+            hasattr(msg, name)
+            for name in ("self_id", "radar_info_raw", "jam_level", "key_mutable", "referee_online")
+        )
+        if has_radar_context_fields:
+            raw = int(getattr(msg, "radar_info_raw", self._fallback_radar_info_raw)) & 0xFF
+            jam_level = int(getattr(msg, "jam_level", _radar_info_to_level(raw)))
+            key_mutable = bool(getattr(msg, "key_mutable", _radar_info_to_key_mutable(raw)))
+            referee_online = bool(
+                getattr(msg, "referee_online", self._fallback_match_time != -200)
+            )
+            self._fallback_radar_info_raw = raw
+            self._fallback_jam_level = jam_level
+            self._fallback_key_mutable = key_mutable
+            self._fallback_referee_online = referee_online
+            self._accept_context(
+                RadarContext(
+                    self_id=self._fallback_self_id(),
+                    self_color=self._fallback_self_color,
+                    radar_info_raw=raw,
+                    jam_level=jam_level,
+                    key_mutable=key_mutable,
+                    match_time=self._fallback_match_time,
+                    referee_online=referee_online,
+                    source="/match_info",
+                )
+            )
+            return
+
+        self._publish_fallback_context_if_ready(source="/match_info")
+
+    def _on_radar_info(self, msg: UInt8) -> None:
+        self._fallback_radar_info_raw = int(msg.data) & 0xFF
+        self._fallback_jam_level = _radar_info_to_level(self._fallback_radar_info_raw)
+        self._fallback_key_mutable = _radar_info_to_key_mutable(self._fallback_radar_info_raw)
+        self._fallback_referee_online = True
+        self._publish_fallback_context_if_ready(source="/judge/radar_info")
+
+    def _publish_fallback_context_if_ready(self, *, source: str) -> None:
+        self_id = self._fallback_self_id()
+        if self_id == 0 and self._fallback_radar_info_raw == 0:
+            return
+        raw = self._fallback_radar_info_raw
+        context = RadarContext(
+            self_id=self_id,
+            self_color=self._fallback_self_color,
+            radar_info_raw=raw,
+            jam_level=self._fallback_jam_level or _radar_info_to_level(raw),
+            key_mutable=self._fallback_key_mutable or _radar_info_to_key_mutable(raw),
+            match_time=self._fallback_match_time,
+            referee_online=self._fallback_referee_online or self._fallback_match_time != -200,
+            source=source,
+        )
+        self._accept_context(context)
+
+    def _fallback_self_id(self) -> int:
+        if self.fallback_self_id > 0:
+            return self.fallback_self_id
+        if self._fallback_msg_self_id > 0:
+            return self._fallback_msg_self_id
+        if self._fallback_self_color == 2:
+            return 9
+        if self._fallback_self_color == 0:
+            return 109
+        return 0
+
+    def _accept_context(self, context: RadarContext) -> None:
+        self.latest_context = context
+        if self.run_mode != "competition" and not self.debug_accept_ros_control:
+            return
+
+        decision = self.controller.update_context(context)
+        self._apply_controller_decision(decision)
+
+    def _apply_controller_decision(self, decision: ControllerDecision) -> None:
+        for warning in decision.warnings:
+            self.get_logger().warn(warning)
+        if decision.team:
+            self.adapter.set_team(decision.team)
+            self.get_logger().info(
+                f"receiver RF team set to opponent {decision.team} "
+                f"(own={self.controller.own_team}): {decision.reason}"
+            )
+        if decision.target:
+            self._set_receiver_target_or_profile(
+                decision.target,
+                reason=decision.reason,
+                team=decision.team or self.controller.rx_team,
+            )
+
+    def _on_jam_key(self, event: JamKeyEvent) -> None:
+        if self.run_mode == "competition":
+            decision = self.controller.handle_jam_key(level=event.level, key=event.key)
+            for warning in decision.warnings:
+                self.get_logger().warn(warning)
+            if decision.publish and self.publish_ros_outputs:
+                self._publish_jam_code(event, decision.level)
+            if decision.target:
+                self._set_receiver_target_or_profile(
+                    decision.target,
+                    reason=decision.reason,
+                    team=self.controller.rx_team,
+                )
+            elif decision.reason:
+                self.get_logger().debug(decision.reason)
+            return
+
+        if self.publish_ros_outputs:
+            self._publish_jam_code(event, event.level)
+
+    def _on_raw_frame(self, event: RawFrameEvent) -> None:
+        if not self.publish_ros_outputs:
+            return
+        msg = RadarWirelessFrame()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.cmd_id = int(event.cmd_id) & 0xFFFF
+        msg.payload_raw = list(event.payload)
+        msg.crc8_ok = bool(event.crc8_ok)
+        msg.crc16_ok = bool(event.crc16_ok)
+        msg.air_chunk_index = int(event.air_chunk_index) & 0xFF
+        msg.source_target = str(event.source_target)
+        msg.team = self._current_team(event.team)
+        self.raw_frame_pub.publish(msg)
+
+    def _on_target_change(self, event: TargetChangeEvent) -> None:
+        self.get_logger().info(
+            f"receiver core target changed {event.before}->{event.after} team={event.team}"
+        )
+
+    def _on_raw_iq(self, raw_iq: np.ndarray) -> None:
+        if self.iq_recorder is not None:
+            self.iq_recorder.write(raw_iq)
+
+    def _set_receiver_target_or_profile(self, target: str, *, reason: str, team: Optional[str]) -> None:
+        target_upper = str(target).upper()
+        if target_upper == "INFO" and self.run_mode == "competition" and self.profile_config:
+            applied = self._apply_info_profile(team=team)
+            if applied:
+                self.get_logger().info(f"receiver INFO profile applied: {reason}")
+                return
+        self.adapter.set_target(target_upper)
+        self.get_logger().info(f"receiver target set to {target_upper}: {reason}")
+
+    def _apply_info_profile(self, *, team: Optional[str]) -> bool:
+        profile = self.profile_config
+        if not profile:
+            return False
+        team_name = str(team or profile.get("team") or self.controller.rx_team or "RED").upper()
+        profile_team = str(profile.get("team") or "").upper()
+        if profile_team and profile_team != team_name:
+            self.get_logger().warn(
+                f"profile team {profile_team} differs from active team {team_name}; using active team"
+            )
+        rescue = str(profile.get("rescue") or "").upper()
+        if rescue in ("", "NONE", "NORMAL"):
+            rescue = ""
+        self.adapter.set_radio_profile(
+            team=team_name,
+            target="INFO",
+            gain=int(profile.get("gain", 40)),
+            rf_bw=int(profile.get("rf_bw_hz", 540000)),
+            freq_offset_hz=int(profile.get("freq_offset_hz", 0)),
+            rescue=rescue,
+            filter_name=str(profile.get("filter") or ""),
+        )
+        return True
+
+    def _publish_jam_code(self, event: JamKeyEvent, level: int) -> None:
+        context = self.latest_context
+        msg = JamCode()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.valid = True
+        msg.command_id = 0x0A06
+        msg.level = int(level) & 0xFF
+        msg.team = self._current_team(event.team)
+        msg.target = f"JAM_L{int(level)}_KEY" if int(level) in (1, 2, 3) else event.target
+        msg.radio_mode = self.run_mode
+        stats = self.adapter.get_stats_snapshot()
+        msg.rf_state = str(stats.get("rf_state") or "")
+        msg.radar_info_raw = int(context.radar_info_raw) & 0xFF if context else 0
+        msg.key_mutable = bool(context.key_mutable) if context else False
+        msg.key = list(event.key[:6])
+        msg.ascii_code = event.ascii_code
+        self.jam_code_pub.publish(msg)
+        self.get_logger().info(
+            f"published jam code level={msg.level} team={msg.team} "
+            f"target={msg.target} key={msg.ascii_code}"
+        )
+
+    def _publish_status(self) -> None:
+        adapter_status = {}
+        try:
+            adapter_status = self.adapter.get_stats_snapshot()
+        except Exception as exc:
+            adapter_status = {"adapter_error": str(exc)}
+
+        status = {
+            "run_mode": self.run_mode,
+            "own_team": self._current_own_team(),
+            "rx_team": self._current_team(),
+            "publish_ros_outputs": self.publish_ros_outputs,
+            "debug_accept_ros_control": self.debug_accept_ros_control,
+            "start_receiver": self.start_receiver,
+            "iq_source": {
+                "enabled": bool(self.iq_source_path),
+                "path": self.iq_source_path,
+                "loop": bool(self.get_parameter("iq_source_loop").value),
+                "throttle": bool(self.get_parameter("iq_source_throttle").value),
+                "center_hz": float(self.get_parameter("iq_source_center_hz").value),
+                "start_offset_sec": float(self.get_parameter("iq_source_start_offset_sec").value),
+                "sample_rate": int(self.get_parameter("iq_source_sample_rate").value),
+            },
+            "original_script_path": self.adapter.get_resolved_script_path(),
+            "micro_tune": {
+                "enabled": bool(self.get_parameter("enable_micro_tune").value),
+                "max_hz": float(self.get_parameter("micro_tune_max_hz").value),
+                "step_hz": float(self.get_parameter("micro_tune_step_hz").value),
+                "timeout_sec": float(self.get_parameter("micro_tune_timeout_sec").value),
+            },
+            "profile": {
+                "path": str(self.get_parameter("profile_path").value),
+                "loaded": bool(self.profile_config),
+                "config": self.profile_config,
+            },
+            "iq_recording": {"enabled": False}
+            if self.iq_recorder is None
+            else self.iq_recorder.status(),
+            "competition": self.controller.status_snapshot(),
+            "core": adapter_status,
+            "receiver_thread_exception": None
+            if self.adapter.receiver_exception is None
+            else str(self.adapter.receiver_exception),
+        }
+        msg = String()
+        msg.data = json.dumps(_json_safe(status), sort_keys=True)
+        self.status_pub.publish(msg)
+
+    def _current_team(self, fallback: str = "UNKNOWN") -> str:
+        if hasattr(self, "controller") and self.controller.rx_team:
+            return self.controller.rx_team
+        own_team = self._current_own_team("")
+        if own_team in ("RED", "BLUE"):
+            return self._opponent_team(own_team)
+        return fallback or "UNKNOWN"
+
+    def _current_own_team(self, fallback: str = "UNKNOWN") -> str:
+        if hasattr(self, "controller") and self.controller.own_team:
+            return self.controller.own_team
+        context = self.latest_context
+        if context is not None:
+            if context.self_id == 9 or context.self_color == 2:
+                return "RED"
+            if context.self_id == 109 or context.self_color == 0:
+                return "BLUE"
+        fallback_self_id = getattr(self, "fallback_self_id", 0)
+        if fallback_self_id == 9:
+            return "RED"
+        if fallback_self_id == 109:
+            return "BLUE"
+        fallback_color = getattr(self, "_fallback_self_color", -1)
+        if fallback_color == 2:
+            return "RED"
+        if fallback_color == 0:
+            return "BLUE"
+        return fallback or "UNKNOWN"
+
+    @staticmethod
+    def _opponent_team(own_team: str) -> str:
+        return "BLUE" if own_team == "RED" else "RED"
+
+    def _log_from_patch(self, message: str) -> None:
+        self.get_logger().info(message)
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = SdrReceiverPyWrapperNode()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+if __name__ == "__main__":
+    main()
