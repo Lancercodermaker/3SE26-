@@ -255,4 +255,3 @@ The selected implementation returns to `main` only after common acceptance evide
 ## 11. Known Diagnostic Limit
 
 Because radar main will publish only data it already owns, the receiver can prove which ROS observation caused a transition but cannot independently prove whether the referee serial layer duplicated, reordered, or delayed the underlying frame. If future evidence requires that distinction, radar main may later add referee frame sequence and low-level receive timestamps without changing the receiver architecture.
-

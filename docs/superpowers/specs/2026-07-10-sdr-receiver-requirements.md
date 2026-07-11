@@ -149,4 +149,3 @@ Both plugins shall be runnable on identical stored IQ and identical metadata. Sh
 - `codex/open-source-replacement`: minimal common foundation plus adapted upstream decoder.
 - `codex/hybrid-receiver`: full common foundation, both plugins, context arbitration, RF safety, and diagnostics.
 - Merge back only after acceptance evidence identifies the production decoder and validates the common foundation.
-
