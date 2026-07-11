@@ -30,6 +30,9 @@ class ContextArbiter:
         self.stable_sec = stable_sec
         self.own_team = None
         self.accepted_level = None
+        self._candidate_level = None
+        self._candidate_count = 0
+        self._candidate_since = None
 
     def observe(self, observation):
         if observation.source != self.authority:
@@ -61,11 +64,40 @@ class ContextArbiter:
                 target=None,
             )
 
+        if observation.jam_level not in (1, 2, 3):
+            return Decision(
+                accepted=False,
+                target_changed=False,
+                reason="invalid_level",
+                level=self.accepted_level,
+                target=None,
+            )
+
+        if observation.jam_level != self._candidate_level:
+            self._candidate_level = observation.jam_level
+            self._candidate_count = 1
+            self._candidate_since = observation.received_monotonic
+        else:
+            self._candidate_count += 1
+
+        stable = self._candidate_count >= self.stable_count and (
+            observation.received_monotonic - self._candidate_since >= self.stable_sec
+        )
+        if not stable:
+            return Decision(
+                accepted=False,
+                target_changed=False,
+                reason="level_not_stable",
+                level=self.accepted_level,
+                target=None,
+            )
+
+        changed = self.accepted_level != observation.jam_level
         self.accepted_level = observation.jam_level
         return Decision(
             accepted=True,
-            target_changed=False,
-            reason="initial_context",
-            level=observation.jam_level,
-            target=None,
+            target_changed=changed,
+            reason="stable_level",
+            level=self.accepted_level,
+            target=f"L{self.accepted_level}",
         )
