@@ -1,14 +1,14 @@
-# 3SE26 SDR Receiver
+# 3SE26 SDR 解析波接收工程
 
-This repository contains the pre-refactor baseline of the 3SE 2026 radar SDR receiver.
+本仓库保存 3SE 2026 雷达 SDR 解析波接收工程的重构前基线，以及后续重构所需的需求分析和架构设计文档。
 
-## Packages
+## 工程目录
 
-- `sdr_receiver_py_wrapper`: the Python/ROS 2 competition receiver and its vendored decoder.
-- `sdr_receiver`: the C++/ROS 2 receiver implementation and message definitions.
-- `docs`: existing requirements, architecture, interface, and RF scan documents.
+- `sdr_receiver_py_wrapper`：Python/ROS 2 比赛接收程序及其内置解调器。
+- `sdr_receiver`：C++/ROS 2 接收程序、消息定义和相关配置。
+- `docs`：需求分析、架构设计、接口约定、射频扫描及部署文档。
 
-IQ recordings, scan logs, virtual environments, and generated build artifacts are intentionally excluded. This baseline preserves the current source before the replacement and hybrid receiver designs are implemented.
+仓库有意排除了 IQ 录波、扫描日志、虚拟环境和构建产物。当前 `main` 分支用于保留重构前源码基线与已确认的设计文档，后续开源替换方案和融合改进方案将在独立分支中实现和验证。
 
 ## 重构文档
 
