@@ -10,3 +10,7 @@ This repository contains the pre-refactor baseline of the 3SE 2026 radar SDR rec
 
 IQ recordings, scan logs, virtual environments, and generated build artifacts are intentionally excluded. This baseline preserves the current source before the replacement and hybrid receiver designs are implemented.
 
+## Refactor Documents
+
+- [Requirements analysis](docs/superpowers/specs/2026-07-10-sdr-receiver-requirements.md)
+- [Architecture design](docs/superpowers/specs/2026-07-10-sdr-receiver-architecture-design.md)
