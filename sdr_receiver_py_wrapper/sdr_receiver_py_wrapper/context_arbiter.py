@@ -37,7 +37,7 @@ class ContextArbiter:
                 accepted=False,
                 target_changed=False,
                 reason="diagnostic_source",
-                level=observation.jam_level,
+                level=self.accepted_level,
                 target=None,
             )
 
@@ -46,7 +46,7 @@ class ContextArbiter:
                 accepted=False,
                 target_changed=False,
                 reason="invalid_radar_id",
-                level=observation.jam_level,
+                level=self.accepted_level,
                 target=None,
             )
 
@@ -57,7 +57,7 @@ class ContextArbiter:
                 accepted=False,
                 target_changed=False,
                 reason="prematch_observation",
-                level=observation.jam_level,
+                level=self.accepted_level,
                 target=None,
             )
 
