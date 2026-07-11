@@ -1,151 +1,152 @@
-# SDR Receiver Refactor Requirements
+# SDR 解析波接收工程重构需求分析
 
-Date: 2026-07-10
+日期：2026-07-10
 
-## 1. Purpose
+## 1. 文档目的
 
-Refactor the 3SE 2026 radar SDR receiver into a diagnosable and competition-ready system. The work must preserve the current ROS 2 integration, use the open-source CombatRadarSdr2026 decoder as a reference implementation, and address both confirmed RF failures and context-driven target switching failures.
+将 3SE 2026 雷达 SDR 解析波工程重构为可诊断、可回放、可验证、可上场的接收系统。重构必须保留现有 ROS 2 集成方式，将开源 CombatRadarSdr2026 解调器作为参考实现，并同时解决已经确认的射频接收问题和上下文错误切级问题。
 
-## 2. Confirmed Evidence
+## 2. 已确认的事实与证据
 
-### 2.1 Field IQ
+### 2.1 现场 IQ 录波
 
-- The field capture contains no recoverable protocol entry: `AC_RAW`, `AC`, `SOF`, `CRC8`, `CRC16`, and `CRC16_FAIL` remain zero across scanned candidates.
-- Many samples reach the AD9363 digital rails near +/-2048. The field receiver package inferred ADC scale from candidates beginning at 32768, so clipped input was reported as low signal.
-- The 900-second recording window contains 576.8 seconds of complex64 samples, approximately 64% acquisition duty.
-- Running the open-source decoder against the field IQ does not recover a valid frame. Replacing only the decoder cannot repair this recording.
+- 现场录波没有进入可恢复的协议阶段：扫描候选中的 `AC_RAW`、`AC`、`SOF`、`CRC8`、`CRC16` 和 `CRC16_FAIL` 均为 0。
+- 大量样本达到 AD9363 数字满量程附近的正负 2048，存在明显削顶。
+- 比赛使用版本从 32768 开始推断 ADC 归一化量程，导致实际约 0.768 的满量程 RMS 被记录为约 0.048，并被误判为弱信号。
+- 900 秒录波窗口只保存了 576.8 秒 `complex64` 样本，有效采集占空比约为 64%。
+- 使用开源解调器处理同一份现场 IQ 也无法恢复合法帧。因此，单纯替换解调算法无法修复这份录波。
 
-### 2.2 Radar Main Logs
+### 2.2 雷达主工程比赛日志
 
-- Match 1 reports level 1, then level 3 from 11:30:52 to 11:30:56, then level 1 again.
-- Match 2 reports level 1, then level 3 from 11:42:03 to 11:42:07, then level 1 again.
-- Neither match contains a received `JamCode`, phase-2 key submission, or successful key update.
-- Invalid transient self IDs such as 0, 160, and 176 appear in the logs. The valid red radar station ID is 9.
-- The receiver accepts context from `/judge/radar_context`, `/match_info`, and `/judge/radar_info` without source arbitration.
+- 第一局先持续报告等级 1，在 `11:30:52` 至 `11:30:56` 短暂报告等级 3，随后恢复等级 1。
+- 第二局先持续报告等级 1，在 `11:42:03` 至 `11:42:07` 短暂报告等级 3，随后恢复等级 1。
+- 两局均没有收到 `JamCode`，没有进入密钥第二阶段，也没有成功更新密钥。
+- 日志中出现过 0、160、176 等异常 `self_id`；红方雷达站的合法 ID 应为 9。
+- 当前解析端同时接受 `/judge/radar_context`、`/match_info` 和 `/judge/radar_info`，但没有来源优先级和仲裁机制。
 
-### 2.3 Reference IQ
+### 2.3 其他队伍参考录波
 
-- `RX_BLUE_ganrao_1`, `RX_BLUE_ganrao_2`, and `RX_BLUE_ganrao_3` are little-endian complex64 recordings at 2.0 Msps.
-- `RX_BLUE_ganrao_1` is a confirmed L1 positive sample and recovers `0x0A06` payload `fcYqTC`.
-- L2 and L3 labels must be verified by decoded command, payload, CRC mode, and required frequency offset before becoming authoritative fixtures.
-- The field BO3 capture is a negative RF/context regression sample, not a positive key-decoding fixture.
+- `RX_BLUE_ganrao_1`、`RX_BLUE_ganrao_2`、`RX_BLUE_ganrao_3` 均为 2.0 Msps、little-endian `complex64` IQ 文件。
+- `RX_BLUE_ganrao_1` 已确认为 L1 正样本，可恢复 `0x0A06` 密钥 `fcYqTC`。
+- L2 和 L3 文件在成为权威测试样本前，必须确认其实际命令、密钥、CRC 模式和所需频偏，不能只依据文件名认定等级。
+- 现场 BO3 录波应作为射频过载、采集空洞和错误切级的负样本，不作为必须解出密钥的正样本。
 
-## 3. Scope
+## 3. 建设范围
 
-### 3.1 In Scope
+### 3.1 本期范围
 
-- A host-side common receiver foundation that exclusively controls Pluto SDR hardware.
-- Two decoder plugins: adapted upstream decoder and improved v67 decoder.
-- ROS 2 input/output integration without introducing the upstream TCP bridge.
-- RF safety, context arbitration, deterministic target switching, structured diagnostics, and replayable recording metadata.
-- A small radar-main integration change that publishes a new topic containing data already available in the radar main process.
-- Offline, ROS closed-loop, hardware bench, and endurance acceptance tests.
+- 在雷达主机上运行的公共接收底座，并由其独占 Pluto SDR 控制权。
+- 两个解调插件：开源方案适配插件和改进后的 v67 插件。
+- 保留 ROS 2 双向通信，不引入开源方案的 TCP 桥接层。
+- 射频安全控制、上下文仲裁、确定性等级状态机、结构化诊断日志和可复盘录波。
+- 雷达主工程新增一个话题，但只发布主工程当前已经拥有的数据。
+- 离线回归、ROS 闭环、硬件台架和长时间稳定性验收。
 
-### 3.2 Out of Scope
+### 3.2 不在本期范围
 
-- Running decoding on the Zynq7010.
-- Replacing Zynq7010/AD9363 with Zynq7020/AD9361.
-- Sending decoder output through TCP or rebuilding an A5 referee frame for local IPC.
-- Letting decoder plugins control SDR settings or publish ROS/TCP data.
-- Requiring radar main to expose new low-level referee sequence or transport timestamps that it does not already retain.
+- 在 Zynq7010 板端运行解调算法。
+- 将 Zynq7010+AD9363 升级为 Zynq7020+AD9361。
+- 使用 TCP 传输解析结果，或为了本机进程间通信重新封装 A5 裁判帧。
+- 允许解调插件直接控制 SDR、发布 ROS 消息或发送 TCP 数据。
+- 强制雷达主工程新增其当前并未保存的裁判帧序号或串口底层接收时间。
 
-## 4. Functional Requirements
+## 4. 功能需求
 
-### FR-1 Hardware Ownership
+### FR-1 硬件控制权唯一
 
-Only the common foundation may connect to libiio, set LO/sample rate/RF bandwidth/gain, or perform reconnects. Decoder plugins consume IQ and immutable metadata only.
+只有公共接收底座可以连接 libiio、设置 LO、采样率、RF 带宽和增益，以及执行设备重连。解调插件只能接收 IQ 和不可变元数据。
 
-### FR-2 Canonical Decoder Interface
+### FR-2 统一解调接口
 
-Every decoder plugin shall consume an `IqChunk` plus an accepted target context and return zero or more `DecodedCommand` values. A decoded command shall contain command ID, payload bytes, CRC evidence, decoder ID, profile, sample range, and receive timestamp.
+每个插件接收 `IqChunk` 和经过仲裁的 `DecodeContext`，返回零个或多个 `DecodedCommand`。解调结果至少包含命令 ID、payload、CRC 证据、解调器标识、profile、样本区间和接收时间。
 
-### FR-3 Output Ownership
+### FR-3 输出权唯一
 
-Only the common ROS adapter may publish `/sdr/jam_code`, raw-frame diagnostics, or receiver status. A valid `0x0A06` payload shall remain six ASCII alphanumeric bytes. The radar main project remains responsible for sending the key to the referee system.
+只有公共 ROS 输出适配器可以发布 `/sdr/jam_code`、原始帧诊断和接收机状态。合法 `0x0A06` 的 payload 必须是六个 ASCII 字母或数字。雷达主工程继续负责向裁判系统发送密钥。
 
-### FR-4 Context Authority
+### FR-4 上下文权威来源
 
-Exactly one configured ROS topic may drive competition state. Other compatible topics are diagnostic inputs and may not overwrite the accepted context.
+比赛模式只能配置一个能够驱动状态机的权威 ROS 话题。其他兼容话题仅作为诊断输入，不得覆盖已采纳的上下文。
 
-### FR-5 Context Validation
+### FR-5 上下文校验
 
-- Accept radar station IDs 9 and 109 only for team selection.
-- Reject IDs such as 0, 160, and 176 without changing the locked team.
-- Lock team selection before competition decoding starts.
-- Reject invalid levels outside 1 through 3.
-- Record every received, accepted, rejected, and conflicting context event.
+- 队伍判断只接受雷达站 ID 9 和 109。
+- 收到 0、160、176 等异常 ID 时保持当前队伍，不得切换方向。
+- 比赛解调开始前锁定队伍，比赛过程中不得由普通上下文自动翻转。
+- 拒绝不在 1 至 3 范围内的干扰等级。
+- 每个上下文事件都要记录接收、采纳、拒绝或冲突结果及原因。
 
-### FR-6 Level Transition Policy
+### FR-6 等级切换策略
 
-- Pre-match level changes shall be logged but shall not retune the receiver.
-- At competition start, initialize from the latest stable authoritative level.
-- In-match changes require configurable consecutive observations and duration.
-- A stable return to a lower official level must replace a previously accepted higher level.
-- A target transition shall record old/new targets, triggering evidence, LO, bandwidth, gain, and decoder reset reason.
+- 赛前等级变化只记录，不驱动 SDR 切频。
+- 正式比赛开始时，根据最新稳定的权威上下文初始化监听等级。
+- 比赛中等级变化必须满足可配置的连续帧数和持续时间。
+- 官方上下文稳定恢复到较低等级时，必须能够覆盖之前采纳的较高等级。
+- 每次切换记录旧目标、新目标、触发证据、LO、带宽、增益和解调器重置原因。
 
-### FR-7 Radar Main Evidence Topic
+### FR-7 雷达主工程证据话题
 
-Radar main may publish a new topic using data it already owns. The minimum atomic message contains:
+雷达主工程可以新增话题，但只发布其当前已经拥有的数据。最小原子消息包含：
 
 - `self_id`
 - `self_color`
 - `radar_info_raw`
-- derived `jam_level`
-- derived `key_mutable`
-- game progress and match time already held by radar main
+- 由原始字节解析得到的 `jam_level`
+- 由原始字节解析得到的 `key_mutable`
+- 主工程已有的比赛阶段和剩余时间
 
-The receiver records local ROS receipt wall time and monotonic time. Referee-frame sequence and low-level serial receive time are optional future fields, not current requirements.
+解析端在收到消息时自行记录 ROS 接收墙钟时间和单调时钟时间。裁判帧序号和串口底层时间戳属于未来可选字段，不是本期要求。
 
-### FR-8 RF Safety
+### FR-8 射频安全控制
 
-- Use an explicit AD9363 digital full-scale convention; the current expected code scale is 2048.
-- Detect I/Q rail occupancy, peak, RMS, DC offset, and clipping ratio.
-- Clipping shall force gain reduction or an RF fault state; it must never be classified as low signal.
-- Automatic gain changes shall be bounded, rate-limited, and auditable.
-- Competition startup shall begin from a conservative gain.
+- 明确采用 AD9363 数字满量程约定，当前预期 ADC code scale 为 2048。
+- 同时计算 I/Q 峰值、RMS、直流偏置、贴轨比例和削顶比例。
+- 一旦削顶，必须降增益或进入射频故障状态，禁止归类为 `RF_LOW`。
+- 自动增益变化必须有上下限、变化速率限制和完整审计记录。
+- 比赛启动默认使用保守增益。
 
-### FR-9 Recording
+### FR-9 可复盘录波
 
-Record IQ separately from a sidecar event stream. Every IQ chunk shall be correlatable with sample index, local monotonic time, LO, sample rate, RF bandwidth, gain, target, context version, decoder configuration, clipping metrics, and drop/overflow counters.
+IQ 与 sidecar 事件流分开保存。每个 IQ chunk 必须能够关联样本索引、单调时间、LO、采样率、RF 带宽、增益、目标、上下文版本、解调配置、削顶指标和丢样计数。
 
-### FR-10 Acquisition Continuity
+### FR-10 采集连续性
 
-Acquisition, decoding, and disk writing shall use bounded queues so synchronous disk flush cannot block SDR reception. Report expected samples, received samples, dropped chunks, queue overflows, libiio errors, and effective acquisition duty.
+IQ 采集、解调和写盘使用有界队列解耦，禁止同步磁盘 flush 阻塞 SDR 接收。系统必须报告理论样本数、实际样本数、丢失 chunk、队列溢出、libiio 错误和有效采集占空比。
 
-### FR-11 Decoder Comparison
+### FR-11 双解调对比
 
-Both plugins shall be runnable on identical stored IQ and identical metadata. Shadow mode may run both, but only the configured primary decoder may feed the ROS output validator.
+两个插件必须能够使用完全相同的 IQ 和元数据运行。影子模式可以同时运行两个插件，但只有配置的主插件能够将结果送入生产 ROS 输出链路。
 
-## 5. Non-Functional Requirements
+## 5. 非功能需求
 
-- No decoder plugin may import ROS, pyadi-iio, or socket output code.
-- Competition configuration must be explicit and versioned.
-- Logs must be structured JSONL in addition to concise operator output.
-- A failure must be classifiable as context, RF, acquisition, synchronization, frame validation, or ROS delivery.
-- The system shall run on the existing radar host and Zynq7010/AD9363 hardware.
-- Decoder CPU and memory use must not reduce acquisition duty below the acceptance threshold.
+- 解调插件不得导入 ROS、pyadi-iio 或 socket 输出代码。
+- 比赛配置必须显式、可版本化、可追溯。
+- 除简洁的终端信息外，还要保存结构化 JSONL 日志。
+- 每次失败必须能够归类为上下文、射频、采集、同步、帧校验或 ROS 输出问题。
+- 系统必须运行在现有雷达主机和 Zynq7010+AD9363 硬件上。
+- 解调 CPU 和内存开销不得导致采集占空比低于验收门槛。
 
-## 6. Hardware Requirements
+## 6. 硬件与部署要求
 
-- Establish a measured RF gain budget for antenna, external LNA, active SAW, cable loss, and SDR gain.
-- Provide a bench-tested attenuation/LNA-bypass procedure for close-range transmitters.
-- Prefer a short verified USB 3 data cable; record libiio reconnects and timeouts during endurance tests.
-- Keep the active SAW only after confirming its passband, gain, compression behavior, and supply noise in the assembled chain.
+- 实测天线、外置 LNA、有源 SAW、线损和 SDR 增益组成的完整增益预算。
+- 为近距离发射场景准备经过台架验证的衰减器或 LNA 旁路方案。
+- 优先使用经过稳定性验证的短 USB 3 数据线，并在长时间测试中记录 libiio 重连和超时。
+- 有源 SAW 必须在整机链路中验证通带、增益、压缩行为和供电噪声。
 
-## 7. Acceptance Criteria
+## 7. 验收标准
 
-1. Confirm the expected key and CRC evidence for each approved L1/L2/L3 positive fixture.
-2. Decode approved fixtures repeatedly with both plugins under one metadata contract.
-3. Produce no key from the field negative capture and classify its clipping/context faults.
-4. Ignore transient invalid IDs and pre-match level-3 excursions without retuning.
-5. Complete `IQ -> decoder -> DecodedCommand -> /sdr/jam_code -> radar main` closed-loop tests.
-6. Demonstrate that radar main enters phase 2 after a known-good JamCode test input.
-7. Run the assembled RF chain without sustained clipping at close range.
-8. Demonstrate at least 99% acquisition duty in a representative endurance test, with zero unexplained drops.
+1. 为批准纳入的 L1/L2/L3 正样本记录哈希、期望密钥和 CRC 证据。
+2. 两个插件都能按照统一元数据协议重复解调批准的正样本。
+3. 现场负样本不得输出密钥，并能报告削顶、上下文异常和采集问题。
+4. 异常 ID 和赛前短暂 L3 不得触发队伍翻转或错误切频。
+5. 完成 `IQ -> 解调插件 -> DecodedCommand -> /sdr/jam_code -> 雷达主工程` 闭环测试。
+6. 使用已知正确 JamCode 时，雷达主工程能够进入密钥第二阶段。
+7. 完整射频前端在近距离测试中不得持续削顶。
+8. 代表性长时间测试的有效采集占空比至少达到 99%，且不存在无法解释的丢样。
 
-## 8. Delivery Strategy
+## 8. 交付与分支策略
 
-- `main`: preserved pre-refactor baseline and approved documents.
-- `codex/open-source-replacement`: minimal common foundation plus adapted upstream decoder.
-- `codex/hybrid-receiver`: full common foundation, both plugins, context arbitration, RF safety, and diagnostics.
-- Merge back only after acceptance evidence identifies the production decoder and validates the common foundation.
+- `main`：保留重构前基线和已批准文档。
+- `codex/open-source-replacement`：最小公共底座加开源解调插件。
+- `codex/hybrid-receiver`：完整公共底座、双插件、上下文仲裁、射频安全和诊断体系。
+- 只有在统一验收证据确认生产解调器并验证公共底座后，才合并回 `main`。
