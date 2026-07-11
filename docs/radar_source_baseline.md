@@ -10,10 +10,24 @@ This import establishes a version-controlled source baseline for radar context t
 
 No ROS/colcon build result is claimed for this mechanical baseline import.
 
+## Audit and compatibility normalization
+
+The byte-exact initial import is commit
+`271529be647b7a574f49d23aac421a200c471229`; this commit is the stable audit
+identifier for the original source snapshots.
+
+Quality review found that the legacy `vision_interface` schema did not match the
+current SDR-integrated consumer. No matching schema snapshot was available
+locally, so the follow-up compatibility fix makes the smallest additive message
+field extensions supported by the repository's existing interface contract. It
+also completes the package manifests, MIT license metadata, and C++17 default.
+The original bytes remain replayable at the initial import commit; the follow-up
+fix is an intentional, versioned normalization.
+
 ## Known baseline property
 
-The imported packages preserve the source snapshots' original bytes. A one-time
-`git diff --cached --check` reports 98 legacy trailing/indentation whitespace
-diagnostics across seven existing source files. This commit leaves them unchanged
-to preserve SHA-256 and audit parity. Later functional commits must apply normal
-diff checks to any lines they add or modify.
+The initial import preserves the source snapshots' original bytes. Its one-time
+full diff check reports 98 legacy trailing/indentation whitespace diagnostics
+across seven existing source files. Those original bytes remain unchanged at the
+stable audit commit above. Later functional commits must apply normal diff checks
+to any lines they add or modify.

@@ -4,3 +4,8 @@ uint8[16] robot_hp #参考0x0003
 uint8[5] marks
 uint8 ultimate
 uint32 eventtype
+uint8 self_id
+uint8 radar_info_raw
+uint8 jam_level
+bool key_mutable
+bool referee_online
