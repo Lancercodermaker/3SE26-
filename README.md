@@ -14,3 +14,9 @@
 
 - [需求分析](docs/superpowers/specs/2026-07-10-sdr-receiver-requirements.md)
 - [架构设计](docs/superpowers/specs/2026-07-10-sdr-receiver-architecture-design.md)
+
+## 实现计划
+
+- [雷达主工程上下文证据话题实现计划](docs/superpowers/plans/2026-07-11-radar-context-integration.md)
+- [公共接收底座与融合方案实现计划](docs/superpowers/plans/2026-07-11-common-receiver-foundation.md)
+- [开源解调插件与软硬件验收实现计划](docs/superpowers/plans/2026-07-11-upstream-decoder-and-validation.md)
