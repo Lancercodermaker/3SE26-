@@ -75,11 +75,12 @@ class DecodeContext:
 class DecodedCommand:
     """A decoder result with recursively frozen validation evidence.
 
-    Evidence accepts JSON-like scalar values, mappings, lists, and tuples;
-    mappings and sequences are recursively snapshotted. Recorders must convert
-    the resulting read-only mappings and tuples explicitly for JSON output.
-    Large or custom mutable objects, including arrays, are rejected instead of
-    being copied implicitly.
+    Evidence accepts exact built-in JSON-like scalar types, mappings, lists,
+    and tuples; mappings and sequences are recursively snapshotted. Recorders
+    must convert the resulting read-only mappings and tuples explicitly for
+    JSON output. Cycles, large mutable objects, scalar subclasses, and custom
+    mutable objects (including arrays) are rejected instead of being copied or
+    retained implicitly.
     """
 
     cmd_id: int
@@ -109,22 +110,36 @@ class DecodedCommand:
         )
 
 
-def _freeze_evidence(value: object) -> object:
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+def _freeze_evidence(
+    value: object,
+    active_path: set[int] | None = None,
+) -> object:
+    if value is None or type(value) in (bool, int, float, str, bytes):
         return value
-    if isinstance(value, Mapping):
-        frozen: dict[str, object] = {}
-        for key, nested_value in value.items():
-            if not isinstance(key, str):
-                raise TypeError("DecodedCommand evidence mapping keys must be str")
-            frozen[key] = _freeze_evidence(nested_value)
-        return MappingProxyType(frozen)
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_evidence(item) for item in value)
-    raise TypeError(
-        "unsupported evidence value type: "
-        f"{type(value).__name__}"
-    )
+    if not isinstance(value, (Mapping, list, tuple)):
+        raise TypeError(
+            "unsupported evidence value type: "
+            f"{type(value).__name__}"
+        )
+
+    path = set() if active_path is None else active_path
+    value_id = id(value)
+    if value_id in path:
+        raise TypeError("cyclic evidence containers are not supported")
+    path.add(value_id)
+    try:
+        if isinstance(value, Mapping):
+            frozen: dict[str, object] = {}
+            for key, nested_value in value.items():
+                if type(key) is not str:
+                    raise TypeError(
+                        "DecodedCommand evidence mapping keys must be exact str"
+                    )
+                frozen[key] = _freeze_evidence(nested_value, path)
+            return MappingProxyType(frozen)
+        return tuple(_freeze_evidence(item, path) for item in value)
+    finally:
+        path.remove(value_id)
 
 
 @dataclass(frozen=True)

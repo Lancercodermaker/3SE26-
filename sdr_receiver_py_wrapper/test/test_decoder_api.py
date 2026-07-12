@@ -235,6 +235,27 @@ class _UnsupportedMutableEvidence:
         self.values: list[int] = []
 
 
+class _MutableInt(int):
+    def __new__(cls, value: int):
+        instance = super().__new__(cls, value)
+        instance.notes = []
+        return instance
+
+
+class _MutableStr(str):
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.notes = []
+        return instance
+
+
+class _MutableBytes(bytes):
+    def __new__(cls, value: bytes):
+        instance = super().__new__(cls, value)
+        instance.notes = []
+        return instance
+
+
 @pytest.mark.parametrize(
     "unsupported",
     [
@@ -248,6 +269,74 @@ def test_decoded_command_rejects_unsupported_mutable_evidence(
 ):
     with pytest.raises(TypeError, match="unsupported evidence"):
         _decoded_command({"unsupported": unsupported})
+
+
+@pytest.mark.parametrize(
+    "mutable_scalar",
+    [_MutableInt(7), _MutableStr("value"), _MutableBytes(b"value")],
+    ids=["int-subclass", "str-subclass", "bytes-subclass"],
+)
+def test_decoded_command_rejects_mutable_builtin_scalar_subclasses(
+    mutable_scalar: object,
+):
+    with pytest.raises(TypeError, match="unsupported evidence"):
+        _decoded_command({"mutable_scalar": mutable_scalar})
+
+
+def test_decoded_command_requires_exact_builtin_str_evidence_keys():
+    key = _MutableStr("key")
+
+    with pytest.raises(TypeError, match="keys must be exact str"):
+        _decoded_command({key: 1})
+
+
+def test_decoded_command_accepts_exact_builtin_scalar_types():
+    command = _decoded_command(
+        {
+            "none": None,
+            "bool": True,
+            "int": 7,
+            "float": 1.5,
+            "str": "value",
+            "bytes": b"value",
+        }
+    )
+
+    assert dict(command.evidence) == {
+        "none": None,
+        "bool": True,
+        "int": 7,
+        "float": 1.5,
+        "str": "value",
+        "bytes": b"value",
+    }
+
+
+@pytest.mark.parametrize("container_type", [dict, list], ids=["mapping", "list"])
+def test_decoded_command_rejects_cyclic_evidence_with_clear_error(
+    container_type: type,
+):
+    cyclic = container_type()
+    if isinstance(cyclic, dict):
+        cyclic["self"] = cyclic
+        evidence = cyclic
+    else:
+        cyclic.append(cyclic)
+        evidence = {"cyclic": cyclic}
+
+    with pytest.raises(TypeError, match="cycl"):
+        _decoded_command(evidence)
+
+
+def test_decoded_command_allows_repeated_container_on_separate_paths():
+    shared = {"items": [1, 2]}
+
+    command = _decoded_command({"left": shared, "right": shared})
+    shared["items"].append(3)
+
+    assert command.evidence["left"] == {"items": (1, 2)}
+    assert command.evidence["right"] == {"items": (1, 2)}
+    assert command.evidence["left"] is not command.evidence["right"]
 
 
 def test_reset_reason_values_are_stable_strings():
