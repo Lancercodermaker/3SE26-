@@ -21,11 +21,15 @@ class RfMetrics:
 
 @dataclass(frozen=True)
 class IqChunk:
-    """A zero-copy view of one contiguous block of received IQ samples.
+    """One contiguous block of IQ samples with transferred buffer ownership.
 
-    ``samples`` must be a read-only ``complex64`` array. Requiring the producer
-    to make the array read-only avoids both a high-throughput copy and a hidden
-    mutation of the caller's array flags.
+    The producer must transfer an exclusive, owning, one-dimensional C-order
+    ``complex64`` array whose write flag is already disabled. This keeps the
+    handoff zero-copy without changing caller-owned flags. NumPy cannot prevent
+    a former owner from deliberately enabling writes again, so the producer
+    must retain no aliases, must never restore write access, and must not reuse
+    the buffer for the lifetime of this chunk. Acquisition code is responsible
+    for copying inputs that cannot meet that ownership contract.
     """
 
     chunk_id: int
@@ -42,8 +46,16 @@ class IqChunk:
     rf_metrics: RfMetrics | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.samples, np.ndarray):
+            raise TypeError("IqChunk samples must be a numpy.ndarray")
         if self.samples.dtype != np.complex64:
             raise ValueError("IqChunk samples must be complex64")
+        if self.samples.ndim != 1:
+            raise ValueError("IqChunk samples must be one-dimensional")
+        if not self.samples.flags.c_contiguous:
+            raise ValueError("IqChunk samples must be C-contiguous")
+        if not self.samples.flags.owndata or self.samples.base is not None:
+            raise ValueError("IqChunk samples must own their backing buffer")
         if self.samples.flags.writeable:
             raise ValueError("IqChunk samples must be read-only")
 
@@ -61,7 +73,14 @@ class DecodeContext:
 
 @dataclass(frozen=True)
 class DecodedCommand:
-    """A decoder result with the evidence needed for later validation."""
+    """A decoder result with recursively frozen validation evidence.
+
+    Evidence accepts JSON-like scalar values, mappings, lists, and tuples;
+    mappings and sequences are recursively snapshotted. Recorders must convert
+    the resulting read-only mappings and tuples explicitly for JSON output.
+    Large or custom mutable objects, including arrays, are rejected instead of
+    being copied implicitly.
+    """
 
     cmd_id: int
     payload: bytes
@@ -81,11 +100,31 @@ class DecodedCommand:
     def __post_init__(self) -> None:
         if not isinstance(self.payload, bytes):
             raise TypeError("DecodedCommand payload must be bytes")
+        if not isinstance(self.evidence, Mapping):
+            raise TypeError("DecodedCommand evidence must be a mapping")
         object.__setattr__(
             self,
             "evidence",
-            MappingProxyType(dict(self.evidence)),
+            _freeze_evidence(self.evidence),
         )
+
+
+def _freeze_evidence(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, nested_value in value.items():
+            if not isinstance(key, str):
+                raise TypeError("DecodedCommand evidence mapping keys must be str")
+            frozen[key] = _freeze_evidence(nested_value)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_evidence(item) for item in value)
+    raise TypeError(
+        "unsupported evidence value type: "
+        f"{type(value).__name__}"
+    )
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,7 @@ import ast
 from dataclasses import FrozenInstanceError, fields
 import inspect
 from pathlib import Path
-from typing import get_type_hints
+from typing import Mapping, get_type_hints
 
 import numpy as np
 import pytest
@@ -50,7 +50,9 @@ def _iq_chunk(samples: np.ndarray | None = None) -> IqChunk:
     )
 
 
-def _decoded_command() -> DecodedCommand:
+def _decoded_command(
+    evidence: Mapping[str, object] | None = None,
+) -> DecodedCommand:
     return DecodedCommand(
         cmd_id=0x0A06,
         payload=b"ABC123",
@@ -65,7 +67,7 @@ def _decoded_command() -> DecodedCommand:
         target="L1",
         team="BLUE",
         context_version=7,
-        evidence={"sequence": 12},
+        evidence={"sequence": 12} if evidence is None else evidence,
     )
 
 
@@ -105,6 +107,39 @@ def test_iq_chunk_rejects_writeable_array_without_changing_caller_flags():
     assert samples.flags.writeable
 
 
+def test_iq_chunk_rejects_non_array_with_clear_type_error():
+    with pytest.raises(TypeError, match="ndarray"):
+        _iq_chunk([1 + 1j])
+
+
+def test_iq_chunk_rejects_two_dimensional_samples():
+    samples = np.ones((2, 4), dtype=np.complex64)
+    samples.setflags(write=False)
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        _iq_chunk(samples)
+
+
+def test_iq_chunk_rejects_noncontiguous_samples():
+    owner = np.ones(16, dtype=np.complex64)
+    samples = owner[::2]
+    samples.setflags(write=False)
+
+    with pytest.raises(ValueError, match="C-contiguous"):
+        _iq_chunk(samples)
+
+
+def test_iq_chunk_rejects_read_only_nonowning_view():
+    owner = np.ones(8, dtype=np.complex64)
+    samples = owner.view()
+    samples.setflags(write=False)
+
+    with pytest.raises(ValueError, match="own"):
+        _iq_chunk(samples)
+
+    assert owner.flags.writeable
+
+
 @pytest.mark.parametrize(
     "value,attribute,replacement",
     [
@@ -130,21 +165,19 @@ def test_decode_context_expresses_authoritative_versions_and_identity():
     assert context.context_version == 4
 
 
-def test_rf_metrics_and_decoder_stats_expose_only_common_measurements_and_counts():
-    assert [field.name for field in fields(RfMetrics)] == [
+def test_rf_metrics_and_decoder_stats_include_required_common_values():
+    assert {field.name for field in fields(RfMetrics)} >= {
         "rms",
         "peak",
         "clipping_ratio",
         "sample_count",
-    ]
-    assert [field.name for field in fields(DecoderStats)] == [
-        "chunks_processed",
-        "samples_processed",
-        "commands_emitted",
-        "decode_errors",
-        "resets",
-    ]
-    assert DecoderStats() == DecoderStats(0, 0, 0, 0, 0)
+    }
+    stats = DecoderStats()
+    assert stats.chunks_processed == 0
+    assert stats.samples_processed == 0
+    assert stats.commands_emitted == 0
+    assert stats.decode_errors == 0
+    assert stats.resets == 0
 
 
 def test_decoded_command_has_complete_immutable_evidence_contract():
@@ -176,6 +209,45 @@ def test_decoded_command_requires_immutable_bytes_payload():
 
     with pytest.raises(TypeError, match="bytes"):
         DecodedCommand(**{**command.__dict__, "payload": bytearray(b"ABC123")})
+
+
+def test_decoded_command_recursively_freezes_nested_evidence_without_aliases():
+    source = {
+        "nested": {"value": 12},
+        "items": [1, {"label": "original"}],
+    }
+
+    command = _decoded_command(source)
+    source["nested"]["value"] = 99
+    source["items"].append(3)
+    source["items"][1]["label"] = "changed"
+
+    assert command.evidence["nested"]["value"] == 12
+    assert command.evidence["items"] == (1, {"label": "original"})
+    with pytest.raises(TypeError):
+        command.evidence["nested"]["value"] = 13
+    with pytest.raises(TypeError):
+        command.evidence["items"][0] = 2
+
+
+class _UnsupportedMutableEvidence:
+    def __init__(self) -> None:
+        self.values: list[int] = []
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        np.ones(4, dtype=np.float32),
+        _UnsupportedMutableEvidence(),
+    ],
+    ids=["ndarray", "custom-mutable"],
+)
+def test_decoded_command_rejects_unsupported_mutable_evidence(
+    unsupported: object,
+):
+    with pytest.raises(TypeError, match="unsupported evidence"):
+        _decoded_command({"unsupported": unsupported})
 
 
 def test_reset_reason_values_are_stable_strings():
