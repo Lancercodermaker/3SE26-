@@ -96,12 +96,7 @@ def measure_rf(
     scale. Empty complex arrays return zero-valued metrics so callers can
     classify them as disconnected without numerical warnings.
     """
-    if (
-        isinstance(code_scale, (bool, np.bool_))
-        or not isinstance(code_scale, Real)
-        or not math.isfinite(float(code_scale))
-        or code_scale <= 0
-    ):
+    if not _valid_real(code_scale) or code_scale <= 0:
         raise ValueError("code_scale must be a finite positive number")
     if not isinstance(samples, np.ndarray):
         raise TypeError("samples must be a numpy.ndarray")
@@ -125,19 +120,18 @@ def measure_rf(
     real = samples.real.astype(np.float64, copy=False)
     imag = samples.imag.astype(np.float64, copy=False)
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        magnitudes = np.hypot(real, imag)
-        normalized_magnitudes = magnitudes / scale
-    if not np.isfinite(magnitudes).all() or not np.isfinite(
-        normalized_magnitudes
-    ).all():
+        normalized_real = real / scale
+        normalized_imag = imag / scale
+        magnitudes = np.hypot(normalized_real, normalized_imag)
+    if not np.isfinite(magnitudes).all():
         raise ValueError("RF measurements exceed finite range")
 
-    peak = float(np.max(normalized_magnitudes))
+    peak = float(np.max(magnitudes))
     if peak == 0.0:
         rms = 0.0
     else:
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            relative_magnitudes = normalized_magnitudes / peak
+            relative_magnitudes = magnitudes / peak
             mean_square = np.mean(
                 np.square(relative_magnitudes),
                 dtype=np.float64,

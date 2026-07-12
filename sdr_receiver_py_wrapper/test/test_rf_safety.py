@@ -58,7 +58,10 @@ def test_empty_complex_array_produces_zero_metrics_without_runtime_warning():
     )
 
 
-@pytest.mark.parametrize("code_scale", [0, -1, np.nan, np.inf, -np.inf, True])
+@pytest.mark.parametrize(
+    "code_scale",
+    [0, -1, np.nan, np.inf, -np.inf, True, 10**400],
+)
 def test_measure_rf_rejects_invalid_code_scale(code_scale):
     with pytest.raises(ValueError, match="code_scale must be a finite positive number"):
         measure_rf(np.array([1 + 1j]), code_scale=code_scale)
@@ -126,6 +129,19 @@ def test_measure_rf_rejects_normalized_magnitude_beyond_float64_range():
 
     with pytest.raises(ValueError, match="RF measurements exceed finite range"):
         measure_rf(samples, code_scale=1.0)
+
+
+def test_measure_rf_normalizes_components_before_extreme_magnitude():
+    component = np.finfo(np.float64).max
+    samples = np.array([complex(component, component)], dtype=np.complex128)
+    expected = math.hypot(component / 2048.0, component / 2048.0)
+
+    metrics = measure_rf(samples)
+
+    assert math.isfinite(metrics.rms)
+    assert math.isfinite(metrics.peak)
+    assert metrics.rms == pytest.approx(expected)
+    assert metrics.peak == pytest.approx(expected)
 
 
 def test_ad9363_clipping_is_not_rf_low():
