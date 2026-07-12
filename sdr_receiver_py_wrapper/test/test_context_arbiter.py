@@ -6,12 +6,17 @@ from pathlib import Path
 
 import pytest
 
+from sdr_receiver_py_wrapper.competition_controller import (
+    CompetitionController,
+    RadarContext,
+)
 from sdr_receiver_py_wrapper.context_arbiter import ContextArbiter, Observation
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 RECEIVER_SOURCE = PACKAGE_ROOT / "sdr_receiver_py_wrapper" / "receiver_node.py"
 COMPETITION_CONFIG = PACKAGE_ROOT / "config" / "competition_receiver.yaml"
+COMPETITION_LAUNCH = PACKAGE_ROOT / "launch" / "competition_receiver.launch.py"
 
 
 def obs(level, *, source="/judge/radar_context", self_id=9, progress=4, t=0.0):
@@ -268,6 +273,167 @@ def test_structured_decision_log_has_stable_required_fields():
     }
 
 
+def _resolve_receiver_target(decision, controller_target):
+    module = importlib.import_module("sdr_receiver_py_wrapper.context_arbiter")
+    resolver = getattr(module, "resolve_receiver_target", None)
+    assert callable(resolver), "receiver target resolver is missing"
+    return resolver(decision, controller_target)
+
+
+def _controller_context(observation):
+    return RadarContext(
+        self_id=observation.self_id,
+        self_color=observation.self_color,
+        radar_info_raw=observation.radar_info_raw,
+        jam_level=observation.jam_level,
+        key_mutable=observation.key_mutable,
+        game_progress=observation.game_progress,
+        match_time=observation.match_time,
+        referee_online=True,
+        source=observation.source,
+    )
+
+
+def test_controller_clamp_owns_effective_receiver_target():
+    arbiter = ContextArbiter("/judge/radar_context", stable_count=1, stable_sec=0.0)
+    controller = CompetitionController(max_jam_break_level=2)
+    observation = obs(3, t=0.0)
+    arbiter_decision = arbiter.observe(observation)
+    controller_decision = controller.update_context(_controller_context(observation))
+
+    assert arbiter_decision.target == "L3"
+    assert controller_decision.target == "L2"
+    assert _resolve_receiver_target(arbiter_decision, controller_decision.target) == "L2"
+
+
+def test_controller_info_state_absorbs_lower_context_target():
+    arbiter = ContextArbiter("/judge/radar_context", stable_count=1, stable_sec=0.0)
+    controller = CompetitionController(max_jam_break_level=3)
+    l3 = obs(3, t=0.0)
+    assert arbiter.observe(l3).target == "L3"
+    assert controller.update_context(_controller_context(l3)).target == "L3"
+    info = controller.handle_jam_key(level=3, key=b"ABCDEF")
+    assert info.target == "INFO"
+
+    lower = obs(1, t=1.0)
+    arbiter_decision = arbiter.observe(lower)
+    controller_decision = controller.update_context(_controller_context(lower))
+
+    assert arbiter_decision.accepted and arbiter_decision.target_changed
+    assert controller_decision.target is None
+    assert _resolve_receiver_target(arbiter_decision, controller_decision.target) is None
+
+
+@pytest.mark.parametrize(
+    ("configured", "legacy", "expected", "used_legacy"),
+    [
+        pytest.param("", "", "/judge/radar_context", False, id="built_in_default"),
+        pytest.param("", "/legacy/context", "/legacy/context", True, id="legacy_only"),
+        pytest.param("/new/context", "", "/new/context", False, id="new_only"),
+        pytest.param(
+            "/new/context",
+            "/legacy/context",
+            "/new/context",
+            False,
+            id="new_wins",
+        ),
+    ],
+)
+def test_context_authority_precedence(configured, legacy, expected, used_legacy):
+    module = importlib.import_module("sdr_receiver_py_wrapper.context_arbiter")
+    resolver = getattr(module, "resolve_context_authority", None)
+    assert callable(resolver), "context authority resolver is missing"
+
+    assert resolver(configured, legacy) == (expected, used_legacy)
+
+
+def _launch_contract(source: str):
+    tree = ast.parse(source)
+    defaults = {}
+    bindings = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == "DeclareLaunchArgument":
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            default = next(
+                (
+                    kw.value.value
+                    for kw in node.keywords
+                    if kw.arg == "default_value"
+                    and isinstance(kw.value, ast.Constant)
+                ),
+                None,
+            )
+            defaults[node.args[0].value] = default
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                continue
+            launch_configurations = [
+                child.args[0].value
+                for child in ast.walk(value)
+                if isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "LaunchConfiguration"
+                and child.args
+                and isinstance(child.args[0], ast.Constant)
+            ]
+            if launch_configurations:
+                bindings[key.value] = launch_configurations[0]
+    return defaults, bindings
+
+
+def test_competition_launch_exposes_and_wires_context_parameters():
+    defaults, bindings = _launch_contract(
+        COMPETITION_LAUNCH.read_text(encoding="utf-8")
+    )
+
+    assert defaults["context_authority_topic"] == ""
+    assert defaults["context_topic"] == ""
+    assert defaults["context_stable_count"] == "3"
+    assert defaults["context_stable_sec"] == "1.0"
+    assert defaults["lock_team_after_start"] == "true"
+    for parameter in (
+        "context_authority_topic",
+        "context_topic",
+        "context_stable_count",
+        "context_stable_sec",
+        "lock_team_after_start",
+    ):
+        assert bindings[parameter] == parameter
+
+
+def _resolve_diagnostic_values(**values):
+    module = importlib.import_module("sdr_receiver_py_wrapper.context_arbiter")
+    resolver = getattr(module, "resolve_diagnostic_values", None)
+    assert callable(resolver), "diagnostic value resolver is missing"
+    return resolver(**values)
+
+
+def test_diagnostic_cache_preserves_explicit_zero_and_false_values():
+    assert _resolve_diagnostic_values(
+        radar_info_raw=0x38,
+        jam_level=0,
+        key_mutable=False,
+        referee_online=False,
+        match_time=400,
+    ) == (0, False, False)
+
+
+def test_diagnostic_cache_derives_only_unknown_values():
+    assert _resolve_diagnostic_values(
+        radar_info_raw=0x38,
+        jam_level=None,
+        key_mutable=None,
+        referee_online=None,
+        match_time=400,
+    ) == (3, True, True)
+
+
 def _method_source(source: str, method_name: str) -> str:
     tree = ast.parse(source)
     receiver_class = next(
@@ -292,12 +458,17 @@ def test_receiver_routes_authority_and_diagnostics_through_one_arbiter_entry():
     assert "self._observe_context(" in _method_source(
         source, "_publish_fallback_context_if_ready"
     )
-    assert "if self_id == 0" not in _method_source(
-        source, "_publish_fallback_context_if_ready"
-    )
+    fallback_entry = _method_source(source, "_publish_fallback_context_if_ready")
+    assert "if self_id == 0" not in fallback_entry
+    assert "resolve_diagnostic_values(" in fallback_entry
+    node_init = _method_source(source, "__init__")
+    assert "self._fallback_jam_level = None" in node_init
+    assert "self._fallback_key_mutable = None" in node_init
+    assert "self._fallback_referee_online = None" in node_init
     arbiter_entry = _method_source(source, "_observe_context")
     assert "format_context_decision_log" in arbiter_entry
     assert "if decision.accepted and decision.target_changed:" in arbiter_entry
+    assert "controller_decision.target," in arbiter_entry
     assert "self._set_receiver_target_or_profile(" in arbiter_entry
 
 

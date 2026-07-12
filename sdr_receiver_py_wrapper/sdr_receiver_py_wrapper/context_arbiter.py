@@ -2,6 +2,9 @@ from dataclasses import dataclass
 import json
 
 
+CANONICAL_CONTEXT_AUTHORITY = "/judge/radar_context"
+
+
 @dataclass(frozen=True)
 class Observation:
     source: str
@@ -121,3 +124,35 @@ def format_context_decision_log(observation, decision):
         },
         sort_keys=True,
     )
+
+
+def resolve_receiver_target(decision, controller_target):
+    if not decision.accepted or not decision.target_changed:
+        return None
+    return controller_target
+
+
+def resolve_context_authority(configured_authority, legacy_context_topic):
+    configured = str(configured_authority or "").strip()
+    legacy = str(legacy_context_topic or "").strip()
+    if configured:
+        return configured, False
+    if legacy:
+        return legacy, True
+    return CANONICAL_CONTEXT_AUTHORITY, False
+
+
+def resolve_diagnostic_values(
+    *, radar_info_raw, jam_level, key_mutable, referee_online, match_time
+):
+    raw = int(radar_info_raw) & 0xFF
+    resolved_level = (raw >> 3) & 0x03 if jam_level is None else int(jam_level)
+    resolved_key_mutable = (
+        ((raw >> 5) & 0x01) != 0 if key_mutable is None else bool(key_mutable)
+    )
+    resolved_referee_online = (
+        int(match_time) != -200
+        if referee_online is None
+        else bool(referee_online)
+    )
+    return resolved_level, resolved_key_mutable, resolved_referee_online

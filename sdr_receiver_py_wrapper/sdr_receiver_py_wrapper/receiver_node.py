@@ -18,7 +18,14 @@ from std_msgs.msg import String, UInt8
 from sdr_receiver.msg import JamCode, RadarContext as RadarContextMsg, RadarWirelessFrame
 
 from .competition_controller import CompetitionController, RadarContext
-from .context_arbiter import ContextArbiter, Observation, format_context_decision_log
+from .context_arbiter import (
+    ContextArbiter,
+    Observation,
+    format_context_decision_log,
+    resolve_context_authority,
+    resolve_diagnostic_values,
+    resolve_receiver_target,
+)
 from .original_receiver_adapter import ReceiverCoreAdapter
 from .patches import JamKeyEvent, PatchCallbacks, RawFrameEvent, TargetChangeEvent
 from .profile_import import AdaptiveProfileLoadError, load_adaptive_profile
@@ -186,17 +193,16 @@ class SdrReceiverPyWrapperNode(Node):
         self.start_receiver = bool(self.get_parameter("start_receiver").value)
         self.import_allow_adi_stub = bool(self.get_parameter("import_allow_adi_stub").value)
         self.iq_source_path = str(self.get_parameter("iq_source_path").value).strip()
-        configured_authority = str(
-            self.get_parameter("context_authority_topic").value
-        ).strip()
-        legacy_context_topic = str(self.get_parameter("context_topic").value).strip()
-        if legacy_context_topic and configured_authority == "/judge/radar_context":
-            self.context_authority_topic = legacy_context_topic
+        self.context_authority_topic, used_legacy_context_topic = (
+            resolve_context_authority(
+                self.get_parameter("context_authority_topic").value,
+                self.get_parameter("context_topic").value,
+            )
+        )
+        if used_legacy_context_topic:
             self.get_logger().warn(
                 "context_topic is deprecated; use context_authority_topic"
             )
-        else:
-            self.context_authority_topic = configured_authority or "/judge/radar_context"
         # Backward-compatible attribute only; exactly one authority subscription is created.
         self.context_topic = self.context_authority_topic
         self.enable_fallback_topics = bool(self.get_parameter("enable_fallback_topics").value)
@@ -217,9 +223,9 @@ class SdrReceiverPyWrapperNode(Node):
         self._fallback_game_progress = 0
         self._fallback_match_time = 0
         self._fallback_radar_info_raw = 0
-        self._fallback_jam_level = 0
-        self._fallback_key_mutable = False
-        self._fallback_referee_online = False
+        self._fallback_jam_level = None
+        self._fallback_key_mutable = None
+        self._fallback_referee_online = None
 
         self.controller = CompetitionController(
             max_jam_break_level=int(self.get_parameter("max_jam_break_level").value),
@@ -313,7 +319,7 @@ class SdrReceiverPyWrapperNode(Node):
         self.declare_parameter("iq_source_center_hz", 0.0)
         self.declare_parameter("iq_source_start_offset_sec", 0.0)
         self.declare_parameter("iq_source_sample_rate", 0)
-        self.declare_parameter("context_authority_topic", "/judge/radar_context")
+        self.declare_parameter("context_authority_topic", "")
         self.declare_parameter("context_stable_count", 3)
         self.declare_parameter("context_stable_sec", 1.0)
         self.declare_parameter("lock_team_after_start", True)
@@ -546,21 +552,27 @@ class SdrReceiverPyWrapperNode(Node):
     def _publish_fallback_context_if_ready(self, *, source: str) -> None:
         self_id = self._fallback_self_id()
         raw = self._fallback_radar_info_raw
+        jam_level, key_mutable, referee_online = resolve_diagnostic_values(
+            radar_info_raw=raw,
+            jam_level=self._fallback_jam_level,
+            key_mutable=self._fallback_key_mutable,
+            referee_online=self._fallback_referee_online,
+            match_time=self._fallback_match_time,
+        )
         observation = Observation(
             source=source,
             self_id=self_id,
             self_color=self._fallback_self_color,
             radar_info_raw=raw,
-            jam_level=self._fallback_jam_level or _radar_info_to_level(raw),
-            key_mutable=self._fallback_key_mutable or _radar_info_to_key_mutable(raw),
+            jam_level=jam_level,
+            key_mutable=key_mutable,
             game_progress=self._fallback_game_progress,
             match_time=self._fallback_match_time,
             received_monotonic=time.monotonic(),
         )
         self._observe_context(
             observation,
-            referee_online=self._fallback_referee_online
-            or self._fallback_match_time != -200,
+            referee_online=referee_online,
         )
 
     def _fallback_self_id(self) -> int:
@@ -607,11 +619,16 @@ class SdrReceiverPyWrapperNode(Node):
                 f"(own={self.controller.own_team}): {controller_decision.reason}"
             )
         if decision.accepted and decision.target_changed:
-            self._set_receiver_target_or_profile(
-                decision.target,
-                reason=decision.reason,
-                team=controller_decision.team or self.controller.rx_team,
+            target = resolve_receiver_target(
+                decision,
+                controller_decision.target,
             )
+            if target:
+                self._set_receiver_target_or_profile(
+                    target,
+                    reason=controller_decision.reason,
+                    team=controller_decision.team or self.controller.rx_team,
+                )
 
     def _on_jam_key(self, event: JamKeyEvent) -> None:
         if self.run_mode == "competition":

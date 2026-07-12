@@ -14,7 +14,11 @@ def generate_launch_description():
             DeclareLaunchArgument("max_jam_break_level", default_value="3"),
             DeclareLaunchArgument("key_publish_min_interval_sec", default_value="0.5"),
             DeclareLaunchArgument("key_retry_limit", default_value="-1"),
-            DeclareLaunchArgument("context_topic", default_value="/judge/radar_context"),
+            DeclareLaunchArgument("context_authority_topic", default_value=""),
+            DeclareLaunchArgument("context_topic", default_value=""),
+            DeclareLaunchArgument("context_stable_count", default_value="3"),
+            DeclareLaunchArgument("context_stable_sec", default_value="1.0"),
+            DeclareLaunchArgument("lock_team_after_start", default_value="true"),
             DeclareLaunchArgument("enable_fallback_topics", default_value="true"),
             DeclareLaunchArgument("fallback_self_id", default_value="0"),
             DeclareLaunchArgument("profile_path", default_value=""),
@@ -68,7 +72,22 @@ def generate_launch_description():
                             LaunchConfiguration("key_retry_limit"),
                             value_type=int,
                         ),
+                        "context_authority_topic": LaunchConfiguration(
+                            "context_authority_topic"
+                        ),
                         "context_topic": LaunchConfiguration("context_topic"),
+                        "context_stable_count": ParameterValue(
+                            LaunchConfiguration("context_stable_count"),
+                            value_type=int,
+                        ),
+                        "context_stable_sec": ParameterValue(
+                            LaunchConfiguration("context_stable_sec"),
+                            value_type=float,
+                        ),
+                        "lock_team_after_start": ParameterValue(
+                            LaunchConfiguration("lock_team_after_start"),
+                            value_type=bool,
+                        ),
                         "enable_fallback_topics": ParameterValue(
                             LaunchConfiguration("enable_fallback_topics"),
                             value_type=bool,
