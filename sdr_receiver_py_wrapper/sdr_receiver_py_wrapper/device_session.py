@@ -33,6 +33,7 @@ class DeviceSession:
         self._lock = RLock()
         self._backend = None
         self._settings = {}
+        self._lifecycle_generation = 0
         self._connects = 0
         self._reconnects = 0
         self._read_errors = 0
@@ -68,6 +69,7 @@ class DeviceSession:
             raise RuntimeError("backend factory returned None")
         self._backend = backend
         self._connects += 1
+        self._lifecycle_generation += 1
 
     def _require_backend_locked(self):
         if self._backend is None:
@@ -128,9 +130,13 @@ class DeviceSession:
                 raise DeviceReadError("failed to read receiver IQ") from exc
 
     def reconnect(self):
+        with self._lock:
+            lifecycle_generation = self._lifecycle_generation
         if self._reconnect_backoff_sec > 0:
             time.sleep(self._reconnect_backoff_sec)
         with self._lock:
+            if lifecycle_generation != self._lifecycle_generation:
+                return False
             try:
                 self._release_backend_locked()
                 self._connect_locked()
@@ -141,12 +147,18 @@ class DeviceSession:
             return True
 
     def snapshot(self):
+        """Return the last fully successful requested settings.
+
+        This is not live hardware truth after a failed write. Reconnect and
+        reconfigure the receiver before relying on settings after such a failure.
+        """
         with self._lock:
             return dict(self._settings)
 
     def close(self):
         with self._lock:
             if self._backend is None:
+                self._lifecycle_generation += 1
                 return None
             try:
                 self._release_backend_locked()
@@ -162,6 +174,7 @@ class DeviceSession:
 
         # Detach first so even a broken cleanup hook cannot leak a usable handle.
         self._backend = None
+        self._lifecycle_generation += 1
         cleanup = self._find_cleanup(backend)
         if cleanup is not None:
             cleanup()

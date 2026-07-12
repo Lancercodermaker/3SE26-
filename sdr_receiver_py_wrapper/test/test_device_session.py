@@ -12,6 +12,13 @@ from sdr_receiver_py_wrapper.device_session import (
 )
 
 
+POSITIVE_WAIT_TIMEOUT_SEC = 3.0
+
+
+def wait_for_event(event):
+    assert event.wait(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
+
+
 class FakePlutoBackend:
     def __init__(self, iq=None):
         self.sample_rate = None
@@ -329,7 +336,7 @@ def test_reconnect_does_not_hold_session_lock_during_backoff(monkeypatch):
     def controlled_sleep(seconds):
         assert seconds == 1.0
         sleeping.set()
-        assert release_sleep.wait(timeout=1.0)
+        wait_for_event(release_sleep)
 
     def run_reconnect():
         try:
@@ -340,17 +347,178 @@ def test_reconnect_does_not_hold_session_lock_during_backoff(monkeypatch):
     monkeypatch.setattr(device_session_module.time, "sleep", controlled_sleep)
     worker = threading.Thread(target=run_reconnect)
     worker.start()
-    assert sleeping.wait(timeout=1.0)
+    wait_for_event(sleeping)
 
     assert session.snapshot() == {}
     assert first.close_calls == 0
 
     release_sleep.set()
-    worker.join(timeout=1.0)
+    worker.join(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
     assert not worker.is_alive()
     assert errors == []
     assert results == [True]
     assert first.close_calls == 1
+
+
+def test_close_cancels_reconnect_waiting_in_backoff(monkeypatch):
+    first = FakePlutoBackend()
+    factory = SequenceFactory(first, FakePlutoBackend())
+    session = DeviceSession(factory, reconnect_backoff_sec=1.0)
+    sleeping = threading.Event()
+    release_sleep = threading.Event()
+    results = []
+    errors = []
+
+    def controlled_sleep(seconds):
+        assert seconds == 1.0
+        sleeping.set()
+        wait_for_event(release_sleep)
+
+    def run_reconnect():
+        try:
+            results.append(session.reconnect())
+        except Exception as exc:  # pragma: no cover - assertion reports thread failure
+            errors.append(exc)
+
+    monkeypatch.setattr(device_session_module.time, "sleep", controlled_sleep)
+    worker = threading.Thread(target=run_reconnect)
+    worker.start()
+    wait_for_event(sleeping)
+
+    session.close()
+    release_sleep.set()
+    worker.join(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert results == [False]
+    assert first.close_calls == 1
+    assert factory.calls == 1
+    assert session.stats.reconnects == 0
+
+
+def test_close_cancels_reconnect_when_failed_read_already_cleared_backend(monkeypatch):
+    read_error = RuntimeError("rx failed")
+    first = ReadFailingBackend(read_error)
+    factory = SequenceFactory(first, FakePlutoBackend())
+    session = DeviceSession(factory, reconnect_backoff_sec=1.0)
+
+    with pytest.raises(DeviceReadError):
+        session.read()
+
+    sleeping = threading.Event()
+    release_sleep = threading.Event()
+    results = []
+    errors = []
+
+    def controlled_sleep(seconds):
+        assert seconds == 1.0
+        sleeping.set()
+        wait_for_event(release_sleep)
+
+    def run_reconnect():
+        try:
+            results.append(session.reconnect())
+        except Exception as exc:  # pragma: no cover - assertion reports thread failure
+            errors.append(exc)
+
+    monkeypatch.setattr(device_session_module.time, "sleep", controlled_sleep)
+    worker = threading.Thread(target=run_reconnect)
+    worker.start()
+    wait_for_event(sleeping)
+
+    session.close()
+    release_sleep.set()
+    worker.join(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert results == [False]
+    assert first.close_calls == 1
+    assert factory.calls == 1
+    assert session.stats.reconnects == 0
+
+
+def test_close_and_connect_supersede_sleeping_reconnect_without_closing_new_backend(
+    monkeypatch,
+):
+    first = FakePlutoBackend()
+    replacement_iq = object()
+    replacement = FakePlutoBackend(iq=replacement_iq)
+    unused_third = FakePlutoBackend()
+    factory = SequenceFactory(first, replacement, unused_third)
+    session = DeviceSession(factory, reconnect_backoff_sec=1.0)
+    sleeping = threading.Event()
+    release_sleep = threading.Event()
+    results = []
+    errors = []
+
+    def controlled_sleep(seconds):
+        assert seconds == 1.0
+        sleeping.set()
+        wait_for_event(release_sleep)
+
+    def run_reconnect():
+        try:
+            results.append(session.reconnect())
+        except Exception as exc:  # pragma: no cover - assertion reports thread failure
+            errors.append(exc)
+
+    monkeypatch.setattr(device_session_module.time, "sleep", controlled_sleep)
+    worker = threading.Thread(target=run_reconnect)
+    worker.start()
+    wait_for_event(sleeping)
+
+    session.close()
+    session.connect()
+    release_sleep.set()
+    worker.join(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert results == [False]
+    assert first.close_calls == 1
+    assert replacement.close_calls == 0
+    assert factory.calls == 2
+    assert session.stats.reconnects == 0
+    assert session.read() is replacement_iq
+
+
+def test_two_reconnects_from_same_generation_allow_only_one_replacement(monkeypatch):
+    first = FakePlutoBackend()
+    replacement = FakePlutoBackend()
+    unused_third = FakePlutoBackend()
+    factory = SequenceFactory(first, replacement, unused_third)
+    session = DeviceSession(factory, reconnect_backoff_sec=1.0)
+    both_sleeping = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def controlled_sleep(seconds):
+        assert seconds == 1.0
+        both_sleeping.wait(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
+
+    def run_reconnect():
+        try:
+            results.append(session.reconnect())
+        except Exception as exc:  # pragma: no cover - assertion reports thread failure
+            errors.append(exc)
+
+    monkeypatch.setattr(device_session_module.time, "sleep", controlled_sleep)
+    workers = [threading.Thread(target=run_reconnect) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    both_sleeping.wait(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
+    for worker in workers:
+        worker.join(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert sorted(results) == [False, True]
+    assert first.close_calls == 1
+    assert replacement.close_calls == 0
+    assert factory.calls == 2
+    assert session.stats.reconnects == 1
 
 
 @pytest.mark.parametrize(
@@ -465,9 +633,9 @@ def test_hardware_operations_all_use_the_session_rlock(operation_name):
     with session._lock:
         worker = threading.Thread(target=run_operation)
         worker.start()
-        assert started.wait(timeout=1.0)
+        wait_for_event(started)
         assert not finished.wait(timeout=0.05)
 
-    worker.join(timeout=1.0)
+    worker.join(timeout=POSITIVE_WAIT_TIMEOUT_SEC)
     assert not worker.is_alive()
     assert errors == []
