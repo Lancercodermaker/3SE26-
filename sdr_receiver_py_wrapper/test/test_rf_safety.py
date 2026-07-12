@@ -1,3 +1,4 @@
+import math
 import warnings
 from dataclasses import FrozenInstanceError
 
@@ -101,6 +102,32 @@ def test_measure_rf_accepts_complex128_without_mutating_the_input():
     np.testing.assert_array_equal(samples, before)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "component"),
+    [
+        (np.complex64, 1e30),
+        (np.complex128, 1e200),
+    ],
+)
+def test_measure_rf_keeps_representable_extreme_metrics_finite(dtype, component):
+    samples = np.array([complex(component, component)], dtype=dtype)
+
+    metrics = measure_rf(samples)
+
+    assert math.isfinite(metrics.rms)
+    assert math.isfinite(metrics.peak)
+    assert metrics.rms == pytest.approx(math.hypot(component, component) / 2048.0)
+    assert metrics.peak == pytest.approx(math.hypot(component, component) / 2048.0)
+
+
+def test_measure_rf_rejects_normalized_magnitude_beyond_float64_range():
+    component = np.finfo(np.float64).max
+    samples = np.array([complex(component, component)], dtype=np.complex128)
+
+    with pytest.raises(ValueError, match="RF measurements exceed finite range"):
+        measure_rf(samples, code_scale=1.0)
+
+
 def test_ad9363_clipping_is_not_rf_low():
     samples = np.full(4096, 2047 + 2047j, dtype=np.complex64)
     metrics = measure_rf(samples, code_scale=2048.0)
@@ -196,6 +223,33 @@ def test_classify_rf_requires_rf_metrics():
         classify_rf(object())
 
 
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        RfMetrics(np.nan, 1.0, 0.0, 100),
+        RfMetrics(np.inf, np.inf, 0.0, 100),
+        RfMetrics(-0.1, 1.0, 0.0, 100),
+        RfMetrics(True, 1.0, 0.0, 100),
+        RfMetrics(0.1, np.nan, 0.0, 100),
+        RfMetrics(0.1, np.inf, 0.0, 100),
+        RfMetrics(0.1, -0.1, 0.0, 100),
+        RfMetrics(0.1, True, 0.0, 100),
+        RfMetrics(0.1, 1.0, np.nan, 100),
+        RfMetrics(0.1, 1.0, np.inf, 100),
+        RfMetrics(0.1, 1.0, -0.1, 100),
+        RfMetrics(0.1, 1.0, 1.1, 100),
+        RfMetrics(0.1, 1.0, True, 100),
+        RfMetrics(0.1, 1.0, 0.0, -1),
+        RfMetrics(0.1, 1.0, 0.0, 1.5),
+        RfMetrics(0.1, 1.0, 0.0, True),
+        RfMetrics(1.1, 1.0, 0.0, 100),
+    ],
+)
+def test_classify_rf_rejects_invalid_metrics(metrics):
+    with pytest.raises(ValueError, match="RF metrics are invalid"):
+        classify_rf(metrics)
+
+
 def test_clipped_signal_reduces_gain_by_six_db():
     decision = RfSafetyController(min_gain=0, max_gain=50).decide(
         RfState.CLIPPED,
@@ -287,6 +341,26 @@ def test_controller_clamps_every_decision_and_out_of_range_input_gain(
 def test_controller_rejects_invalid_configuration(kwargs):
     with pytest.raises(ValueError, match="RF safety controller configuration"):
         RfSafetyController(**kwargs)
+
+
+def test_controller_rejects_integer_too_large_for_finite_float():
+    with pytest.raises(ValueError, match="RF safety controller configuration"):
+        RfSafetyController(min_gain=0, max_gain=10**400)
+
+
+def test_controller_handles_finite_numpy_scalars_without_arithmetic_warning():
+    float_max = np.finfo(np.float64).max
+    controller = RfSafetyController(
+        min_gain=np.float64(-float_max),
+        max_gain=np.float64(float_max),
+        weak_step=np.float64(float_max),
+    )
+
+    decision = controller.decide(RfState.TOO_WEAK, np.float64(float_max))
+
+    assert type(decision.new_gain) is float
+    assert decision.new_gain == float_max
+    assert decision.reason == "weak_signal_increase_gain"
 
 
 @pytest.mark.parametrize("current_gain", [np.nan, np.inf, -np.inf, True, "20"])

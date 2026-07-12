@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass
 from enum import Enum
-from numbers import Real
+from numbers import Integral, Real
 
 import numpy as np
 
@@ -62,23 +62,26 @@ class RfSafetyController:
         if not _valid_real(current_gain):
             raise ValueError("current_gain must be a finite number")
 
+        gain = float(current_gain)
+        min_gain = float(self.min_gain)
+        max_gain = float(self.max_gain)
         if state == RfState.CLIPPED:
-            target_gain = current_gain - self.clipped_step
+            target_gain = gain - float(self.clipped_step)
             reason = "clipping_reduce_gain"
         elif state == RfState.TOO_STRONG:
-            target_gain = current_gain - self.strong_step
+            target_gain = gain - float(self.strong_step)
             reason = "strong_signal_reduce_gain"
         elif state == RfState.TOO_WEAK:
-            target_gain = current_gain + self.weak_step
+            target_gain = gain + float(self.weak_step)
             reason = "weak_signal_increase_gain"
         elif state == RfState.LINEAR:
-            target_gain = current_gain
+            target_gain = gain
             reason = "linear_hold_gain"
         else:
-            target_gain = current_gain
+            target_gain = gain
             reason = "disconnected_hold_gain"
 
-        new_gain = min(self.max_gain, max(self.min_gain, target_gain))
+        new_gain = min(max_gain, max(min_gain, target_gain))
         return GainDecision(new_gain=new_gain, reason=reason)
 
 
@@ -119,13 +122,32 @@ def measure_rf(
         )
 
     scale = float(code_scale)
-    magnitudes = np.abs(samples)
-    rms = float(np.sqrt(np.mean(np.square(magnitudes), dtype=np.float64)) / scale)
-    peak = float(np.max(magnitudes) / scale)
+    real = samples.real.astype(np.float64, copy=False)
+    imag = samples.imag.astype(np.float64, copy=False)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        magnitudes = np.hypot(real, imag)
+        normalized_magnitudes = magnitudes / scale
+    if not np.isfinite(magnitudes).all() or not np.isfinite(
+        normalized_magnitudes
+    ).all():
+        raise ValueError("RF measurements exceed finite range")
+
+    peak = float(np.max(normalized_magnitudes))
+    if peak == 0.0:
+        rms = 0.0
+    else:
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            relative_magnitudes = normalized_magnitudes / peak
+            mean_square = np.mean(
+                np.square(relative_magnitudes),
+                dtype=np.float64,
+            )
+            rms = float(peak * np.sqrt(mean_square))
+    if not math.isfinite(rms) or not math.isfinite(peak):
+        raise ValueError("RF measurements exceed finite range")
+
     clipping_level = 0.98 * scale
-    clipped = (np.abs(samples.real) >= clipping_level) | (
-        np.abs(samples.imag) >= clipping_level
-    )
+    clipped = (np.abs(real) >= clipping_level) | (np.abs(imag) >= clipping_level)
     clipping_ratio = float(np.count_nonzero(clipped) / sample_count)
     return RfMetrics(
         rms=rms,
@@ -151,6 +173,19 @@ def classify_rf(
         raise ValueError("RF classification thresholds are invalid")
     if weak_rms < 0 or strong_rms <= weak_rms:
         raise ValueError("RF classification thresholds are invalid")
+    if (
+        not _valid_real(metrics.rms)
+        or metrics.rms < 0
+        or not _valid_real(metrics.peak)
+        or metrics.peak < 0
+        or metrics.rms > metrics.peak
+        or not _valid_real(metrics.clipping_ratio)
+        or not 0 <= metrics.clipping_ratio <= 1
+        or isinstance(metrics.sample_count, (bool, np.bool_))
+        or not isinstance(metrics.sample_count, Integral)
+        or metrics.sample_count < 0
+    ):
+        raise ValueError("RF metrics are invalid")
 
     if metrics.sample_count == 0:
         return RfState.DISCONNECTED
@@ -164,8 +199,9 @@ def classify_rf(
 
 
 def _valid_real(value: object) -> bool:
-    return (
-        not isinstance(value, (bool, np.bool_))
-        and isinstance(value, Real)
-        and math.isfinite(float(value))
-    )
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
