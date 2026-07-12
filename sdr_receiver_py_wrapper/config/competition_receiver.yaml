@@ -3,7 +3,10 @@ sdr_receiver_py_wrapper_competition:
     run_mode: competition
     publish_ros_outputs: true
     debug_accept_ros_control: false
-    context_topic: /judge/radar_context
+    context_authority_topic: /judge/radar_context
+    context_stable_count: 3
+    context_stable_sec: 1.0
+    lock_team_after_start: true
     enable_fallback_topics: true
     fallback_self_id: 0
     max_jam_break_level: 3

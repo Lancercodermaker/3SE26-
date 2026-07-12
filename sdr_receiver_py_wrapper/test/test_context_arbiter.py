@@ -1,6 +1,17 @@
+import ast
+import importlib
+import inspect
+import json
+from pathlib import Path
+
 import pytest
 
 from sdr_receiver_py_wrapper.context_arbiter import ContextArbiter, Observation
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+RECEIVER_SOURCE = PACKAGE_ROOT / "sdr_receiver_py_wrapper" / "receiver_node.py"
+COMPETITION_CONFIG = PACKAGE_ROOT / "config" / "competition_receiver.yaml"
 
 
 def obs(level, *, source="/judge/radar_context", self_id=9, progress=4, t=0.0):
@@ -173,3 +184,127 @@ def test_prematch_l3_is_logged_but_does_not_retune():
         assert result.level is None
 
     assert arbiter.accepted_level is None
+
+
+def test_decision_version_only_advances_for_accepted_context():
+    arbiter = ContextArbiter("/judge/radar_context", stable_count=2, stable_sec=1.0)
+
+    pending = arbiter.observe(obs(1, t=0.0))
+    assert getattr(pending, "context_version", None) == 0
+    diagnostic = arbiter.observe(obs(3, source="/match_info", t=0.5))
+    assert getattr(diagnostic, "context_version", None) == 0
+    accepted = arbiter.observe(obs(1, t=1.0))
+    assert getattr(accepted, "context_version", None) == 1
+    invalid = arbiter.observe(obs(2, self_id=176, t=2.0))
+    assert getattr(invalid, "context_version", None) == 1
+    unchanged = arbiter.observe(obs(1, t=2.1))
+    assert unchanged.accepted is True
+    assert unchanged.target_changed is False
+    assert getattr(unchanged, "context_version", None) == 2
+
+
+def test_lock_team_after_start_is_a_constructor_option_and_blocks_flip():
+    assert "lock_team_after_start" in inspect.signature(ContextArbiter).parameters
+    arbiter = ContextArbiter(
+        "/judge/radar_context",
+        stable_count=1,
+        stable_sec=0.0,
+        lock_team_after_start=True,
+    )
+    accepted = arbiter.observe(obs(1, self_id=9, progress=4, t=0.0))
+    assert accepted.accepted is True
+    assert arbiter.own_team == "RED"
+
+    rejected = arbiter.observe(obs(3, self_id=109, progress=4, t=1.0))
+
+    assert_rejected_decision(rejected, "team_locked", level=1)
+    assert rejected.context_version == 1
+    assert arbiter.own_team == "RED"
+    assert arbiter.accepted_level == 1
+
+
+def test_team_can_change_when_lock_is_disabled():
+    arbiter = ContextArbiter(
+        "/judge/radar_context",
+        stable_count=1,
+        stable_sec=0.0,
+        lock_team_after_start=False,
+    )
+    assert arbiter.observe(obs(1, self_id=9, progress=4, t=0.0)).accepted
+
+    changed = arbiter.observe(obs(3, self_id=109, progress=4, t=1.0))
+
+    assert changed.accepted is True
+    assert changed.context_version == 2
+    assert arbiter.own_team == "BLUE"
+    assert arbiter.accepted_level == 3
+
+
+def test_structured_decision_log_has_stable_required_fields():
+    module = importlib.import_module("sdr_receiver_py_wrapper.context_arbiter")
+    formatter = getattr(module, "format_context_decision_log", None)
+    assert callable(formatter)
+    arbiter = ContextArbiter("/judge/radar_context", stable_count=1, stable_sec=0.0)
+    observation = obs(1, t=2.5)
+    decision = arbiter.observe(observation)
+
+    payload = json.loads(formatter(observation, decision))
+
+    assert payload == {
+        "accepted": True,
+        "context_version": 1,
+        "raw": {
+            "game_progress": 4,
+            "jam_level": 1,
+            "key_mutable": True,
+            "match_time": 400,
+            "radar_info_raw": 40,
+            "self_color": 2,
+            "self_id": 9,
+        },
+        "reason": "stable_level",
+        "source": "/judge/radar_context",
+        "target_changed": True,
+    }
+
+
+def _method_source(source: str, method_name: str) -> str:
+    tree = ast.parse(source)
+    receiver_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SdrReceiverPyWrapperNode"
+    )
+    for node in receiver_class.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == method_name:
+            return ast.get_source_segment(source, node) or ""
+    raise AssertionError(f"method {method_name} not found")
+
+
+def test_receiver_routes_authority_and_diagnostics_through_one_arbiter_entry():
+    source = RECEIVER_SOURCE.read_text(encoding="utf-8")
+
+    assert "self.context_authority_topic" in source
+    assert "ContextArbiter(" in source
+    assert "self.context_authority_topic," in _method_source(source, "__init__")
+    assert "self._observe_context(" in _method_source(source, "_on_radar_context")
+    assert "self._observe_context(" in _method_source(source, "_on_match_info")
+    assert "self._observe_context(" in _method_source(
+        source, "_publish_fallback_context_if_ready"
+    )
+    assert "if self_id == 0" not in _method_source(
+        source, "_publish_fallback_context_if_ready"
+    )
+    arbiter_entry = _method_source(source, "_observe_context")
+    assert "format_context_decision_log" in arbiter_entry
+    assert "if decision.accepted and decision.target_changed:" in arbiter_entry
+    assert "self._set_receiver_target_or_profile(" in arbiter_entry
+
+
+def test_competition_config_enables_authority_stability_and_team_lock():
+    source = COMPETITION_CONFIG.read_text(encoding="utf-8")
+
+    assert "context_authority_topic: /judge/radar_context" in source
+    assert "context_stable_count: 3" in source
+    assert "context_stable_sec: 1.0" in source
+    assert "lock_team_after_start: true" in source

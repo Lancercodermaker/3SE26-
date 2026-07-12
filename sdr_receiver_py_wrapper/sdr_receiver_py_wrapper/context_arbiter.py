@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 
 
 @dataclass(frozen=True)
@@ -21,57 +22,58 @@ class Decision:
     reason: str
     level: int | None
     target: str | None
+    context_version: int
 
 
 class ContextArbiter:
-    def __init__(self, authority, stable_count=3, stable_sec=1.0):
+    def __init__(
+        self,
+        authority,
+        stable_count=3,
+        stable_sec=1.0,
+        lock_team_after_start=True,
+    ):
         self.authority = authority
         self.stable_count = stable_count
         self.stable_sec = stable_sec
+        self.lock_team_after_start = lock_team_after_start
         self.own_team = None
         self.accepted_level = None
+        self.context_version = 0
         self._candidate_level = None
         self._candidate_count = 0
         self._candidate_since = None
+        self._team_locked = False
+
+    def _reject(self, reason):
+        return Decision(
+            accepted=False,
+            target_changed=False,
+            reason=reason,
+            level=self.accepted_level,
+            target=None,
+            context_version=self.context_version,
+        )
 
     def observe(self, observation):
         if observation.source != self.authority:
-            return Decision(
-                accepted=False,
-                target_changed=False,
-                reason="diagnostic_source",
-                level=self.accepted_level,
-                target=None,
-            )
+            return self._reject("diagnostic_source")
 
         if observation.self_id not in (9, 109):
-            return Decision(
-                accepted=False,
-                target_changed=False,
-                reason="invalid_radar_id",
-                level=self.accepted_level,
-                target=None,
-            )
+            return self._reject("invalid_radar_id")
 
-        self.own_team = "RED" if observation.self_id == 9 else "BLUE"
+        observed_team = "RED" if observation.self_id == 9 else "BLUE"
+        if self._team_locked and observed_team != self.own_team:
+            return self._reject("team_locked")
+        self.own_team = observed_team
+        if self.lock_team_after_start and observation.game_progress == 4:
+            self._team_locked = True
 
         if observation.game_progress != 4:
-            return Decision(
-                accepted=False,
-                target_changed=False,
-                reason="prematch_observation",
-                level=self.accepted_level,
-                target=None,
-            )
+            return self._reject("prematch_observation")
 
         if observation.jam_level not in (1, 2, 3):
-            return Decision(
-                accepted=False,
-                target_changed=False,
-                reason="invalid_level",
-                level=self.accepted_level,
-                target=None,
-            )
+            return self._reject("invalid_level")
 
         if observation.jam_level != self._candidate_level:
             self._candidate_level = observation.jam_level
@@ -84,20 +86,38 @@ class ContextArbiter:
             observation.received_monotonic - self._candidate_since >= self.stable_sec
         )
         if not stable:
-            return Decision(
-                accepted=False,
-                target_changed=False,
-                reason="level_not_stable",
-                level=self.accepted_level,
-                target=None,
-            )
+            return self._reject("level_not_stable")
 
         changed = self.accepted_level != observation.jam_level
         self.accepted_level = observation.jam_level
+        self.context_version += 1
         return Decision(
             accepted=True,
             target_changed=changed,
             reason="stable_level",
             level=self.accepted_level,
             target=f"L{self.accepted_level}",
+            context_version=self.context_version,
         )
+
+
+def format_context_decision_log(observation, decision):
+    return json.dumps(
+        {
+            "source": observation.source,
+            "raw": {
+                "self_id": observation.self_id,
+                "self_color": observation.self_color,
+                "radar_info_raw": observation.radar_info_raw,
+                "jam_level": observation.jam_level,
+                "key_mutable": observation.key_mutable,
+                "game_progress": observation.game_progress,
+                "match_time": observation.match_time,
+            },
+            "accepted": decision.accepted,
+            "target_changed": decision.target_changed,
+            "reason": decision.reason,
+            "context_version": decision.context_version,
+        },
+        sort_keys=True,
+    )
