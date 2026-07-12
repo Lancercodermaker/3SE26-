@@ -14,6 +14,7 @@
 #include "robot_referee/log_sys.h"
 #include "sdr_receiver/msg/radar_wireless_frame.hpp"
 #include "sdr_receiver/msg/jam_code.hpp"
+#include "sdr_receiver/msg/radar_context.hpp"
 #include "vision_interface/msg/detect_result.hpp"
 
 
@@ -65,6 +66,7 @@ private:
     rclcpp::Subscription<sdr_receiver::msg::JamCode>::SharedPtr _wirelessKey_Sub;
     rclcpp::Subscription<vision_interface::msg::DetectResult>::SharedPtr _detectResult_Sub;
     rclcpp::Publisher<vision_interface::msg::MatchInfo>::SharedPtr _matchInfo_Pub;
+    rclcpp::Publisher<sdr_receiver::msg::RadarContext>::SharedPtr _radarContextPub;
 
     std::vector<std::vector<uint8_t>> _frameBuffer;
     boost::asio::io_context _io;
@@ -123,6 +125,7 @@ private:
     void processWirelessEvent(const sdr_receiver::msg::RadarWirelessFrame::SharedPtr msg);
     // void matchInfoCallback(const vision_interface::msg::MatchInfo::SharedPtr msg);
     void publishMatchInfo();
+    void publishRadarContext();
 
     uint8_t _self_ID;
     uint16_t _markProgress;

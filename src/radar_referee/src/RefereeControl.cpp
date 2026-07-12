@@ -275,6 +275,8 @@ RefereeControl::RefereeControl(): Node("referee_control_node"),_timeThreshold(15
     oss << std::put_time(std::localtime(&now), "%Y-%m-%d_%H-%M-%S");
     std::string timeString = oss.str();
     _logger.init(Logger::file, Logger::debug, ("./log_referee/result_" + timeString + ".log"));
+    _radarContextPub = this->create_publisher<sdr_receiver::msg::RadarContext>(
+        "/judge/radar_context", rclcpp::QoS(10).reliable());
     
    
 }
@@ -446,6 +448,7 @@ void RefereeControl::executeCommand()
                 _vulnerableOpp = radar_info_data.radar_info & 0x03;
                 _jam_level = (radar_info_data.radar_info >> 3) & 0x03;
                 _key_mutable = (radar_info_data.radar_info & 0x20) == 0x20;
+                publishRadarContext();
                 
                 _logger.INFO("vulopp: " + std::to_string(_vulnerableOpp));
                 _logger.INFO("jam_level: " + std::to_string(_jam_level));
@@ -901,6 +904,21 @@ void RefereeControl::sendOutpostAlive()
 
     _logger.INFO("outpost alive status sent to sentry: " + std::to_string(outpost_alive));
     //RCLCPP_INFO(this->get_logger(), "Outpost alive status sent to sentry: %d", outpost_alive);
+}
+
+void RefereeControl::publishRadarContext()
+{
+    sdr_receiver::msg::RadarContext msg;
+    msg.header.stamp = this->get_clock()->now();
+    msg.self_id = _self_ID;
+    msg.self_color = _self_ID == 9 ? 2 : (_self_ID == 109 ? 0 : -1);
+    msg.radar_info_raw = _radar_info_raw;
+    msg.jam_level = _jam_level;
+    msg.key_mutable = _key_mutable;
+    msg.game_progress = _game_progress;
+    msg.match_time = _game_progress == 4 ? static_cast<int16_t>(_stage_remain_time) : -200;
+    msg.referee_online = _self_ID == 9 || _self_ID == 109;
+    _radarContextPub->publish(msg);
 }
 
 void RefereeControl::publishMatchInfo()
