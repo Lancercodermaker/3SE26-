@@ -293,7 +293,7 @@ def test_read_failure_closes_and_clears_backend_then_reconnects_to_next_one():
     assert session.stats.read_errors == 1
     assert session.stats.closes == 1
 
-    assert session.reconnect() is None
+    assert session.reconnect() is True
     assert factory.calls == 2
     assert session.stats.connects == 2
     assert session.stats.reconnects == 1
@@ -324,6 +324,7 @@ def test_reconnect_does_not_hold_session_lock_during_backoff(monkeypatch):
     sleeping = threading.Event()
     release_sleep = threading.Event()
     errors = []
+    results = []
 
     def controlled_sleep(seconds):
         assert seconds == 1.0
@@ -332,7 +333,7 @@ def test_reconnect_does_not_hold_session_lock_during_backoff(monkeypatch):
 
     def run_reconnect():
         try:
-            session.reconnect()
+            results.append(session.reconnect())
         except Exception as exc:  # pragma: no cover - assertion reports thread failure
             errors.append(exc)
 
@@ -348,6 +349,7 @@ def test_reconnect_does_not_hold_session_lock_during_backoff(monkeypatch):
     worker.join(timeout=1.0)
     assert not worker.is_alive()
     assert errors == []
+    assert results == [True]
     assert first.close_calls == 1
 
 

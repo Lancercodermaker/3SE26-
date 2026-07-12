@@ -138,7 +138,7 @@ class DeviceSession:
                 self._connection_errors += 1
                 raise DeviceConnectionError("failed to reconnect receiver") from exc
             self._reconnects += 1
-            return None
+            return True
 
     def snapshot(self):
         with self._lock:
