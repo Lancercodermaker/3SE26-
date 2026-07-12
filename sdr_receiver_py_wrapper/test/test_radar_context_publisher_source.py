@@ -101,3 +101,12 @@ def test_radar_info_branch_publishes_after_all_same_frame_assignments():
     assert branch.count(publish) == 1
     publish_index = branch.index(publish)
     assert all(branch.index(assignment) < publish_index for assignment in assignments)
+
+
+def test_wireless_key_callback_does_not_override_authoritative_key_mutable():
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    callback_body = _extract_braced_region(
+        source, "void RefereeControl::wirelessKeyCallback"
+    )
+
+    assert re.search(r"\b_key_mutable\s*=", callback_body) is None

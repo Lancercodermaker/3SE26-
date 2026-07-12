@@ -81,9 +81,8 @@ void RefereeControl::wirelessKeyCallback(const sdr_receiver::msg::JamCode::Share
                      std::to_string(radar_cmd.password_6));
         _logger.INFO("_password_updated: "+std::to_string(_password_updated));
 
-        _key_mutable = msg->key_mutable;
-        RCLCPP_INFO(this->get_logger(), "Key mutable: %d", _key_mutable);
-        _logger.INFO("Key mutable: " + std::to_string(_key_mutable));
+        RCLCPP_INFO(this->get_logger(), "JamCode key mutable input: %d", msg->key_mutable);
+        _logger.INFO("JamCode key mutable input: " + std::to_string(msg->key_mutable));
     }
     else
     {
