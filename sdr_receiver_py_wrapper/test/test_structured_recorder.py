@@ -166,6 +166,49 @@ def test_close_drains_is_idempotent_and_rejects_later_writes(tmp_path):
         recorder.write_event("too-late", {})
 
 
+def test_close_waits_for_slow_accepted_writes_without_a_total_timeout(
+    tmp_path,
+    monkeypatch,
+):
+    worker_entered_open = threading.Event()
+    release_worker = threading.Event()
+    original_open = Path.open
+
+    def controlled_open(path, *args, **kwargs):
+        if threading.current_thread() is not threading.main_thread():
+            worker_entered_open.set()
+            assert release_worker.wait(timeout=3.0)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", controlled_open)
+    recorder = StructuredRecorder(tmp_path, "slow-close")
+    assert worker_entered_open.wait(timeout=3.0)
+    assert recorder.write_chunk(make_chunk(chunk_id=11))
+    real_join = recorder._worker.join
+    join_timeouts = []
+
+    def controlled_join(timeout=None):
+        join_timeouts.append(timeout)
+        if timeout is not None:
+            return
+        release_worker.set()
+        real_join()
+
+    monkeypatch.setattr(recorder._worker, "join", controlled_join)
+    try:
+        recorder.close()
+    finally:
+        release_worker.set()
+        real_join(timeout=3.0)
+
+    assert join_timeouts == [None]
+    assert recorder.stats.closed
+    assert recorder.stats.chunks_written == 1
+    summary = json.loads((tmp_path / "slow-close.summary.json").read_text())
+    assert summary["chunks_written"] == 1
+    assert summary["stopped_reason"] == "closed"
+
+
 def test_file_operations_and_single_flush_happen_only_on_worker(tmp_path, monkeypatch):
     original_open = Path.open
     operation_threads = []

@@ -143,9 +143,7 @@ class StructuredRecorder:
                 break
             except Full:
                 continue
-        self._worker.join(timeout=5.0)
-        if self._worker.is_alive():
-            raise RecorderError("recorder worker did not stop")
+        self._worker.join()
         with self._lock:
             self._closed = True
             self._raise_worker_error_locked()
