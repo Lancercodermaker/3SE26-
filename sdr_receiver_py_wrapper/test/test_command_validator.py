@@ -16,6 +16,7 @@ from sdr_receiver_py_wrapper.competition_controller import (
     CompetitionState,
     RadarContext,
 )
+from sdr_receiver_py_wrapper.context_arbiter import ContextArbiter, Observation
 from sdr_receiver_py_wrapper.models import DecodedCommand
 from sdr_receiver_py_wrapper.patches import JamKeyEvent
 
@@ -231,6 +232,60 @@ def test_aborted_publication_releases_reservation_for_retry():
     assert retry.accepted is True
 
 
+def test_standalone_commit_keeps_duplicate_rejected():
+    validator = CommandValidator()
+    item = command(payload=b"COMMIT")
+    first = validator.validate(item)
+
+    assert validator.begin_publish_authorization(item, first) is True
+    assert validator.commit_publish_authorization(item, first) is True
+
+    duplicate = validator.validate(command(payload=b"COMMIT"))
+    assert duplicate.accepted is False
+    assert "duplicate command" in duplicate.reason
+
+
+def test_committed_key_window_evicts_oldest_after_1025_commits():
+    validator = CommandValidator()
+    commands = [command(payload=f"{index:06d}".encode()) for index in range(1025)]
+
+    for item in commands:
+        result = validator.validate(item)
+        assert result.accepted is True
+        assert validator.begin_publish_authorization(item, result) is True
+        assert validator.commit_publish_authorization(item, result) is True
+
+    oldest_after_eviction = validator.validate(commands[0])
+    newest_duplicate = validator.validate(commands[-1])
+
+    assert oldest_after_eviction.accepted is True
+    assert newest_duplicate.accepted is False
+    assert "duplicate command" in newest_duplicate.reason
+
+
+def test_publication_transaction_rejects_repeated_and_out_of_order_calls():
+    validator = CommandValidator()
+    item = command(payload=b"ORDER1")
+    first = validator.validate(item)
+
+    assert validator.commit_publish_authorization(item, first) is False
+    assert validator.begin_publish_authorization(item, first) is True
+    assert validator.begin_publish_authorization(item, first) is False
+    assert validator.abort_publish_authorization(item, first) is True
+    assert validator.abort_publish_authorization(item, first) is False
+    assert validator.commit_publish_authorization(item, first) is False
+
+    second = validator.validate(item)
+    assert validator.abort_publish_authorization(item, second) is True
+    assert validator.begin_publish_authorization(item, second) is False
+
+    third = validator.validate(item)
+    assert validator.begin_publish_authorization(item, third) is True
+    assert validator.commit_publish_authorization(item, third) is True
+    assert validator.commit_publish_authorization(item, third) is False
+    assert validator.abort_publish_authorization(item, third) is False
+
+
 def test_concurrent_duplicate_validation_accepts_exactly_one():
     validator = CommandValidator()
     workers = 32
@@ -376,6 +431,20 @@ def jam_event(payload, *, level=1):
         target=f"L{level}",
         source="legacy-core",
         timestamp=321.0,
+    )
+
+
+def context_observation(level, *, source="judge"):
+    return Observation(
+        source=source,
+        self_id=9,
+        self_color=2,
+        radar_info_raw=((level & 0x03) << 3) | (1 << 5),
+        jam_level=level,
+        key_mutable=True,
+        game_progress=4,
+        match_time=300,
+        received_monotonic=500.0 + level,
     )
 
 
@@ -778,6 +847,178 @@ def test_rf_target_exception_after_commit_does_not_restore_controller(
 
     node._on_jam_key(event)
     assert len(node.jam_code_pub.messages) == 1
+
+
+def test_failed_jam_rollback_does_not_overwrite_concurrent_context_update(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module, level=1)
+    node.context_arbiter = ContextArbiter(
+        "judge",
+        stable_count=1,
+        stable_sec=0.0,
+    )
+    stats_entered = threading.Event()
+    release_failure = threading.Event()
+    context_observed = threading.Event()
+    context_finished = threading.Event()
+    jam_errors = []
+    context_errors = []
+    real_observe = node.context_arbiter.observe
+
+    def observe_with_barrier(observation):
+        decision = real_observe(observation)
+        context_observed.set()
+        return decision
+
+    def fail_stats_after_context_attempt():
+        stats_entered.set()
+        assert release_failure.wait(timeout=5.0)
+        raise RuntimeError("stats failed after context attempt")
+
+    def run_jam():
+        try:
+            node._on_jam_key(jam_event(b"RACE12", level=1))
+        except Exception as exc:
+            jam_errors.append(exc)
+
+    def run_context():
+        try:
+            node._observe_context(
+                context_observation(2),
+                referee_online=True,
+            )
+        except Exception as exc:
+            context_errors.append(exc)
+        finally:
+            context_finished.set()
+
+    node.context_arbiter.observe = observe_with_barrier
+    node.adapter.get_stats_snapshot = fail_stats_after_context_attempt
+    jam_thread = threading.Thread(target=run_jam)
+    context_thread = threading.Thread(target=run_context)
+    jam_thread.start()
+    assert stats_entered.wait(timeout=5.0)
+    context_thread.start()
+    assert context_observed.wait(timeout=5.0)
+
+    # Without controller serialization, this finishes before rollback and its
+    # state is then partially overwritten. With the lock it waits atomically.
+    context_finished.wait(timeout=1.0)
+    release_failure.set()
+    jam_thread.join(timeout=5.0)
+    context_thread.join(timeout=5.0)
+
+    assert not jam_thread.is_alive()
+    assert not context_thread.is_alive()
+    assert len(jam_errors) == 1
+    assert "stats failed after context attempt" in str(jam_errors[0])
+    assert context_errors == []
+    assert node.jam_code_pub.messages == []
+    assert node.controller.state == CompetitionState.JAM_L2
+    assert node.controller.active_level == 2
+    assert node.controller.completed_level == 0
+    assert node.controller.desired_target == "L2"
+    assert node.controller.published_keys == {}
+    assert node.controller.latest_context.jam_level == 2
+    assert node.latest_context.jam_level == 2
+
+
+def test_failed_info_rf_transition_retries_on_next_context_without_republish(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module, level=3)
+    node.context_arbiter = ContextArbiter(
+        "judge",
+        stable_count=1,
+        stable_sec=0.0,
+    )
+    target_attempts = []
+
+    def fail_once(target):
+        target_attempts.append(target)
+        if len(target_attempts) == 1:
+            raise RuntimeError("transient INFO target failure")
+
+    node.adapter.set_target = fail_once
+    with pytest.raises(RuntimeError, match="transient INFO target failure"):
+        node._on_jam_key(jam_event(b"PEND31", level=3))
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.INFO
+    assert node.controller.completed_level == 3
+    assert node.controller.desired_target == "INFO"
+    assert node._pending_rf_transition.target == "INFO"
+    assert target_attempts == ["INFO"]
+
+    node._observe_context(
+        context_observation(3),
+        referee_online=True,
+    )
+
+    assert target_attempts == ["INFO", "INFO"]
+    assert node._pending_rf_transition is None
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.INFO
+    assert node.controller.status_snapshot()["published_key_counts"] == {"3": 1}
+
+
+def test_pending_info_rf_transition_survives_failures_and_applies_once(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module, level=3)
+    target_attempts = []
+
+    def always_fail(target):
+        target_attempts.append(target)
+        raise RuntimeError("INFO target still unavailable")
+
+    node.adapter.set_target = always_fail
+    event = jam_event(b"PEND32", level=3)
+    with pytest.raises(RuntimeError, match="INFO target still unavailable"):
+        node._on_jam_key(event)
+
+    node._on_jam_key(event)
+
+    assert target_attempts == ["INFO", "INFO"]
+    assert node._pending_rf_transition.target == "INFO"
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.INFO
+
+    node.adapter.set_target = lambda target: target_attempts.append(target)
+    node._on_jam_key(event)
+    node._on_jam_key(event)
+
+    assert target_attempts == ["INFO", "INFO", "INFO"]
+    assert node._pending_rf_transition is None
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.status_snapshot()["published_key_counts"] == {"3": 1}
+
+
+def test_successful_info_rf_apply_is_not_retried_when_success_log_fails(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module, level=3)
+    target_attempts = []
+    node.adapter.set_target = lambda target: target_attempts.append(target)
+
+    def fail_info(_message):
+        raise RuntimeError("INFO success log unavailable")
+
+    node.get_logger = lambda: SimpleNamespace(
+        info=fail_info,
+        debug=lambda _message: None,
+        warn=lambda _message: None,
+    )
+    event = jam_event(b"PEND33", level=3)
+
+    node._on_jam_key(event)
+    node._on_jam_key(event)
+
+    assert target_attempts == ["INFO"]
+    assert node._pending_rf_transition is None
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.INFO
 
 
 def test_legacy_callback_preserves_controller_target_without_publish(

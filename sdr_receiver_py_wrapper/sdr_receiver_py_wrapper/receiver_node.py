@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,13 @@ from .structured_recorder import StructuredRecorder, _json_snapshot
 
 DEFAULT_ORIGINAL_SCRIPT = "auto"
 PRIMARY_DECODER_ID = "improved_v67"
+
+
+@dataclass(frozen=True)
+class _PendingRfTransition:
+    target: str
+    reason: str
+    team: Optional[str]
 
 
 class IqRecorder:
@@ -341,6 +349,8 @@ class SdrReceiverPyWrapperNode(Node):
         self._fallback_key_mutable = None
         self._fallback_referee_online = None
 
+        self._controller_lock = threading.RLock()
+        self._pending_rf_transition: Optional[_PendingRfTransition] = None
         self.controller = CompetitionController(
             max_jam_break_level=int(self.get_parameter("max_jam_break_level").value),
             key_publish_min_interval_sec=float(
@@ -731,9 +741,6 @@ class SdrReceiverPyWrapperNode(Node):
     ) -> None:
         decision = self.context_arbiter.observe(observation)
         self.get_logger().info(format_context_decision_log(observation, decision))
-        if not decision.accepted:
-            return
-
         context = RadarContext(
             self_id=observation.self_id,
             self_color=observation.self_color,
@@ -745,90 +752,134 @@ class SdrReceiverPyWrapperNode(Node):
             referee_online=referee_online,
             source=observation.source,
         )
-        self.latest_context = context
-        if self.run_mode != "competition" and not self.debug_accept_ros_control:
-            return
+        with self._get_controller_lock():
+            self._retry_pending_rf_transition_locked()
+            if not decision.accepted:
+                return
 
-        controller_decision = self.controller.update_context(context)
-        for warning in controller_decision.warnings:
-            self.get_logger().warn(warning)
-        if controller_decision.team:
-            self.adapter.set_team(controller_decision.team)
-            self.get_logger().info(
-                f"receiver RF team set to opponent {controller_decision.team} "
-                f"(own={self.controller.own_team}): {controller_decision.reason}"
-            )
-        if decision.accepted and decision.target_changed:
-            target = resolve_receiver_target(
-                decision,
-                controller_decision.target,
-            )
-            if target:
-                self._set_receiver_target_or_profile(
-                    target,
-                    reason=controller_decision.reason,
-                    team=controller_decision.team or self.controller.rx_team,
+            self.latest_context = context
+            if self.run_mode != "competition" and not self.debug_accept_ros_control:
+                return
+
+            controller_decision = self.controller.update_context(context)
+            for warning in controller_decision.warnings:
+                self.get_logger().warn(warning)
+            if controller_decision.team:
+                self.adapter.set_team(controller_decision.team)
+                self.get_logger().info(
+                    f"receiver RF team set to opponent {controller_decision.team} "
+                    f"(own={self.controller.own_team}): {controller_decision.reason}"
                 )
+            if decision.accepted and decision.target_changed:
+                target = resolve_receiver_target(
+                    decision,
+                    controller_decision.target,
+                )
+                if target:
+                    self._set_receiver_target_or_profile(
+                        target,
+                        reason=controller_decision.reason,
+                        team=controller_decision.team or self.controller.rx_team,
+                    )
 
     def _on_jam_key(self, event: JamKeyEvent) -> None:
         if self.run_mode == "competition":
-            candidate = self._decoded_command_from_legacy_event(
-                event,
-                event.level,
-            )
-            prevalidation = self.command_validator.prevalidate(candidate)
-            if not prevalidation.accepted:
-                self.get_logger().debug(prevalidation.reason)
-                return
-            controller_snapshot = self._snapshot_jam_key_controller_state()
-            publication_committed = False
-            try:
-                decision = self.controller.handle_jam_key(
-                    level=event.level,
-                    key=event.key,
+            with self._get_controller_lock():
+                self._retry_pending_rf_transition_locked()
+                candidate = self._decoded_command_from_legacy_event(
+                    event,
+                    event.level,
                 )
-                for warning in decision.warnings:
-                    self.get_logger().warn(warning)
-                if decision.publish:
-                    if not self.publish_ros_outputs:
-                        self._restore_jam_key_controller_state(
-                            controller_snapshot
-                        )
-                        self.get_logger().debug(
-                            "ROS output disabled; controller key decision aborted"
-                        )
-                        return
-                    result = self._handle_controller_decoded_command(
-                        self._decoded_command_from_legacy_event(
-                            event,
-                            decision.level,
-                        )
+                prevalidation = self.command_validator.prevalidate(candidate)
+                if not prevalidation.accepted:
+                    self.get_logger().debug(prevalidation.reason)
+                    return
+                controller_snapshot = self._snapshot_jam_key_controller_state()
+                publication_committed = False
+                try:
+                    decision = self.controller.handle_jam_key(
+                        level=event.level,
+                        key=event.key,
                     )
-                    if not result.accepted:
+                    for warning in decision.warnings:
+                        self.get_logger().warn(warning)
+                    if decision.publish:
+                        if not self.publish_ros_outputs:
+                            self._restore_jam_key_controller_state(
+                                controller_snapshot
+                            )
+                            self.get_logger().debug(
+                                "ROS output disabled; controller key decision aborted"
+                            )
+                            return
+                        result = self._handle_controller_decoded_command(
+                            self._decoded_command_from_legacy_event(
+                                event,
+                                decision.level,
+                            )
+                        )
+                        if not result.accepted:
+                            self._restore_jam_key_controller_state(
+                                controller_snapshot
+                            )
+                            self.get_logger().debug(result.reason)
+                            return
+                        publication_committed = True
+                except Exception:
+                    if not publication_committed:
                         self._restore_jam_key_controller_state(
                             controller_snapshot
                         )
-                        self.get_logger().debug(result.reason)
-                        return
-                    publication_committed = True
-            except Exception:
-                if not publication_committed:
-                    self._restore_jam_key_controller_state(controller_snapshot)
-                raise
-            if decision.target:
-                self._set_receiver_target_or_profile(
-                    decision.target,
-                    reason=decision.reason,
-                    team=self.controller.rx_team,
-                )
-            elif decision.reason:
-                self.get_logger().debug(decision.reason)
+                    raise
+                if decision.target:
+                    transition = _PendingRfTransition(
+                        target=decision.target,
+                        reason=decision.reason,
+                        team=self.controller.rx_team,
+                    )
+                    try:
+                        self._set_receiver_target_or_profile(
+                            transition.target,
+                            reason=transition.reason,
+                            team=transition.team,
+                        )
+                    except Exception:
+                        self._pending_rf_transition = transition
+                        raise
+                    self._pending_rf_transition = None
+                elif decision.reason:
+                    self.get_logger().debug(decision.reason)
             return
 
         if self.publish_ros_outputs:
             self._handle_decoded_command(
                 self._decoded_command_from_legacy_event(event, event.level)
             )
+
+    def _get_controller_lock(self):
+        lock = getattr(self, "_controller_lock", None)
+        if lock is None:
+            lock = self.__dict__.setdefault(
+                "_controller_lock",
+                threading.RLock(),
+            )
+        return lock
+
+    def _retry_pending_rf_transition_locked(self) -> bool:
+        pending = getattr(self, "_pending_rf_transition", None)
+        if pending is None:
+            return True
+        try:
+            self._set_receiver_target_or_profile(
+                pending.target,
+                reason=pending.reason,
+                team=pending.team,
+            )
+        except Exception:
+            return False
+        if self._pending_rf_transition is pending:
+            self._pending_rf_transition = None
+        return True
 
     def _snapshot_jam_key_controller_state(self) -> dict[str, object]:
         """Snapshot exactly the fields mutated by ``handle_jam_key``."""
@@ -973,10 +1024,20 @@ class SdrReceiverPyWrapperNode(Node):
         if target_upper == "INFO" and self.run_mode == "competition" and self.profile_config:
             applied = self._apply_info_profile(team=team)
             if applied:
-                self.get_logger().info(f"receiver INFO profile applied: {reason}")
+                try:
+                    self.get_logger().info(
+                        f"receiver INFO profile applied: {reason}"
+                    )
+                except Exception:
+                    pass
                 return
         self.adapter.set_target(target_upper)
-        self.get_logger().info(f"receiver target set to {target_upper}: {reason}")
+        try:
+            self.get_logger().info(
+                f"receiver target set to {target_upper}: {reason}"
+            )
+        except Exception:
+            pass
 
     def _apply_info_profile(self, *, team: Optional[str]) -> bool:
         profile = self.profile_config
@@ -1058,10 +1119,15 @@ class SdrReceiverPyWrapperNode(Node):
         except Exception as exc:
             adapter_status = {"adapter_error": str(exc)}
 
+        with self._get_controller_lock():
+            own_team = self._current_own_team()
+            rx_team = self._current_team()
+            competition_status = self.controller.status_snapshot()
+
         status = {
             "run_mode": self.run_mode,
-            "own_team": self._current_own_team(),
-            "rx_team": self._current_team(),
+            "own_team": own_team,
+            "rx_team": rx_team,
             "publish_ros_outputs": self.publish_ros_outputs,
             "debug_accept_ros_control": self.debug_accept_ros_control,
             "start_receiver": self.start_receiver,
@@ -1089,7 +1155,7 @@ class SdrReceiverPyWrapperNode(Node):
             "iq_recording": {"enabled": False}
             if self.iq_recorder is None
             else self.iq_recorder.status(),
-            "competition": self.controller.status_snapshot(),
+            "competition": competition_status,
             "core": adapter_status,
             "receiver_thread_exception": None
             if self.adapter.receiver_exception is None
@@ -1100,33 +1166,35 @@ class SdrReceiverPyWrapperNode(Node):
         self.status_pub.publish(msg)
 
     def _current_team(self, fallback: str = "UNKNOWN") -> str:
-        if hasattr(self, "controller") and self.controller.rx_team:
-            return self.controller.rx_team
-        own_team = self._current_own_team("")
-        if own_team in ("RED", "BLUE"):
-            return self._opponent_team(own_team)
-        return fallback or "UNKNOWN"
+        with self._get_controller_lock():
+            if hasattr(self, "controller") and self.controller.rx_team:
+                return self.controller.rx_team
+            own_team = self._current_own_team("")
+            if own_team in ("RED", "BLUE"):
+                return self._opponent_team(own_team)
+            return fallback or "UNKNOWN"
 
     def _current_own_team(self, fallback: str = "UNKNOWN") -> str:
-        if hasattr(self, "controller") and self.controller.own_team:
-            return self.controller.own_team
-        context = self.latest_context
-        if context is not None:
-            if context.self_id == 9 or context.self_color == 2:
+        with self._get_controller_lock():
+            if hasattr(self, "controller") and self.controller.own_team:
+                return self.controller.own_team
+            context = self.latest_context
+            if context is not None:
+                if context.self_id == 9 or context.self_color == 2:
+                    return "RED"
+                if context.self_id == 109 or context.self_color == 0:
+                    return "BLUE"
+            fallback_self_id = getattr(self, "fallback_self_id", 0)
+            if fallback_self_id == 9:
                 return "RED"
-            if context.self_id == 109 or context.self_color == 0:
+            if fallback_self_id == 109:
                 return "BLUE"
-        fallback_self_id = getattr(self, "fallback_self_id", 0)
-        if fallback_self_id == 9:
-            return "RED"
-        if fallback_self_id == 109:
-            return "BLUE"
-        fallback_color = getattr(self, "_fallback_self_color", -1)
-        if fallback_color == 2:
-            return "RED"
-        if fallback_color == 0:
-            return "BLUE"
-        return fallback or "UNKNOWN"
+            fallback_color = getattr(self, "_fallback_self_color", -1)
+            if fallback_color == 2:
+                return "RED"
+            if fallback_color == 0:
+                return "BLUE"
+            return fallback or "UNKNOWN"
 
     @staticmethod
     def _opponent_team(own_team: str) -> str:
