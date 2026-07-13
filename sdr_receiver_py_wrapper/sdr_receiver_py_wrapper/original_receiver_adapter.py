@@ -10,6 +10,8 @@ from types import ModuleType
 import types
 from typing import Callable, Optional
 
+import numpy as np
+
 from .iq_file_source import IqFilePluto
 from .patches import PatchCallbacks, PatchManager
 
@@ -176,6 +178,84 @@ class ReceiverCoreAdapter:
                 logger=self.logger,
             )
             self.patch_manager.apply()
+
+    def demodulate_iq(
+        self,
+        *,
+        samples: np.ndarray,
+        profile: dict[str, str],
+        callbacks: PatchCallbacks,
+    ) -> None:
+        """Demodulate one IQ array without starting or controlling an SDR.
+
+        ``profile`` contains exactly the decoder-facing context needed by v67:
+        string keys ``name``, ``team``, and ``target``. The caller's IQ buffer
+        is never passed to or retained by the imported core.
+        """
+
+        if not isinstance(samples, np.ndarray):
+            raise TypeError("samples must be a numpy.ndarray")
+        if samples.dtype != np.complex64:
+            raise ValueError("samples must have dtype complex64")
+        if samples.ndim != 1:
+            raise ValueError("samples must be one-dimensional")
+        if type(profile) is not dict:
+            raise TypeError("profile must be a dict")
+        if set(profile) != {"name", "team", "target"}:
+            raise ValueError(
+                "profile must contain exactly name, team, and target"
+            )
+        if any(type(profile[key]) is not str for key in ("name", "team", "target")):
+            raise TypeError("profile name, team, and target must be strings")
+        if not all(profile[key].strip() for key in ("name", "team", "target")):
+            raise ValueError("profile name, team, and target must be non-empty")
+        if not isinstance(callbacks, PatchCallbacks):
+            raise TypeError("callbacks must be PatchCallbacks")
+        module = self._require_module()
+        core_samples = np.array(samples, dtype=np.complex64, copy=True, order="C")
+        with self.lock:
+            tune_cfg = getattr(module, "TUNE_CFG", None)
+            radar_params = getattr(module, "RADAR_PARAMS", None)
+            team = profile["team"].upper()
+            target = self._normalize_target(profile["target"])
+            if team not in ("RED", "BLUE"):
+                raise ValueError(f"invalid profile team: {profile['team']}")
+            if (
+                not isinstance(radar_params, dict)
+                or team not in radar_params
+                or target not in radar_params[team]
+            ):
+                raise ValueError(
+                    f"invalid profile target for {team}: {profile['target']}"
+                )
+            saved_tune_cfg = copy.deepcopy(tune_cfg)
+            persistent_manager = self.patch_manager
+            persistent_was_applied = bool(
+                persistent_manager is not None
+                and getattr(persistent_manager, "_applied", False)
+            )
+            if persistent_was_applied:
+                persistent_manager.restore()
+
+            temporary_manager = PatchManager(
+                module,
+                run_mode="pure_decoder",
+                callbacks=callbacks,
+                stop_event=self.stop_event,
+                logger=self.logger,
+            )
+            try:
+                tune_cfg["TEAM"] = team
+                tune_cfg["TARGET"] = target
+                ac_target = radar_params[team][target]["ac"]
+                temporary_manager.apply()
+                module.fast_demod(core_samples, ac_target)
+            finally:
+                temporary_manager.restore()
+                tune_cfg.clear()
+                tune_cfg.update(saved_tune_cfg)
+                if persistent_was_applied:
+                    persistent_manager.apply()
 
     def configure_iq_file_source(
         self,
