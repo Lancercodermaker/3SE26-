@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -771,13 +772,39 @@ class SdrReceiverPyWrapperNode(Node):
 
     def _on_jam_key(self, event: JamKeyEvent) -> None:
         if self.run_mode == "competition":
+            candidate = self._decoded_command_from_legacy_event(
+                event,
+                event.level,
+            )
+            prevalidation = self.command_validator.prevalidate(candidate)
+            if not prevalidation.accepted:
+                self.get_logger().debug(prevalidation.reason)
+                return
+            controller_snapshot = self._snapshot_jam_key_controller_state()
             decision = self.controller.handle_jam_key(level=event.level, key=event.key)
             for warning in decision.warnings:
                 self.get_logger().warn(warning)
-            if decision.publish and self.publish_ros_outputs:
-                self._handle_decoded_command(
-                    self._decoded_command_from_legacy_event(event, decision.level)
-                )
+            if decision.publish:
+                if not self.publish_ros_outputs:
+                    self._restore_jam_key_controller_state(controller_snapshot)
+                    self.get_logger().debug(
+                        "ROS output disabled; controller key decision aborted"
+                    )
+                    return
+                try:
+                    result = self._handle_controller_decoded_command(
+                        self._decoded_command_from_legacy_event(
+                            event,
+                            decision.level,
+                        )
+                    )
+                except Exception:
+                    self._restore_jam_key_controller_state(controller_snapshot)
+                    raise
+                if not result.accepted:
+                    self._restore_jam_key_controller_state(controller_snapshot)
+                    self.get_logger().debug(result.reason)
+                    return
             if decision.target:
                 self._set_receiver_target_or_profile(
                     decision.target,
@@ -793,6 +820,28 @@ class SdrReceiverPyWrapperNode(Node):
                 self._decoded_command_from_legacy_event(event, event.level)
             )
 
+    def _snapshot_jam_key_controller_state(self) -> dict[str, object]:
+        """Snapshot exactly the fields mutated by ``handle_jam_key``."""
+
+        fields = (
+            "state",
+            "completed_level",
+            "desired_target",
+            "published_keys",
+        )
+        return {
+            name: copy.deepcopy(getattr(self.controller, name))
+            for name in fields
+            if hasattr(self.controller, name)
+        }
+
+    def _restore_jam_key_controller_state(
+        self,
+        snapshot: dict[str, object],
+    ) -> None:
+        for name, value in snapshot.items():
+            setattr(self.controller, name, value)
+
     def _decoded_command_from_legacy_event(
         self,
         event: JamKeyEvent,
@@ -803,7 +852,7 @@ class SdrReceiverPyWrapperNode(Node):
         context_arbiter = getattr(self, "context_arbiter", None)
         return DecodedCommand(
             cmd_id=event.cmd_id,
-            payload=bytes(event.key),
+            payload=bytes(event.payload),
             decoder_id=self.primary_decoder_id,
             profile=self.run_mode,
             crc8_ok=True,
@@ -850,7 +899,35 @@ class SdrReceiverPyWrapperNode(Node):
             if self.publish_ros_outputs:
                 self._publish_validated_jam_code(command, result)
             else:
-                self.command_validator.discard_publish_authorization(
+                self.command_validator.abort_publish_authorization(
+                    command,
+                    result,
+                )
+        else:
+            self.get_logger().debug(result.reason)
+        return result
+
+    def _handle_controller_decoded_command(
+        self,
+        command: DecodedCommand,
+    ) -> ValidationResult:
+        """Publish a command whose retry policy is owned by the controller."""
+
+        if command.decoder_id != self.primary_decoder_id:
+            result = ValidationResult(
+                False,
+                f"decoder_id {command.decoder_id!r} is not primary decoder "
+                f"{self.primary_decoder_id!r}",
+            )
+            self.get_logger().debug(result.reason)
+            return result
+
+        result = self.command_validator.reserve_controller_publication(command)
+        if result.accepted:
+            if self.publish_ros_outputs:
+                self._publish_validated_jam_code(command, result)
+            else:
+                self.command_validator.abort_publish_authorization(
                     command,
                     result,
                 )
@@ -921,7 +998,7 @@ class SdrReceiverPyWrapperNode(Node):
         result: ValidationResult,
     ) -> None:
         if command.decoder_id != self.primary_decoder_id:
-            self.command_validator.discard_publish_authorization(
+            self.command_validator.abort_publish_authorization(
                 command,
                 result,
             )
@@ -929,26 +1006,32 @@ class SdrReceiverPyWrapperNode(Node):
                 f"Jam publisher requires primary decoder "
                 f"{self.primary_decoder_id!r}"
             )
-        if not self.command_validator.consume_publish_authorization(command, result):
+        if not self.command_validator.begin_publish_authorization(command, result):
             raise ValueError(
                 "Jam publisher requires a fresh validated command result"
             )
-        context = self.latest_context
-        msg = JamCode()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.valid = True
-        msg.command_id = int(command.cmd_id) & 0xFFFF
-        msg.level = int(result.level) & 0xFF
-        msg.team = self._current_team(command.team)
-        msg.target = command.target
-        msg.radio_mode = self.run_mode
-        stats = self.adapter.get_stats_snapshot()
-        msg.rf_state = str(stats.get("rf_state") or "")
-        msg.radar_info_raw = int(context.radar_info_raw) & 0xFF if context else 0
-        msg.key_mutable = bool(context.key_mutable) if context else False
-        msg.key = list(command.payload)
-        msg.ascii_code = str(result.ascii_code)
-        self.jam_code_pub.publish(msg)
+        try:
+            context = self.latest_context
+            msg = JamCode()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.valid = True
+            msg.command_id = int(command.cmd_id) & 0xFFFF
+            msg.level = int(result.level) & 0xFF
+            msg.team = self._current_team(command.team)
+            msg.target = command.target
+            msg.radio_mode = self.run_mode
+            stats = self.adapter.get_stats_snapshot()
+            msg.rf_state = str(stats.get("rf_state") or "")
+            msg.radar_info_raw = int(context.radar_info_raw) & 0xFF if context else 0
+            msg.key_mutable = bool(context.key_mutable) if context else False
+            msg.key = list(command.payload)
+            msg.ascii_code = str(result.ascii_code)
+            self.jam_code_pub.publish(msg)
+        except Exception:
+            self.command_validator.abort_publish_authorization(command, result)
+            raise
+        if not self.command_validator.commit_publish_authorization(command, result):
+            raise RuntimeError("Jam publisher transaction could not be committed")
         self.get_logger().info(
             f"published jam code level={msg.level} team={msg.team} "
             f"target={msg.target} key={msg.ascii_code}"

@@ -11,6 +11,11 @@ from sdr_receiver_py_wrapper.command_validator import (
     CommandValidator,
     ValidationResult,
 )
+from sdr_receiver_py_wrapper.competition_controller import (
+    CompetitionController,
+    CompetitionState,
+    RadarContext,
+)
 from sdr_receiver_py_wrapper.models import DecodedCommand
 from sdr_receiver_py_wrapper.patches import JamKeyEvent
 
@@ -119,6 +124,23 @@ def test_non_jam_command_is_explicitly_rejected():
 
 
 @pytest.mark.parametrize(
+    ("cmd_id", "reason"),
+    [
+        (True, "cmd_id must be an exact int"),
+        (False, "cmd_id must be an exact int"),
+        ("0x0A06", "cmd_id must be an exact int"),
+        (-1, "cmd_id must be between 0x0000 and 0xFFFF"),
+        (0x10000, "cmd_id must be between 0x0000 and 0xFFFF"),
+    ],
+)
+def test_malformed_command_ids_are_stably_rejected(cmd_id, reason):
+    result = CommandValidator().validate(command(cmd_id=cmd_id))
+
+    assert result.accepted is False
+    assert result.reason == reason
+
+
+@pytest.mark.parametrize(
     ("level", "reason"),
     [
         (MISSING, "0x0A06 evidence.level is missing"),
@@ -166,8 +188,9 @@ def test_publish_authorization_is_bound_to_original_command_identity(changes):
     result = validator.validate(original)
     substituted = replace(original, **changes)
 
-    assert validator.consume_publish_authorization(substituted, result) is False
-    assert validator.consume_publish_authorization(original, result) is True
+    assert validator.begin_publish_authorization(substituted, result) is False
+    assert validator.begin_publish_authorization(original, result) is True
+    assert validator.commit_publish_authorization(original, result) is True
 
 
 def test_publish_authorization_is_bound_to_original_result_identity():
@@ -176,24 +199,36 @@ def test_publish_authorization_is_bound_to_original_result_identity():
     result = validator.validate(original)
     substituted = replace(result, ascii_code="FORGED")
 
-    assert validator.consume_publish_authorization(original, substituted) is False
-    assert validator.consume_publish_authorization(original, result) is True
+    assert validator.begin_publish_authorization(original, substituted) is False
+    assert validator.begin_publish_authorization(original, result) is True
+    assert validator.commit_publish_authorization(original, result) is True
 
 
-def test_pending_publish_authorizations_are_bounded():
+def test_pending_publish_authorization_capacity_rejects_without_evicting():
     validator = CommandValidator()
     commands = [command(payload=f"{index:06d}".encode()) for index in range(1025)]
     results = [validator.validate(item) for item in commands]
 
-    assert all(result.accepted for result in results)
-    assert (
-        validator.consume_publish_authorization(commands[0], results[0])
-        is False
-    )
-    assert (
-        validator.consume_publish_authorization(commands[-1], results[-1])
-        is True
-    )
+    assert all(result.accepted for result in results[:1024])
+    assert results[-1].accepted is False
+    assert results[-1].reason == "publication authorization capacity reached"
+    assert validator.begin_publish_authorization(commands[0], results[0]) is True
+    assert validator.commit_publish_authorization(commands[0], results[0]) is True
+
+    replacement = validator.validate(commands[-1])
+    assert replacement.accepted is True
+
+
+def test_aborted_publication_releases_reservation_for_retry():
+    validator = CommandValidator()
+    item = command(payload=b"ABC123")
+    first = validator.validate(item)
+
+    assert validator.begin_publish_authorization(item, first) is True
+    assert validator.abort_publish_authorization(item, first) is True
+
+    retry = validator.validate(item)
+    assert retry.accepted is True
 
 
 def test_concurrent_duplicate_validation_accepts_exactly_one():
@@ -301,6 +336,47 @@ def make_node(receiver_node_module):
     )
     node.get_logger = lambda: logger
     return node
+
+
+def make_real_controller_node(
+    receiver_node_module,
+    *,
+    level=1,
+    min_interval=0.0,
+    retry_limit=-1,
+):
+    node = make_node(receiver_node_module)
+    node.controller = CompetitionController(
+        max_jam_break_level=3,
+        key_publish_min_interval_sec=min_interval,
+        key_retry_limit=retry_limit,
+    )
+    context = RadarContext(
+        self_id=9,
+        self_color=2,
+        radar_info_raw=((level & 0x03) << 3) | (1 << 5),
+        jam_level=level,
+        key_mutable=True,
+        referee_online=True,
+    )
+    node.latest_context = context
+    node.controller.update_context(context)
+    return node
+
+
+def jam_event(payload, *, level=1):
+    key = bytes(payload[:6])
+    return JamKeyEvent(
+        cmd_id=0x0A06,
+        payload=bytes(payload),
+        key=key,
+        ascii_code=key.decode("ascii", errors="replace"),
+        level=level,
+        team="BLUE",
+        target=f"L{level}",
+        source="legacy-core",
+        timestamp=321.0,
+    )
 
 
 def test_primary_gate_publishes_valid_command_once(receiver_node_module):
@@ -434,6 +510,146 @@ def test_legacy_callback_routes_invalid_key_through_validator(receiver_node_modu
     node._on_jam_key(event)
 
     assert node.jam_code_pub.messages == []
+
+
+@pytest.mark.parametrize("payload", [b"BAD!!!", b"ABC123X"])
+def test_legacy_semantic_validation_precedes_real_controller_mutation(
+    receiver_node_module,
+    payload,
+):
+    node = make_real_controller_node(receiver_node_module)
+    before = node.controller.status_snapshot()
+
+    node._on_jam_key(jam_event(payload))
+
+    assert node.controller.status_snapshot() == before
+    assert node.controller.state == CompetitionState.JAM_L1
+    assert node.controller.completed_level == 0
+    assert node.controller.published_keys == {}
+    assert node.controller.desired_target == "L1"
+    assert node.adapter.targets == []
+    assert node.jam_code_pub.messages == []
+
+
+def test_adapter_stats_failure_aborts_controller_and_validator_for_retry(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module)
+    before = node.controller.status_snapshot()
+
+    def fail_stats():
+        raise RuntimeError("stats unavailable")
+
+    node.adapter.get_stats_snapshot = fail_stats
+    with pytest.raises(RuntimeError, match="stats unavailable"):
+        node._on_jam_key(jam_event(b"ABC123"))
+
+    assert node.jam_code_pub.messages == []
+    assert node.controller.status_snapshot() == before
+    assert node.adapter.targets == []
+
+    node.adapter.get_stats_snapshot = lambda: {"rf_state": "receiving"}
+    node._on_jam_key(jam_event(b"ABC123"))
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.WAIT_LEVEL_L2
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 1}
+
+
+def test_ros_publish_failure_aborts_controller_and_validator_for_retry(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module)
+    before = node.controller.status_snapshot()
+    original_publish = node.jam_code_pub.publish
+
+    def fail_publish(_message):
+        raise RuntimeError("ROS publish failed")
+
+    node.jam_code_pub.publish = fail_publish
+    with pytest.raises(RuntimeError, match="ROS publish failed"):
+        node._on_jam_key(jam_event(b"ABC123"))
+
+    assert node.jam_code_pub.messages == []
+    assert node.controller.status_snapshot() == before
+    assert node.adapter.targets == []
+
+    node.jam_code_pub.publish = original_publish
+    node._on_jam_key(jam_event(b"ABC123"))
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 1}
+
+
+def test_real_controller_retry_policy_can_publish_same_key_twice(
+    receiver_node_module,
+):
+    node = make_real_controller_node(
+        receiver_node_module,
+        min_interval=0.0,
+        retry_limit=-1,
+    )
+    event = jam_event(b"ABC123")
+
+    node._on_jam_key(event)
+    node._on_jam_key(event)
+
+    assert len(node.jam_code_pub.messages) == 2
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 2}
+
+
+def test_rate_limited_controller_decision_does_not_leak_reservation(
+    receiver_node_module,
+):
+    node = make_real_controller_node(
+        receiver_node_module,
+        min_interval=60.0,
+        retry_limit=-1,
+    )
+    event = jam_event(b"ABC123")
+
+    node._on_jam_key(event)
+    node._on_jam_key(event)
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 1}
+
+    node.controller.key_publish_min_interval_sec = 0.0
+    node._on_jam_key(event)
+
+    assert len(node.jam_code_pub.messages) == 2
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 2}
+
+
+def test_final_l3_commits_info_and_rf_target_only_after_ros_success(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module, level=3)
+    before = node.controller.status_snapshot()
+    original_publish = node.jam_code_pub.publish
+
+    def fail_publish(_message):
+        raise RuntimeError("final publish failed")
+
+    node.jam_code_pub.publish = fail_publish
+    with pytest.raises(RuntimeError, match="final publish failed"):
+        node._on_jam_key(jam_event(b"XYZ789", level=3))
+
+    assert node.controller.status_snapshot() == before
+    assert node.controller.state == CompetitionState.JAM_L3
+    assert node.controller.desired_target == "L3"
+    assert node.controller.published_keys == {}
+    assert node.adapter.targets == []
+    assert node.jam_code_pub.messages == []
+
+    node.jam_code_pub.publish = original_publish
+    node._on_jam_key(jam_event(b"XYZ789", level=3))
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.INFO
+    assert node.controller.completed_level == 3
+    assert node.controller.desired_target == "INFO"
+    assert node.controller.status_snapshot()["published_key_counts"] == {"3": 1}
+    assert node.adapter.targets == ["INFO"]
 
 
 def test_legacy_callback_preserves_controller_target_without_publish(
