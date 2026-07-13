@@ -32,9 +32,9 @@ class RecorderStats:
     bytes_written: int = 0
     dropped_chunks: int = 0
     dropped_events: int = 0
-    latest_rf_metrics: RfMetrics | None = None
     closed: bool = False
     worker_error: str | None = None
+    latest_rf_metrics: RfMetrics | None = None
 
 
 class StructuredRecorder:

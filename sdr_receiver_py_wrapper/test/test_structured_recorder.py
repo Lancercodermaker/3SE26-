@@ -14,6 +14,7 @@ from sdr_receiver_py_wrapper.models import IqChunk, RfMetrics
 from sdr_receiver_py_wrapper import rf_safety
 from sdr_receiver_py_wrapper.structured_recorder import (
     RecorderError,
+    RecorderStats,
     StructuredRecorder,
     _json_snapshot,
 )
@@ -137,6 +138,14 @@ def make_iq_adapter(tmp_path, recorder_class=CapturingStructuredRecorder, **over
     }
     options.update(overrides)
     return load_iq_recorder_class(recorder_class)(**options)
+
+
+def test_recorder_stats_preserves_legacy_positional_field_order():
+    stats = RecorderStats(1, 2, 3, 4, 5, 6, True, "disk failed")
+
+    assert stats.closed is True
+    assert stats.worker_error == "disk failed"
+    assert stats.latest_rf_metrics is None
 
 
 def make_chunk(*, chunk_id=0, first_sample_index=0, sample_count=16):
