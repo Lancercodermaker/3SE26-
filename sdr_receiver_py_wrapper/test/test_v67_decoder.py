@@ -7,19 +7,27 @@ from dataclasses import FrozenInstanceError
 import importlib
 from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
+from types import MappingProxyType, ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 
+import sdr_receiver_py_wrapper.original_receiver_adapter as adapter_module
 from sdr_receiver_py_wrapper.models import DecodeContext, IqChunk, ResetReason
-from sdr_receiver_py_wrapper.original_receiver_adapter import ReceiverCoreAdapter
+from sdr_receiver_py_wrapper.original_receiver_adapter import (
+    ReceiverCoreAdapter,
+    ReceiverCoreLoadError,
+)
 from sdr_receiver_py_wrapper.patches import JamKeyEvent, PatchCallbacks, RawFrameEvent
 from sdr_receiver_py_wrapper.v67_decoder import V67Decoder
 
 
-def make_chunk() -> IqChunk:
-    samples = np.zeros(8, dtype=np.complex64)
+def make_chunk(samples: np.ndarray | None = None) -> IqChunk:
+    samples = (
+        np.zeros(8, dtype=np.complex64)
+        if samples is None
+        else np.asarray(samples, dtype=np.complex64).copy()
+    )
     samples.flags.writeable = False
     return IqChunk(
         chunk_id=1,
@@ -188,6 +196,32 @@ def test_core_exception_is_counted_and_propagated_without_success_counts():
     assert decoder.stats().commands_emitted == 0
 
 
+@pytest.mark.parametrize(
+    ("samples", "message"),
+    [
+        (np.zeros(0, dtype=np.complex64), "must not be empty"),
+        (np.array([complex(np.nan, 0.0)], dtype=np.complex64), "finite"),
+        (np.array([complex(0.0, np.inf)], dtype=np.complex64), "finite"),
+    ],
+)
+def test_decoder_rejects_invalid_iq_before_calling_core(samples, message):
+    calls = []
+
+    class BoundaryCore:
+        def demodulate_iq(self, **kwargs):
+            calls.append(kwargs)
+
+    decoder = V67Decoder(core=BoundaryCore())
+    with pytest.raises(ValueError, match=message):
+        decoder.decode(make_chunk(samples), decode_context("BLUE", "L1"))
+
+    assert calls == []
+    assert decoder.stats().decode_errors == 1
+    assert decoder.stats().chunks_processed == 0
+    assert decoder.stats().samples_processed == 0
+    assert decoder.stats().commands_emitted == 0
+
+
 def test_reset_uses_pure_hook_and_counts_only_success():
     calls = []
 
@@ -245,6 +279,12 @@ def test_adapter_reset_clears_vendor_decoder_state_without_leaking_profile_or_ca
     module = ModuleType("resettable_v67")
     module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}
     module.STATE = {
+        "STATS": {
+            "JAM_RF_SOURCE": "L1",
+            "JAM_RF_CONF": 9.0,
+            "JAM_RF_MATCH_STREAK": 8,
+            "JAM_RF_TARGET_CHANGED": 7.0,
+        },
         "BIT_POOLS": {"pool": "bits"},
         "PENDING_FRAMES": {"frame": {"seen": 1}},
         "POOL_SCORES": {"pool": 2.5},
@@ -288,6 +328,12 @@ def test_adapter_reset_clears_vendor_decoder_state_without_leaking_profile_or_ca
     assert module.STATE["BIT_POOLS"] == {}
     assert module.STATE["PENDING_FRAMES"] == {}
     assert module.STATE["POOL_SCORES"] == {}
+    assert module.STATE["STATS"] == {
+        "JAM_RF_SOURCE": "",
+        "JAM_RF_CONF": 0.0,
+        "JAM_RF_MATCH_STREAK": 0,
+        "JAM_RF_TARGET_CHANGED": 0.0,
+    }
     assert module.STATE["TRACK"] == {
         "TARGET": None,
         "PROFILE": None,
@@ -315,6 +361,40 @@ def test_adapter_reset_fails_clearly_when_vendor_has_no_reset_hook():
 
     assert module.STATE["BIT_POOLS"] == {"pool": "bits"}
     assert module.TUNE_CFG == {"TEAM": "RED", "TARGET": "INFO"}
+
+
+def test_bundled_vendor_reset_removes_stale_l1_jam_rf_gate_before_l2():
+    adapter = ReceiverCoreAdapter()
+    module = adapter.load(allow_adi_import_stub=True)
+    stats = module.STATE["STATS"]
+    module.TUNE_CFG.update(TEAM="BLUE", TARGET="L1")
+    stats.update(
+        JAM_RF_SOURCE="L1",
+        JAM_RF_CONF=module.JAM_RF_SOURCE_CONF_MIN * 2.0,
+        JAM_RF_MATCH_STREAK=module.JAM_RF_ACCEPT_STREAK_MIN,
+        JAM_RF_TARGET_CHANGED=0.0,
+    )
+    assert module.jam_rf_gate_status() == ("L1", "rf-classified")
+
+    adapter.reset_decoder(
+        reason=ResetReason.TARGET_CHANGE,
+        profile={"name": "BLUE-L2", "team": "BLUE", "target": "L2"},
+    )
+
+    assert stats["JAM_RF_SOURCE"] == ""
+    assert stats["JAM_RF_CONF"] == 0.0
+    assert stats["JAM_RF_MATCH_STREAK"] == 0
+    assert stats["JAM_RF_TARGET_CHANGED"] == 0.0
+    assert module.TUNE_CFG == {"TEAM": "BLUE", "TARGET": "L1"}
+
+    module.TUNE_CFG["TARGET"] = "L2"
+    stats.update(
+        JAM_RF_SOURCE="L2",
+        JAM_RF_CONF=module.JAM_RF_SOURCE_CONF_MIN * 2.0,
+        JAM_RF_MATCH_STREAK=module.JAM_RF_ACCEPT_STREAK_MIN,
+        JAM_RF_TARGET_CHANGED=0.0,
+    )
+    assert module.jam_rf_gate_status() == ("L2", "rf-classified")
 
 
 def test_adapter_demodulates_copied_iq_with_temporary_profile_and_callbacks():
@@ -357,6 +437,40 @@ def test_adapter_demodulates_copied_iq_with_temporary_profile_and_callbacks():
     assert module.fast_demod is fast_demod
 
 
+def test_adapter_accepts_ndarray_subclass_but_normalizes_core_copy():
+    class IqSubclass(np.ndarray):
+        pass
+
+    module = ModuleType("subclass_v67")
+    module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}
+    module.STATE = {"STATS": {}}
+    module.RADAR_PARAMS = {"BLUE": {"L1": {"ac": "ac"}}}
+    module.validate_and_parse = lambda cmd_id, payload, source="direct": True
+    captured = []
+
+    def fast_demod(samples, ac_target):
+        captured.append((samples, ac_target))
+        samples[0] = np.complex64(9 + 2j)
+
+    module.fast_demod = fast_demod
+    adapter = ReceiverCoreAdapter()
+    adapter.module = module
+    samples = np.zeros(4, dtype=np.complex64).view(IqSubclass)
+    before = samples.copy()
+
+    adapter.demodulate_iq(
+        samples=samples,
+        profile={"name": "BLUE-L1", "team": "BLUE", "target": "L1"},
+        callbacks=PatchCallbacks(),
+    )
+
+    core_samples, ac_target = captured[0]
+    assert type(core_samples) is np.ndarray
+    assert ac_target == "ac"
+    assert not np.shares_memory(core_samples, samples)
+    np.testing.assert_array_equal(samples, before)
+
+
 @pytest.mark.parametrize(
     ("samples", "error", "message"),
     [
@@ -381,6 +495,54 @@ def test_adapter_rejects_iq_outside_exact_array_contract(samples, error, message
             profile={"name": "BLUE-L1", "team": "BLUE", "target": "L1"},
             callbacks=PatchCallbacks(),
         )
+
+
+@pytest.mark.parametrize(
+    ("samples", "message"),
+    [
+        (np.zeros(0, dtype=np.complex64), "must not be empty"),
+        (np.array([complex(np.nan, 0.0)], dtype=np.complex64), "finite"),
+        (np.array([complex(0.0, np.inf)], dtype=np.complex64), "finite"),
+    ],
+)
+def test_adapter_rejects_invalid_values_before_core_or_patch_state(samples, message):
+    module = ModuleType("invalid_values_v67")
+    module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}
+    module.STATE = {"STATS": {}}
+    module.RADAR_PARAMS = {"BLUE": {"L1": {"ac": "ac"}}}
+    module.validate_and_parse = lambda cmd_id, payload, source="direct": True
+    core_calls = []
+    module.fast_demod = lambda iq, ac: core_calls.append((iq, ac))
+
+    class PersistentManager:
+        _applied = True
+
+        def __init__(self):
+            self.restore_calls = 0
+            self.apply_calls = 0
+
+        def restore(self):
+            self.restore_calls += 1
+
+        def apply(self):
+            self.apply_calls += 1
+
+    manager = PersistentManager()
+    adapter = ReceiverCoreAdapter()
+    adapter.module = module
+    adapter.patch_manager = manager
+
+    with pytest.raises(ValueError, match=message):
+        adapter.demodulate_iq(
+            samples=samples,
+            profile={"name": "BLUE-L1", "team": "BLUE", "target": "L1"},
+            callbacks=PatchCallbacks(),
+        )
+
+    assert core_calls == []
+    assert manager.restore_calls == 0
+    assert manager.apply_calls == 0
+    assert module.TUNE_CFG == {"TEAM": "RED", "TARGET": "INFO"}
 
 
 @pytest.mark.parametrize(
@@ -413,6 +575,68 @@ def test_adapter_rejects_profiles_outside_exact_contract(profile, error, message
             profile=profile,
             callbacks=PatchCallbacks(),
         )
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("tune_cfg", "TUNE_CFG.*mutable dict"),
+        ("missing_target", "RADAR_PARAMS.*BLUE.*L1"),
+        ("entry_type", "RADAR_PARAMS.*BLUE.*L1.*mapping"),
+        ("missing_ac", "RADAR_PARAMS.*BLUE.*L1.*ac"),
+        ("fast_demod", "fast_demod.*callable"),
+        ("validate_and_parse", "validate_and_parse.*callable"),
+    ],
+)
+def test_adapter_validates_core_contract_before_any_state_change(fault, message):
+    module = ModuleType("invalid_contract_v67")
+    module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}
+    module.STATE = {"STATS": {}}
+    module.RADAR_PARAMS = {"BLUE": {"L1": {"ac": "ac"}}}
+    module.validate_and_parse = lambda cmd_id, payload, source="direct": True
+    module.fast_demod = lambda samples, ac_target: False
+    if fault == "tune_cfg":
+        module.TUNE_CFG = MappingProxyType(module.TUNE_CFG)
+    elif fault == "missing_target":
+        module.RADAR_PARAMS = {"BLUE": {}}
+    elif fault == "entry_type":
+        module.RADAR_PARAMS["BLUE"]["L1"] = []
+    elif fault == "missing_ac":
+        module.RADAR_PARAMS["BLUE"]["L1"] = {}
+    elif fault == "fast_demod":
+        module.fast_demod = None
+    elif fault == "validate_and_parse":
+        module.validate_and_parse = None
+
+    class PersistentManager:
+        _applied = True
+
+        def __init__(self):
+            self.restore_calls = 0
+            self.apply_calls = 0
+
+        def restore(self):
+            self.restore_calls += 1
+
+        def apply(self):
+            self.apply_calls += 1
+
+    manager = PersistentManager()
+    adapter = ReceiverCoreAdapter()
+    adapter.module = module
+    adapter.patch_manager = manager
+    tune_cfg_before = module.TUNE_CFG
+
+    with pytest.raises(ReceiverCoreLoadError, match=message):
+        adapter.demodulate_iq(
+            samples=np.zeros(4, dtype=np.complex64),
+            profile={"name": "BLUE-L1", "team": "BLUE", "target": "L1"},
+            callbacks=PatchCallbacks(),
+        )
+
+    assert module.TUNE_CFG is tune_cfg_before
+    assert manager.restore_calls == 0
+    assert manager.apply_calls == 0
 
 
 def test_adapter_restores_persistent_callbacks_after_success_and_exception():
@@ -458,6 +682,73 @@ def test_adapter_restores_persistent_callbacks_after_success_and_exception():
     assert module.TUNE_CFG == {"TEAM": "RED", "TARGET": "INFO"}
     module.validate_and_parse(0x0A06, b"GHI789", source="persistent")
     assert [event.key for event in persistent_events] == [b"DEF456", b"GHI789"]
+
+
+@pytest.mark.parametrize(
+    ("demod_fails", "expected_error"),
+    [
+        (True, "demod primary"),
+        (False, "temporary restore cleanup"),
+    ],
+)
+def test_adapter_cleanup_steps_are_independent_and_preserve_first_error(
+    monkeypatch, demod_fails, expected_error
+):
+    module = ModuleType("cleanup_v67")
+    module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}
+    module.STATE = {"STATS": {}}
+    module.RADAR_PARAMS = {"BLUE": {"L1": {"ac": "ac"}}}
+    module.validate_and_parse = lambda cmd_id, payload, source="direct": True
+    events = []
+
+    def fast_demod(samples, ac_target):
+        events.append("fast_demod")
+        if demod_fails:
+            raise RuntimeError("demod primary")
+
+    module.fast_demod = fast_demod
+
+    class PersistentManager:
+        _applied = True
+
+        def restore(self):
+            events.append("persistent_restore")
+
+        def apply(self):
+            events.append("persistent_apply")
+            raise RuntimeError("persistent apply cleanup")
+
+    class TemporaryManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def apply(self):
+            events.append("temporary_apply")
+
+        def restore(self):
+            events.append("temporary_restore")
+            raise RuntimeError("temporary restore cleanup")
+
+    monkeypatch.setattr(adapter_module, "PatchManager", TemporaryManager)
+    adapter = ReceiverCoreAdapter()
+    adapter.module = module
+    adapter.patch_manager = PersistentManager()
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        adapter.demodulate_iq(
+            samples=np.zeros(4, dtype=np.complex64),
+            profile={"name": "BLUE-L1", "team": "BLUE", "target": "L1"},
+            callbacks=PatchCallbacks(),
+        )
+
+    assert events == [
+        "persistent_restore",
+        "temporary_apply",
+        "fast_demod",
+        "temporary_restore",
+        "persistent_apply",
+    ]
+    assert module.TUNE_CFG == {"TEAM": "RED", "TARGET": "INFO"}
 
 
 def test_v67_plugin_source_has_no_device_ros_io_or_thread_creation():

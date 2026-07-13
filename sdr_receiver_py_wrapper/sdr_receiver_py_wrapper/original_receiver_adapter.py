@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 import importlib.util
 import os
 from pathlib import Path
@@ -200,6 +201,10 @@ class ReceiverCoreAdapter:
             raise ValueError("samples must have dtype complex64")
         if samples.ndim != 1:
             raise ValueError("samples must be one-dimensional")
+        if samples.size == 0:
+            raise ValueError("samples must not be empty")
+        if not np.isfinite(samples.real).all() or not np.isfinite(samples.imag).all():
+            raise ValueError("samples must contain only finite real and imaginary values")
         if type(profile) is not dict:
             raise TypeError("profile must be a dict")
         if set(profile) != {"name", "team", "target"}:
@@ -221,23 +226,43 @@ class ReceiverCoreAdapter:
             target = self._normalize_target(profile["target"])
             if team not in ("RED", "BLUE"):
                 raise ValueError(f"invalid profile team: {profile['team']}")
-            if (
-                not isinstance(radar_params, dict)
-                or team not in radar_params
-                or target not in radar_params[team]
-            ):
-                raise ValueError(
-                    f"invalid profile target for {team}: {profile['target']}"
+            if type(tune_cfg) is not dict:
+                raise ReceiverCoreLoadError(
+                    "original receiver core TUNE_CFG must be a mutable dict"
                 )
+            if not isinstance(radar_params, Mapping):
+                raise ReceiverCoreLoadError(
+                    "original receiver core RADAR_PARAMS must be a mapping"
+                )
+            team_params = radar_params.get(team)
+            if not isinstance(team_params, Mapping) or target not in team_params:
+                raise ReceiverCoreLoadError(
+                    f"original receiver core RADAR_PARAMS has no {team}/{target} profile"
+                )
+            target_params = team_params[target]
+            if not isinstance(target_params, Mapping):
+                raise ReceiverCoreLoadError(
+                    f"original receiver core RADAR_PARAMS {team}/{target} must be a mapping"
+                )
+            if "ac" not in target_params:
+                raise ReceiverCoreLoadError(
+                    f"original receiver core RADAR_PARAMS {team}/{target} is missing ac"
+                )
+            if not callable(getattr(module, "fast_demod", None)):
+                raise ReceiverCoreLoadError(
+                    "original receiver core fast_demod must be callable"
+                )
+            if not callable(getattr(module, "validate_and_parse", None)):
+                raise ReceiverCoreLoadError(
+                    "original receiver core validate_and_parse must be callable"
+                )
+            ac_target = target_params["ac"]
             saved_tune_cfg = copy.deepcopy(tune_cfg)
             persistent_manager = self.patch_manager
             persistent_was_applied = bool(
                 persistent_manager is not None
                 and getattr(persistent_manager, "_applied", False)
             )
-            if persistent_was_applied:
-                persistent_manager.restore()
-
             temporary_manager = PatchManager(
                 module,
                 run_mode="pure_decoder",
@@ -245,18 +270,40 @@ class ReceiverCoreAdapter:
                 stop_event=self.stop_event,
                 logger=self.logger,
             )
+            primary_error: Optional[BaseException] = None
+            primary_traceback = None
             try:
+                if persistent_was_applied:
+                    persistent_manager.restore()
                 tune_cfg["TEAM"] = team
                 tune_cfg["TARGET"] = target
-                ac_target = radar_params[team][target]["ac"]
                 temporary_manager.apply()
                 module.fast_demod(core_samples, ac_target)
-            finally:
+            except BaseException as exc:
+                primary_error = exc
+                primary_traceback = exc.__traceback__
+
+            cleanup_errors: list[BaseException] = []
+            try:
                 temporary_manager.restore()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            try:
                 tune_cfg.clear()
                 tune_cfg.update(saved_tune_cfg)
-                if persistent_was_applied:
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            if persistent_was_applied:
+                try:
                     persistent_manager.apply()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+
+            if primary_error is not None:
+                raise primary_error.with_traceback(primary_traceback)
+            if cleanup_errors:
+                cleanup_error = cleanup_errors[0]
+                raise cleanup_error.with_traceback(cleanup_error.__traceback__)
 
     def reset_decoder(
         self,
@@ -286,7 +333,19 @@ class ReceiverCoreAdapter:
                 raise RuntimeError(
                     "original receiver core does not support pure decoder reset"
                 )
+            state = getattr(module, "STATE", None)
+            stats = state.get("STATS") if isinstance(state, dict) else None
+            if not isinstance(stats, dict):
+                raise ReceiverCoreLoadError(
+                    "original receiver core STATE.STATS must be a mutable dict"
+                )
             reset_tracking_state(clear_scores=True)
+            stats.update(
+                JAM_RF_SOURCE="",
+                JAM_RF_CONF=0.0,
+                JAM_RF_MATCH_STREAK=0,
+                JAM_RF_TARGET_CHANGED=0.0,
+            )
 
     def configure_iq_file_source(
         self,

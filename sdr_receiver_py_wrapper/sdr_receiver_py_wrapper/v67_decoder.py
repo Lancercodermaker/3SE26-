@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 
+import numpy as np
+
 from .models import DecodedCommand, DecodeContext, DecoderStats, IqChunk, ResetReason
 from .patches import JamKeyEvent, PatchCallbacks, RawFrameEvent
 
@@ -85,6 +87,15 @@ class V67Decoder:
             )
 
         try:
+            if chunk.samples.size == 0:
+                raise ValueError("IQ chunk samples must not be empty")
+            if (
+                not np.isfinite(chunk.samples.real).all()
+                or not np.isfinite(chunk.samples.imag).all()
+            ):
+                raise ValueError(
+                    "IQ chunk samples must contain only finite real and imaginary values"
+                )
             self._core.demodulate_iq(
                 samples=chunk.samples,
                 profile=self._profile(context),
