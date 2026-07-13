@@ -849,6 +849,11 @@ class SdrReceiverPyWrapperNode(Node):
         if result.accepted:
             if self.publish_ros_outputs:
                 self._publish_validated_jam_code(command, result)
+            else:
+                self.command_validator.discard_publish_authorization(
+                    command,
+                    result,
+                )
         else:
             self.get_logger().debug(result.reason)
         return result
@@ -915,6 +920,15 @@ class SdrReceiverPyWrapperNode(Node):
         command: DecodedCommand,
         result: ValidationResult,
     ) -> None:
+        if command.decoder_id != self.primary_decoder_id:
+            self.command_validator.discard_publish_authorization(
+                command,
+                result,
+            )
+            raise ValueError(
+                f"Jam publisher requires primary decoder "
+                f"{self.primary_decoder_id!r}"
+            )
         if not self.command_validator.consume_publish_authorization(command, result):
             raise ValueError(
                 "Jam publisher requires a fresh validated command result"

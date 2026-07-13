@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import OrderedDict
+from dataclasses import dataclass
+import threading
 
 from .models import DecodedCommand
 
@@ -15,24 +17,26 @@ class ValidationResult:
     reason: str
     ascii_code: str | None = None
     level: int | None = None
-    _dedup_key: tuple[int, bytes, int] | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-    _publish_authorization: object | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
 
 
 class CommandValidator:
-    """Validate and de-duplicate decoded commands for production output."""
+    """Validate and de-duplicate decoded commands for production output.
+
+    Pending publication pairs are retained strongly for identity checks and
+    bounded so direct validation clients cannot grow authorization state
+    without limit. Accepted de-duplication keys intentionally last for the
+    validator instance lifetime.
+    """
+
+    _MAX_PENDING_AUTHORIZATIONS = 1024
 
     def __init__(self) -> None:
         self._accepted_keys: set[tuple[int, bytes, int]] = set()
-        self._publish_authorizations: set[object] = set()
+        self._pending_authorizations: OrderedDict[
+            int,
+            tuple[ValidationResult, DecodedCommand],
+        ] = OrderedDict()
+        self._lock = threading.Lock()
 
     def validate(self, command: DecodedCommand) -> ValidationResult:
         if type(command.crc8_ok) is not bool or command.crc8_ok is not True:
@@ -74,24 +78,28 @@ class CommandValidator:
                 "0x0A06 evidence.level must be between 1 and 3",
             )
         key = (command.cmd_id, command.payload, level)
-        if key in self._accepted_keys:
-            return ValidationResult(
-                False,
-                "duplicate command: cmd_id/payload/target_level already accepted",
+        with self._lock:
+            if key in self._accepted_keys:
+                return ValidationResult(
+                    False,
+                    "duplicate command: cmd_id/payload/target_level already accepted",
+                    ascii_code=command.payload.decode("ascii"),
+                    level=level,
+                )
+            self._accepted_keys.add(key)
+            result = ValidationResult(
+                True,
+                "accepted",
                 ascii_code=command.payload.decode("ascii"),
                 level=level,
             )
-        self._accepted_keys.add(key)
-        authorization = object()
-        self._publish_authorizations.add(authorization)
-        return ValidationResult(
-            True,
-            "accepted",
-            ascii_code=command.payload.decode("ascii"),
-            level=level,
-            _dedup_key=key,
-            _publish_authorization=authorization,
-        )
+            self._pending_authorizations[id(result)] = (result, command)
+            while (
+                len(self._pending_authorizations)
+                > self._MAX_PENDING_AUTHORIZATIONS
+            ):
+                self._pending_authorizations.popitem(last=False)
+            return result
 
     def consume_publish_authorization(
         self,
@@ -100,15 +108,22 @@ class CommandValidator:
     ) -> bool:
         """Consume the one-shot authorization attached to an accepted result."""
 
-        authorization = result._publish_authorization
-        if (
-            result.accepted is not True
-            or authorization is None
-            or authorization not in self._publish_authorizations
-            or result.level is None
-            or result._dedup_key
-            != (command.cmd_id, command.payload, result.level)
-        ):
-            return False
-        self._publish_authorizations.remove(authorization)
-        return True
+        with self._lock:
+            pending = self._pending_authorizations.get(id(result))
+            if (
+                pending is None
+                or pending[0] is not result
+                or pending[1] is not command
+            ):
+                return False
+            del self._pending_authorizations[id(result)]
+            return True
+
+    def discard_publish_authorization(
+        self,
+        command: DecodedCommand,
+        result: ValidationResult,
+    ) -> bool:
+        """Discard an exact pending result when ROS output is disabled."""
+
+        return self.consume_publish_authorization(command, result)

@@ -1,6 +1,8 @@
-from dataclasses import FrozenInstanceError
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError, replace
 import importlib
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -14,6 +16,15 @@ from sdr_receiver_py_wrapper.patches import JamKeyEvent
 
 
 MISSING = object()
+SUBSTITUTED_COMMAND_CHANGES = [
+    {"decoder_id": "shadow_v67"},
+    {"crc8_ok": False},
+    {"crc16_ok": False},
+    {"target": "JAM_L2_KEY"},
+    {"team": "BLUE"},
+    {"context_version": 99},
+    {"evidence": {"level": 1, "source": "substituted"}},
+]
 
 
 def command(
@@ -24,8 +35,13 @@ def command(
     crc16_ok=True,
     decoder_id="improved_v67",
     level=1,
+    target="JAM_L1_KEY",
+    team="RED",
+    context_version=4,
+    evidence=MISSING,
 ):
-    evidence = {} if level is MISSING else {"level": level}
+    if evidence is MISSING:
+        evidence = {} if level is MISSING else {"level": level}
     return DecodedCommand(
         cmd_id=cmd_id,
         payload=payload,
@@ -37,9 +53,9 @@ def command(
         first_sample_index=10,
         last_sample_index=20,
         receive_wall_time=123.0,
-        target="JAM_L1_KEY",
-        team="RED",
-        context_version=4,
+        target=target,
+        team=team,
+        context_version=context_version,
         evidence=evidence,
     )
 
@@ -140,6 +156,63 @@ def test_duplicate_key_is_cmd_payload_and_target_level():
     assert different_payload.accepted is True
 
 
+@pytest.mark.parametrize(
+    "changes",
+    SUBSTITUTED_COMMAND_CHANGES,
+)
+def test_publish_authorization_is_bound_to_original_command_identity(changes):
+    validator = CommandValidator()
+    original = command(payload=b"ABC123")
+    result = validator.validate(original)
+    substituted = replace(original, **changes)
+
+    assert validator.consume_publish_authorization(substituted, result) is False
+    assert validator.consume_publish_authorization(original, result) is True
+
+
+def test_publish_authorization_is_bound_to_original_result_identity():
+    validator = CommandValidator()
+    original = command(payload=b"ABC123")
+    result = validator.validate(original)
+    substituted = replace(result, ascii_code="FORGED")
+
+    assert validator.consume_publish_authorization(original, substituted) is False
+    assert validator.consume_publish_authorization(original, result) is True
+
+
+def test_pending_publish_authorizations_are_bounded():
+    validator = CommandValidator()
+    commands = [command(payload=f"{index:06d}".encode()) for index in range(1025)]
+    results = [validator.validate(item) for item in commands]
+
+    assert all(result.accepted for result in results)
+    assert (
+        validator.consume_publish_authorization(commands[0], results[0])
+        is False
+    )
+    assert (
+        validator.consume_publish_authorization(commands[-1], results[-1])
+        is True
+    )
+
+
+def test_concurrent_duplicate_validation_accepts_exactly_one():
+    validator = CommandValidator()
+    workers = 32
+    barrier = threading.Barrier(workers)
+
+    def validate_once(_index):
+        item = command(payload=b"RACE01")
+        barrier.wait()
+        return validator.validate(item)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(validate_once, range(workers)))
+
+    assert sum(result.accepted for result in results) == 1
+    assert sum("duplicate command" in result.reason for result in results) == 31
+
+
 class FakeRosMessage:
     def __init__(self):
         self.header = SimpleNamespace(stamp=None)
@@ -191,6 +264,17 @@ class FakePublisher:
         self.messages.append(message)
 
 
+class FakeAdapter:
+    def __init__(self):
+        self.targets = []
+
+    def get_stats_snapshot(self):
+        return {"rf_state": "receiving"}
+
+    def set_target(self, target):
+        self.targets.append(target)
+
+
 def make_node(receiver_node_module):
     node = object.__new__(receiver_node_module.SdrReceiverPyWrapperNode)
     node.primary_decoder_id = "improved_v67"
@@ -204,9 +288,8 @@ def make_node(receiver_node_module):
         key_mutable=True,
     )
     node.run_mode = "competition"
-    node.adapter = SimpleNamespace(
-        get_stats_snapshot=lambda: {"rf_state": "receiving"},
-    )
+    node.adapter = FakeAdapter()
+    node.profile_config = {}
     node.controller = SimpleNamespace(rx_team="BLUE", own_team="RED")
     node.get_clock = lambda: SimpleNamespace(
         now=lambda: SimpleNamespace(to_msg=lambda: "stamp")
@@ -267,15 +350,64 @@ def test_validated_publisher_rejects_unvalidated_or_reused_result(
     with pytest.raises(ValueError, match="validated command"):
         node._publish_validated_jam_code(command(payload=b"ABC123"), forged)
 
-    foreign = CommandValidator().validate(command(payload=b"ABC123"))
+    foreign_command = command(payload=b"ABC123")
+    foreign = CommandValidator().validate(foreign_command)
     with pytest.raises(ValueError, match="validated command"):
-        node._publish_validated_jam_code(command(payload=b"ABC123"), foreign)
+        node._publish_validated_jam_code(foreign_command, foreign)
 
-    accepted = node.command_validator.validate(command(payload=b"ABC123"))
-    node._publish_validated_jam_code(command(payload=b"ABC123"), accepted)
+    accepted_command = command(payload=b"ABC123")
+    accepted = node.command_validator.validate(accepted_command)
+    node._publish_validated_jam_code(accepted_command, accepted)
     with pytest.raises(ValueError, match="validated command"):
-        node._publish_validated_jam_code(command(payload=b"ABC123"), accepted)
+        node._publish_validated_jam_code(accepted_command, accepted)
     assert len(node.jam_code_pub.messages) == 1
+
+
+@pytest.mark.parametrize("changes", SUBSTITUTED_COMMAND_CHANGES)
+def test_publisher_rejects_every_substituted_command(
+    receiver_node_module,
+    changes,
+):
+    node = make_node(receiver_node_module)
+    original = command(payload=b"ABC123")
+    result = node.command_validator.validate(original)
+    substituted = replace(original, **changes)
+
+    with pytest.raises(ValueError):
+        node._publish_validated_jam_code(substituted, result)
+
+    assert node.jam_code_pub.messages == []
+    node._publish_validated_jam_code(original, result)
+    assert len(node.jam_code_pub.messages) == 1
+
+
+def test_publisher_rechecks_primary_decoder_for_validator_signed_shadow(
+    receiver_node_module,
+):
+    node = make_node(receiver_node_module)
+    shadow = command(decoder_id="shadow_v67", payload=b"ABC123")
+    result = node.command_validator.validate(shadow)
+
+    with pytest.raises(ValueError, match="primary decoder"):
+        node._publish_validated_jam_code(shadow, result)
+
+    assert node.jam_code_pub.messages == []
+
+
+def test_disabled_ros_output_discards_accepted_publish_authorization(
+    receiver_node_module,
+):
+    node = make_node(receiver_node_module)
+    node.publish_ros_outputs = False
+    item = command(payload=b"ABC123")
+
+    result = node._handle_decoded_command(item)
+
+    assert result.accepted is True
+    node.publish_ros_outputs = True
+    with pytest.raises(ValueError, match="validated command"):
+        node._publish_validated_jam_code(item, result)
+    assert node.jam_code_pub.messages == []
 
 
 def test_legacy_callback_routes_invalid_key_through_validator(receiver_node_module):
@@ -302,3 +434,63 @@ def test_legacy_callback_routes_invalid_key_through_validator(receiver_node_modu
     node._on_jam_key(event)
 
     assert node.jam_code_pub.messages == []
+
+
+def test_legacy_callback_preserves_controller_target_without_publish(
+    receiver_node_module,
+):
+    node = make_node(receiver_node_module)
+    node.controller.handle_jam_key = lambda **_kwargs: SimpleNamespace(
+        publish=False,
+        warnings=(),
+        level=1,
+        target="L2",
+        reason="advance RF only",
+    )
+    event = JamKeyEvent(
+        cmd_id=0x0A06,
+        payload=b"ABC123",
+        key=b"ABC123",
+        ascii_code="ABC123",
+        level=1,
+        team="BLUE",
+        target="L1",
+        source="legacy-core",
+        timestamp=321.0,
+    )
+
+    node._on_jam_key(event)
+
+    assert node.jam_code_pub.messages == []
+    assert node.adapter.targets == ["L2"]
+
+
+def test_legacy_callback_uses_controller_level_for_validation_and_output(
+    receiver_node_module,
+):
+    node = make_node(receiver_node_module)
+    node.controller.handle_jam_key = lambda **_kwargs: SimpleNamespace(
+        publish=True,
+        warnings=(),
+        level=2,
+        target=None,
+        reason="controller selected L2",
+    )
+    event = JamKeyEvent(
+        cmd_id=0x0A06,
+        payload=b"ABC123",
+        key=b"ABC123",
+        ascii_code="ABC123",
+        level=1,
+        team="BLUE",
+        target="L1",
+        source="legacy-core",
+        timestamp=321.0,
+    )
+
+    node._on_jam_key(event)
+
+    assert len(node.jam_code_pub.messages) == 1
+    message = node.jam_code_pub.messages[0]
+    assert message.level == 2
+    assert message.target == "JAM_L2_KEY"
