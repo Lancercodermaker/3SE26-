@@ -161,21 +161,23 @@ class StructuredRecorder:
                         "first_sample_index": chunk.first_sample_index,
                         "last_sample_index_exclusive": last_sample,
                     }
+                    previous_range = (
+                        self._dropped_chunk_ranges_overflow
+                        if self._dropped_chunk_ranges_overflow is not None
+                        else (
+                            self._dropped_chunk_ranges[-1]
+                            if self._dropped_chunk_ranges
+                            else None
+                        )
+                    )
                     if (
-                        self._dropped_chunk_ranges
-                        and chunk.chunk_id
-                        == self._dropped_chunk_ranges[-1]["last_chunk_id"] + 1
+                        previous_range is not None
+                        and chunk.chunk_id == previous_range["last_chunk_id"] + 1
                         and chunk.first_sample_index
-                        == self._dropped_chunk_ranges[-1][
-                            "last_sample_index_exclusive"
-                        ]
+                        == previous_range["last_sample_index_exclusive"]
                     ):
-                        self._dropped_chunk_ranges[-1][
-                            "last_chunk_id"
-                        ] = chunk.chunk_id
-                        self._dropped_chunk_ranges[-1][
-                            "last_sample_index_exclusive"
-                        ] = last_sample
+                        previous_range["last_chunk_id"] = chunk.chunk_id
+                        previous_range["last_sample_index_exclusive"] = last_sample
                     elif len(self._dropped_chunk_ranges) < 16:
                         self._dropped_chunk_ranges.append(dropped_range)
                     elif self._dropped_chunk_ranges_overflow is None:
@@ -372,8 +374,8 @@ class StructuredRecorder:
                 provider_metadata = {"metadata_error": str(exc)}
         with self._lock:
             payload = {
-                **self._summary_metadata,
                 **provider_metadata,
+                **self._summary_metadata,
                 "format": "numpy.complex64 little-endian interleaved IQ",
                 "files": {
                     "iq": self.iq_path.name,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import numbers
 import os
 from pathlib import Path
 import sys
@@ -30,7 +29,7 @@ from .original_receiver_adapter import ReceiverCoreAdapter
 from .patches import JamKeyEvent, PatchCallbacks, RawFrameEvent, TargetChangeEvent
 from .profile_import import AdaptiveProfileLoadError, load_adaptive_profile
 from .models import IqChunk
-from .structured_recorder import StructuredRecorder
+from .structured_recorder import StructuredRecorder, _json_snapshot
 
 
 DEFAULT_ORIGINAL_SCRIPT = "auto"
@@ -58,7 +57,9 @@ class IqRecorder:
         self.max_bytes = int(max_bytes)
         self.every_n = max(1, int(every_n))
         self.metadata_provider = metadata_provider
-        self.chunk_metadata_provider = chunk_metadata_provider or metadata_provider
+        self.chunk_metadata_provider = (
+            chunk_metadata_provider if chunk_metadata_provider is not None else lambda: {}
+        )
         self.lock = threading.RLock()
         self._close_lock = threading.Lock()
         self.path: Optional[Path] = None
@@ -898,7 +899,7 @@ class SdrReceiverPyWrapperNode(Node):
             else str(self.adapter.receiver_exception),
         }
         msg = String()
-        msg.data = json.dumps(_json_safe(status), sort_keys=True)
+        msg.data = _json_dumps(status)
         self.status_pub.publish(msg)
 
     def _current_team(self, fallback: str = "UNKNOWN") -> str:
@@ -949,17 +950,11 @@ def main(args=None) -> None:
 
 
 def _json_safe(value):
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    if isinstance(value, numbers.Integral):
-        return int(value)
-    if isinstance(value, numbers.Real):
-        return float(value)
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    return str(value)
+    return _json_snapshot(value)
+
+
+def _json_dumps(value) -> str:
+    return json.dumps(_json_safe(value), sort_keys=True, allow_nan=False)
 
 
 if __name__ == "__main__":

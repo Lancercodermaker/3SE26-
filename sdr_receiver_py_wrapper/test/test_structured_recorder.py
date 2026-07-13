@@ -11,7 +11,11 @@ import numpy as np
 import pytest
 
 from sdr_receiver_py_wrapper.models import IqChunk, RfMetrics
-from sdr_receiver_py_wrapper.structured_recorder import RecorderError, StructuredRecorder
+from sdr_receiver_py_wrapper.structured_recorder import (
+    RecorderError,
+    StructuredRecorder,
+    _json_snapshot,
+)
 
 
 def load_iq_recorder_class(structured_recorder_class):
@@ -46,6 +50,35 @@ def load_iq_recorder_class(structured_recorder_class):
         namespace,
     )
     return namespace["IqRecorder"]
+
+
+def load_receiver_json_dumps():
+    receiver_path = (
+        Path(__file__).parents[1]
+        / "sdr_receiver_py_wrapper"
+        / "receiver_node.py"
+    )
+    tree = ast.parse(receiver_path.read_text(encoding="utf-8"))
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_json_safe", "_json_dumps"}
+    ]
+    namespace = {
+        "_json_snapshot": _json_snapshot,
+        "json": json,
+        "np": np,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])),
+            str(receiver_path),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["_json_dumps"]
 
 
 class CapturingStructuredRecorder:
@@ -171,6 +204,27 @@ def test_iq_adapter_hot_path_uses_light_metadata_and_no_rf_reductions(
     assert delegate.chunk_metadata[0]["target"] == "HERO"
     recorder.close()
     assert calls == {"summary": 1, "chunk": 1}
+
+
+def test_iq_adapter_legacy_provider_runs_only_once_in_worker_summary(tmp_path):
+    CapturingStructuredRecorder.instances.clear()
+    calls = 0
+
+    def complete_metadata():
+        nonlocal calls
+        calls += 1
+        return {"profile": {"large": "payload"}, "target": "HERO"}
+
+    recorder = make_iq_adapter(tmp_path, metadata_provider=complete_metadata)
+    for _ in range(3):
+        recorder.write(np.ones(4, dtype=np.complex64))
+
+    assert calls == 0
+    assert CapturingStructuredRecorder.instances[-1].chunk_metadata == [
+        {"target": "UNKNOWN"}
+    ] * 3
+    recorder.close()
+    assert calls == 1
 
 
 def test_iq_adapter_every_n_preserves_real_sample_gaps_without_copying_skips(
@@ -396,6 +450,45 @@ def test_nonfinite_values_are_encoded_as_strict_auditable_json(tmp_path):
     assert provider_threads[0] is not threading.main_thread()
 
 
+def test_receiver_status_json_uses_strict_auditable_nonfinite_encoding():
+    dumps = load_receiver_json_dumps()
+
+    encoded = dumps(
+        {
+            "float": float("nan"),
+            "positive": float("inf"),
+            "negative": float("-inf"),
+            "numpy": np.float64(float("nan")),
+        }
+    )
+
+    def reject_constant(value):
+        raise AssertionError(f"non-standard JSON constant: {value}")
+
+    assert json.loads(encoded, parse_constant=reject_constant) == {
+        "float": "NaN",
+        "positive": "Infinity",
+        "negative": "-Infinity",
+        "numpy": "NaN",
+    }
+
+
+def test_static_summary_configuration_overrides_provider_values(tmp_path):
+    recorder = StructuredRecorder(
+        tmp_path,
+        "authoritative-config",
+        summary_metadata={"every_n": 2, "max_bytes": 32},
+        summary_metadata_provider=lambda: {"every_n": 999, "max_bytes": 999},
+    )
+    recorder.close()
+
+    summary = json.loads(
+        (tmp_path / "authoritative-config.summary.json").read_text()
+    )
+    assert summary["every_n"] == 2
+    assert summary["max_bytes"] == 32
+
+
 def test_recorder_writes_iq_chunk_and_event_sidecars(tmp_path):
     recorder = StructuredRecorder(tmp_path, "case")
     recorder.write_chunk(make_chunk(chunk_id=7, first_sample_index=112))
@@ -537,6 +630,56 @@ def test_queue_overflow_is_nonblocking_counted_and_auditable(tmp_path, monkeypat
     assert summary["dropped_chunks"] == 2
     assert summary["dropped_events"] == 23
     assert summary["queue_overflows"] == 25
+
+
+def test_bounded_overflow_tail_counts_discontinuous_ranges(tmp_path, monkeypatch):
+    worker_entered_open = threading.Event()
+    release_worker = threading.Event()
+    original_open = Path.open
+
+    def delayed_open(path, *args, **kwargs):
+        if threading.current_thread() is not threading.main_thread():
+            worker_entered_open.set()
+            assert release_worker.wait(timeout=3.0)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", delayed_open)
+    recorder = StructuredRecorder(tmp_path, "bounded-tail", queue_size=1)
+    assert worker_entered_open.wait(timeout=3.0)
+    assert recorder.write_chunk(make_chunk(chunk_id=999, sample_count=1))
+    for chunk_id in range(0, 32, 2):
+        assert not recorder.write_chunk(
+            make_chunk(
+                chunk_id=chunk_id,
+                first_sample_index=chunk_id,
+                sample_count=1,
+            )
+        )
+    for chunk_id in (32, 33, 35):
+        assert not recorder.write_chunk(
+            make_chunk(
+                chunk_id=chunk_id,
+                first_sample_index=chunk_id,
+                sample_count=1,
+            )
+        )
+    release_worker.set()
+    recorder.close()
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "bounded-tail.events.jsonl").read_text().splitlines()
+    ]
+    overflow = next(event for event in events if event["kind"] == "recorder_queue_overflow")
+    payload = overflow["payload"]
+    assert len(payload["dropped_chunk_ranges"]) == 16
+    assert payload["dropped_chunk_ranges_overflow"] == {
+        "first_chunk_id": 32,
+        "last_chunk_id": 35,
+        "first_sample_index": 32,
+        "last_sample_index_exclusive": 36,
+        "range_count": 2,
+    }
 
 
 def test_close_drains_is_idempotent_and_rejects_later_writes(tmp_path):
@@ -690,18 +833,20 @@ def test_receiver_iq_recorder_delegates_without_synchronous_disk_calls():
 
 def test_receiver_iq_recorder_preserves_compatibility_and_snapshots_raw_iq(tmp_path):
     CapturingStructuredRecorder.instances.clear()
+    metadata = {
+        "sample_rate_hz": 2_000_000,
+        "rx_lo_hz": 434_920_000,
+        "rf_bandwidth_hz": 940_000,
+        "rx_gain": 20,
+        "target_version": 7,
+        "context_version": 8,
+        "target": "HERO",
+    }
     recorder = make_iq_adapter(
         tmp_path,
         prefix="base",
-        metadata_provider=lambda: {
-            "sample_rate_hz": 2_000_000,
-            "rx_lo_hz": 434_920_000,
-            "rf_bandwidth_hz": 940_000,
-            "rx_gain": 20,
-            "target_version": 7,
-            "context_version": 8,
-            "target": "HERO",
-        },
+        metadata_provider=lambda: metadata,
+        chunk_metadata_provider=lambda: metadata,
         prefix_provider=lambda: "dynamic",
     )
     reused_device_buffer = np.asarray([1 + 2j, 3 + 4j], dtype=np.complex64)
