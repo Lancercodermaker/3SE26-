@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from sdr_receiver_py_wrapper.models import IqChunk, RfMetrics
+from sdr_receiver_py_wrapper import rf_safety
 from sdr_receiver_py_wrapper.structured_recorder import (
     RecorderError,
     StructuredRecorder,
@@ -159,6 +160,32 @@ def make_chunk(*, chunk_id=0, first_sample_index=0, sample_count=16):
             clipping_ratio=0.0,
             sample_count=sample_count,
         ),
+    )
+
+
+def make_unmeasured_chunk(
+    samples,
+    *,
+    chunk_id=0,
+    first_sample_index=0,
+    target_version=1,
+    context_version=1,
+):
+    owned = np.array(samples, dtype=np.complex64, copy=True)
+    owned.setflags(write=False)
+    return IqChunk(
+        chunk_id=chunk_id,
+        first_sample_index=first_sample_index,
+        samples=owned,
+        sample_rate_hz=2_000_000,
+        rx_wall_time=1_700_000_000.25,
+        rx_monotonic_ns=123_456_789,
+        lo_hz=434_920_000,
+        rf_bandwidth_hz=940_000,
+        rx_gain_db=20,
+        target_version=target_version,
+        context_version=context_version,
+        rf_metrics=None,
     )
 
 
@@ -450,6 +477,77 @@ def test_nonfinite_values_are_encoded_as_strict_auditable_json(tmp_path):
     assert provider_threads[0] is not threading.main_thread()
 
 
+def test_worker_measures_missing_rf_metrics_and_iq_status_reports_them(
+    tmp_path,
+    monkeypatch,
+):
+    measure_threads = []
+    original_measure_rf = rf_safety.measure_rf
+
+    def tracking_measure_rf(samples, code_scale=2048.0):
+        measure_threads.append(threading.current_thread())
+        return original_measure_rf(samples, code_scale=code_scale)
+
+    monkeypatch.setattr(rf_safety, "measure_rf", tracking_measure_rf)
+    recorder = make_iq_adapter(
+        tmp_path,
+        StructuredRecorder,
+        chunk_metadata_provider=lambda: {
+            "target": "HERO",
+            "adc_code_scale": 2048.0,
+        },
+    )
+    recorder.write(np.array([3 + 4j, 0], dtype=np.complex64))
+    recorder.close()
+
+    assert measure_threads
+    assert all(thread is not threading.main_thread() for thread in measure_threads)
+    status = recorder.status()
+    assert status["last_peak"] == pytest.approx(5.0 / 2048.0)
+    assert status["last_rms"] == pytest.approx((5.0 / np.sqrt(2.0)) / 2048.0)
+    chunk = json.loads(recorder.path.with_suffix(".chunks.jsonl").read_text())
+    assert chunk["rf_metrics"]["peak"] == pytest.approx(5.0 / 2048.0)
+    assert chunk["rf_metrics"]["rms"] == pytest.approx(
+        (5.0 / np.sqrt(2.0)) / 2048.0
+    )
+    summary = json.loads(recorder.path.with_suffix(".summary.json").read_text())
+    assert summary["latest_rf_metrics"] == chunk["rf_metrics"]
+
+
+def test_worker_preserves_authoritative_chunk_rf_metrics(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rf_safety,
+        "measure_rf",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("provided RF metrics must not be recomputed")
+        ),
+    )
+    recorder = StructuredRecorder(tmp_path, "provided-rf")
+    recorder.write_chunk(make_chunk(sample_count=2))
+    recorder.close()
+
+    chunk = json.loads((tmp_path / "provided-rf.chunks.jsonl").read_text())
+    assert chunk["rf_metrics"] == {
+        "clipping_ratio": 0.0,
+        "peak": 1.0,
+        "rms": 0.5,
+        "sample_count": 2,
+    }
+
+
+def test_invalid_chunk_adc_scale_is_reported_as_worker_error(tmp_path):
+    recorder = StructuredRecorder(tmp_path, "invalid-scale")
+    recorder.write_chunk(
+        make_unmeasured_chunk([1 + 1j]),
+        metadata={"adc_code_scale": 0},
+    )
+
+    with pytest.raises(RecorderError, match="worker failed") as error:
+        recorder.close()
+    assert isinstance(error.value.__cause__, ValueError)
+    assert "code_scale" in str(error.value.__cause__)
+
+
 def test_receiver_status_json_uses_strict_auditable_nonfinite_encoding():
     dumps = load_receiver_json_dumps()
 
@@ -607,6 +705,13 @@ def test_queue_overflow_is_nonblocking_counted_and_auditable(tmp_path, monkeypat
         "last_chunk_id": 9,
         "first_sample_index": 112,
         "last_sample_index_exclusive": 160,
+        "first_target": None,
+        "first_target_version": 3,
+        "first_context_version": 4,
+        "last_target": None,
+        "last_target_version": 3,
+        "last_context_version": 4,
+        "mixed_context": False,
     }
     assert payload["dropped_chunk_ranges"] == [
         {
@@ -614,12 +719,18 @@ def test_queue_overflow_is_nonblocking_counted_and_auditable(tmp_path, monkeypat
             "last_chunk_id": 7,
             "first_sample_index": 112,
             "last_sample_index_exclusive": 128,
+            "target": None,
+            "target_version": 3,
+            "context_version": 4,
         },
         {
             "first_chunk_id": 9,
             "last_chunk_id": 9,
             "first_sample_index": 144,
             "last_sample_index_exclusive": 160,
+            "target": None,
+            "target_version": 3,
+            "context_version": 4,
         },
     ]
     assert payload["dropped_event_kinds"]["context_rejected"] == 2
@@ -649,20 +760,32 @@ def test_bounded_overflow_tail_counts_discontinuous_ranges(tmp_path, monkeypatch
     assert recorder.write_chunk(make_chunk(chunk_id=999, sample_count=1))
     for chunk_id in range(0, 32, 2):
         assert not recorder.write_chunk(
-            make_chunk(
+            make_unmeasured_chunk(
+                [1],
                 chunk_id=chunk_id,
                 first_sample_index=chunk_id,
-                sample_count=1,
-            )
+            ),
+            metadata={"target": "HERO"},
         )
-    for chunk_id in (32, 33, 35):
+    for chunk_id in (32, 33):
         assert not recorder.write_chunk(
-            make_chunk(
+            make_unmeasured_chunk(
+                [1],
                 chunk_id=chunk_id,
                 first_sample_index=chunk_id,
-                sample_count=1,
-            )
+            ),
+            metadata={"target": "HERO"},
         )
+    assert not recorder.write_chunk(
+        make_unmeasured_chunk(
+            [1],
+            chunk_id=35,
+            first_sample_index=35,
+            target_version=2,
+            context_version=2,
+        ),
+        metadata={"target": "INFANTRY"},
+    )
     release_worker.set()
     recorder.close()
 
@@ -678,8 +801,70 @@ def test_bounded_overflow_tail_counts_discontinuous_ranges(tmp_path, monkeypatch
         "last_chunk_id": 35,
         "first_sample_index": 32,
         "last_sample_index_exclusive": 36,
+        "first_target": "HERO",
+        "first_target_version": 1,
+        "first_context_version": 1,
+        "last_target": "INFANTRY",
+        "last_target_version": 2,
+        "last_context_version": 2,
+        "mixed_context": True,
         "range_count": 2,
     }
+    summary = json.loads((tmp_path / "bounded-tail.summary.json").read_text())
+    assert summary["dropped_chunk_ranges_overflow"] == payload[
+        "dropped_chunk_ranges_overflow"
+    ]
+
+
+def test_dropped_ranges_split_and_retain_target_context(tmp_path, monkeypatch):
+    worker_entered_open = threading.Event()
+    release_worker = threading.Event()
+    original_open = Path.open
+
+    def delayed_open(path, *args, **kwargs):
+        if threading.current_thread() is not threading.main_thread():
+            worker_entered_open.set()
+            assert release_worker.wait(timeout=3.0)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", delayed_open)
+    recorder = StructuredRecorder(tmp_path, "drop-context", queue_size=1)
+    assert worker_entered_open.wait(timeout=3.0)
+    assert recorder.write_chunk(
+        make_unmeasured_chunk([1], chunk_id=0),
+        metadata={"target": "HERO"},
+    )
+    assert not recorder.write_chunk(
+        make_unmeasured_chunk([1], chunk_id=1, first_sample_index=1),
+        metadata={"target": "HERO"},
+    )
+    infantry = make_unmeasured_chunk(
+        [1],
+        chunk_id=2,
+        first_sample_index=2,
+        target_version=2,
+        context_version=2,
+    )
+    assert not recorder.write_chunk(infantry, metadata={"target": "INFANTRY"})
+    release_worker.set()
+    recorder.close()
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "drop-context.events.jsonl").read_text().splitlines()
+    ]
+    overflow = next(event for event in events if event["kind"] == "recorder_queue_overflow")
+    ranges = overflow["payload"]["dropped_chunk_ranges"]
+    assert [(item["target"], item["target_version"], item["context_version"]) for item in ranges] == [
+        ("HERO", 1, 1),
+        ("INFANTRY", 2, 2),
+    ]
+    assert overflow["payload"]["dropped_chunk_range"]["first_target"] == "HERO"
+    assert overflow["payload"]["dropped_chunk_range"]["last_target"] == "INFANTRY"
+    assert overflow["payload"]["dropped_chunk_range"]["mixed_context"] is True
+    summary = json.loads((tmp_path / "drop-context.summary.json").read_text())
+    assert summary["dropped_chunk_ranges"] == ranges
+    assert summary["dropped_chunk_range"] == overflow["payload"]["dropped_chunk_range"]
 
 
 def test_close_drains_is_idempotent_and_rejects_later_writes(tmp_path):

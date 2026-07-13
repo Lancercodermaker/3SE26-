@@ -16,7 +16,8 @@ from typing import Mapping
 
 import numpy as np
 
-from .models import IqChunk
+from . import rf_safety
+from .models import IqChunk, RfMetrics
 
 
 class RecorderError(RuntimeError):
@@ -31,6 +32,7 @@ class RecorderStats:
     bytes_written: int = 0
     dropped_chunks: int = 0
     dropped_events: int = 0
+    latest_rf_metrics: RfMetrics | None = None
     closed: bool = False
     worker_error: str | None = None
 
@@ -90,6 +92,7 @@ class StructuredRecorder:
         self._bytes_written = 0
         self._dropped_chunks = 0
         self._dropped_events = 0
+        self._latest_rf_metrics: RfMetrics | None = None
         self._dropped_chunk_range: dict[str, int] | None = None
         self._dropped_chunk_ranges: list[dict[str, int]] = []
         self._dropped_chunk_ranges_overflow: dict[str, int] | None = None
@@ -143,23 +146,54 @@ class StructuredRecorder:
                     self._dropped_chunks += 1
                     chunk = item[1]
                     last_sample = chunk.first_sample_index + int(chunk.samples.size)
+                    chunk_metadata = item[2]
+                    target = chunk_metadata.get("target")
+                    target_context = (
+                        target,
+                        chunk.target_version,
+                        chunk.context_version,
+                    )
                     if self._dropped_chunk_range is None:
                         self._dropped_chunk_range = {
                             "first_chunk_id": chunk.chunk_id,
                             "last_chunk_id": chunk.chunk_id,
                             "first_sample_index": chunk.first_sample_index,
                             "last_sample_index_exclusive": last_sample,
+                            "first_target": target,
+                            "first_target_version": chunk.target_version,
+                            "first_context_version": chunk.context_version,
+                            "last_target": target,
+                            "last_target_version": chunk.target_version,
+                            "last_context_version": chunk.context_version,
+                            "mixed_context": False,
                         }
                     else:
                         self._dropped_chunk_range["last_chunk_id"] = chunk.chunk_id
                         self._dropped_chunk_range[
                             "last_sample_index_exclusive"
                         ] = last_sample
+                        self._dropped_chunk_range["last_target"] = target
+                        self._dropped_chunk_range[
+                            "last_target_version"
+                        ] = chunk.target_version
+                        self._dropped_chunk_range[
+                            "last_context_version"
+                        ] = chunk.context_version
+                        first_context = (
+                            self._dropped_chunk_range["first_target"],
+                            self._dropped_chunk_range["first_target_version"],
+                            self._dropped_chunk_range["first_context_version"],
+                        )
+                        if target_context != first_context:
+                            self._dropped_chunk_range["mixed_context"] = True
                     dropped_range = {
                         "first_chunk_id": chunk.chunk_id,
                         "last_chunk_id": chunk.chunk_id,
                         "first_sample_index": chunk.first_sample_index,
                         "last_sample_index_exclusive": last_sample,
+                        "target": target,
+                        "target_version": chunk.target_version,
+                        "context_version": chunk.context_version,
                     }
                     previous_range = (
                         self._dropped_chunk_ranges_overflow
@@ -175,6 +209,7 @@ class StructuredRecorder:
                         and chunk.chunk_id == previous_range["last_chunk_id"] + 1
                         and chunk.first_sample_index
                         == previous_range["last_sample_index_exclusive"]
+                        and target_context == _range_last_context(previous_range)
                     ):
                         previous_range["last_chunk_id"] = chunk.chunk_id
                         previous_range["last_sample_index_exclusive"] = last_sample
@@ -182,7 +217,17 @@ class StructuredRecorder:
                         self._dropped_chunk_ranges.append(dropped_range)
                     elif self._dropped_chunk_ranges_overflow is None:
                         self._dropped_chunk_ranges_overflow = {
-                            **dropped_range,
+                            "first_chunk_id": chunk.chunk_id,
+                            "last_chunk_id": chunk.chunk_id,
+                            "first_sample_index": chunk.first_sample_index,
+                            "last_sample_index_exclusive": last_sample,
+                            "first_target": target,
+                            "first_target_version": chunk.target_version,
+                            "first_context_version": chunk.context_version,
+                            "last_target": target,
+                            "last_target_version": chunk.target_version,
+                            "last_context_version": chunk.context_version,
+                            "mixed_context": False,
                             "range_count": 1,
                         }
                     else:
@@ -192,6 +237,26 @@ class StructuredRecorder:
                         self._dropped_chunk_ranges_overflow[
                             "last_sample_index_exclusive"
                         ] = last_sample
+                        self._dropped_chunk_ranges_overflow["last_target"] = target
+                        self._dropped_chunk_ranges_overflow[
+                            "last_target_version"
+                        ] = chunk.target_version
+                        self._dropped_chunk_ranges_overflow[
+                            "last_context_version"
+                        ] = chunk.context_version
+                        first_context = (
+                            self._dropped_chunk_ranges_overflow["first_target"],
+                            self._dropped_chunk_ranges_overflow[
+                                "first_target_version"
+                            ],
+                            self._dropped_chunk_ranges_overflow[
+                                "first_context_version"
+                            ],
+                        )
+                        if target_context != first_context:
+                            self._dropped_chunk_ranges_overflow[
+                                "mixed_context"
+                            ] = True
                         self._dropped_chunk_ranges_overflow["range_count"] += 1
                 else:
                     self._dropped_events += 1
@@ -217,6 +282,7 @@ class StructuredRecorder:
                 bytes_written=self._bytes_written,
                 dropped_chunks=self._dropped_chunks,
                 dropped_events=self._dropped_events,
+                latest_rf_metrics=self._latest_rf_metrics,
                 closed=self._closed,
                 worker_error=None if self._worker_error is None else str(self._worker_error),
             )
@@ -271,6 +337,13 @@ class StructuredRecorder:
                     if item_kind == "chunk":
                         chunk = value
                         chunk_metadata = extra[0]
+                        rf_metrics = chunk.rf_metrics
+                        if rf_metrics is None:
+                            code_scale = chunk_metadata.get("adc_code_scale", 2048.0)
+                            rf_metrics = rf_safety.measure_rf(
+                                chunk.samples,
+                                code_scale=code_scale,
+                            )
                         raw = chunk.samples.astype("<c8", copy=False).tobytes(order="C")
                         iq_handle.write(raw)
                         metadata = {
@@ -286,7 +359,7 @@ class StructuredRecorder:
                             "context_version": chunk.context_version,
                             "target": chunk_metadata.get("target"),
                             "metadata": chunk_metadata,
-                            "rf_metrics": None if chunk.rf_metrics is None else asdict(chunk.rf_metrics),
+                            "rf_metrics": asdict(rf_metrics),
                             "sample_count": int(chunk.samples.size),
                             "byte_offset": byte_offset,
                             "byte_length": len(raw),
@@ -297,6 +370,7 @@ class StructuredRecorder:
                             self._chunks_written += 1
                             self._samples_written += int(chunk.samples.size)
                             self._bytes_written += len(raw)
+                            self._latest_rf_metrics = rf_metrics
                     else:
                         events_handle.write(_json_line(value))
                         with self._lock:
@@ -396,6 +470,11 @@ class StructuredRecorder:
                 ],
                 "dropped_chunk_ranges_overflow": self._dropped_chunk_ranges_overflow,
                 "dropped_event_kinds": dict(self._dropped_event_kinds),
+                "latest_rf_metrics": (
+                    None
+                    if self._latest_rf_metrics is None
+                    else asdict(self._latest_rf_metrics)
+                ),
                 "started_wall_time": self._started_wall_time,
                 "closed_wall_time": time.time(),
                 "stopped_reason": stopped_reason,
@@ -421,6 +500,20 @@ def _json_line(value: object) -> str:
         separators=(",", ":"),
         allow_nan=False,
     ) + "\n"
+
+
+def _range_last_context(dropped_range: Mapping[str, object]) -> tuple[object, int, int]:
+    if "last_target" in dropped_range:
+        return (
+            dropped_range["last_target"],
+            int(dropped_range["last_target_version"]),
+            int(dropped_range["last_context_version"]),
+        )
+    return (
+        dropped_range.get("target"),
+        int(dropped_range["target_version"]),
+        int(dropped_range["context_version"]),
+    )
 
 
 def _json_snapshot(value: object) -> object:

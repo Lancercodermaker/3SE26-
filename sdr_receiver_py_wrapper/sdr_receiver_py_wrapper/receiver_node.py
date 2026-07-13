@@ -182,6 +182,9 @@ class IqRecorder:
     def status(self) -> dict:
         with self.lock:
             stats = None if self._recorder is None else self._recorder.stats
+            latest_rf_metrics = (
+                None if stats is None else getattr(stats, "latest_rf_metrics", None)
+            )
             return {
                 "enabled": True,
                 "path": None if self.path is None else str(self.path),
@@ -196,8 +199,16 @@ class IqRecorder:
                 "finalizer_error": None
                 if self._finalizer_error is None
                 else str(self._finalizer_error),
-                "last_peak": self.last_peak,
-                "last_rms": self.last_rms,
+                "last_peak": (
+                    self.last_peak
+                    if latest_rf_metrics is None
+                    else latest_rf_metrics.peak
+                ),
+                "last_rms": (
+                    self.last_rms
+                    if latest_rf_metrics is None
+                    else latest_rf_metrics.rms
+                ),
                 "stopped_reason": self.stopped_reason,
             }
 
@@ -536,7 +547,6 @@ class SdrReceiverPyWrapperNode(Node):
             "team": rx_team,
             "core_team": status.get("team"),
             "target": status.get("target"),
-            "target_version": 0,
             "context_version": int(
                 getattr(self.context_arbiter, "context_version", 0)
             ),
