@@ -14,6 +14,97 @@ from sdr_receiver_py_wrapper.models import IqChunk, RfMetrics
 from sdr_receiver_py_wrapper.structured_recorder import RecorderError, StructuredRecorder
 
 
+def load_iq_recorder_class(structured_recorder_class):
+    receiver_path = (
+        Path(__file__).parents[1]
+        / "sdr_receiver_py_wrapper"
+        / "receiver_node.py"
+    )
+    tree = ast.parse(receiver_path.read_text(encoding="utf-8"))
+    recorder_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "IqRecorder"
+    )
+    namespace = {
+        "IqChunk": IqChunk,
+        "Optional": Optional,
+        "Path": Path,
+        "RfMetrics": RfMetrics,
+        "StructuredRecorder": structured_recorder_class,
+        "np": np,
+        "os": os,
+        "threading": threading,
+        "time": __import__("time"),
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[recorder_class], type_ignores=[])),
+            str(receiver_path),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["IqRecorder"]
+
+
+class CapturingStructuredRecorder:
+    instances = []
+
+    def __init__(self, record_dir, prefix, **kwargs):
+        self.record_dir = Path(record_dir)
+        self.prefix = prefix
+        self.kwargs = kwargs
+        self.iq_path = self.record_dir / f"{prefix}.c64"
+        self.summary_path = self.record_dir / f"{prefix}.summary.json"
+        self.chunks = []
+        self.chunk_metadata = []
+        self.events = []
+        self.close_reason = None
+        self.stats = SimpleNamespace(
+            chunks_written=0,
+            samples_written=0,
+            bytes_written=0,
+            dropped_chunks=0,
+            dropped_events=0,
+            worker_error=None,
+            closed=False,
+        )
+        self.instances.append(self)
+
+    def write_chunk(self, chunk, metadata=None):
+        self.chunks.append(chunk)
+        self.chunk_metadata.append(metadata)
+        self.stats.chunks_written += 1
+        self.stats.samples_written += chunk.samples.size
+        self.stats.bytes_written += chunk.samples.nbytes
+        return True
+
+    def write_event(self, kind, payload):
+        self.events.append((kind, payload))
+        return True
+
+    def close(self, *, stopped_reason="closed"):
+        provider = self.kwargs.get("summary_metadata_provider")
+        if provider is not None:
+            provider()
+        self.close_reason = stopped_reason
+        self.stats.closed = True
+
+
+def make_iq_adapter(tmp_path, recorder_class=CapturingStructuredRecorder, **overrides):
+    options = {
+        "record_dir": str(tmp_path),
+        "prefix": "test",
+        "max_sec": 0.0,
+        "max_bytes": 0,
+        "every_n": 1,
+        "metadata_provider": lambda: {"target": "HERO"},
+    }
+    options.update(overrides)
+    return load_iq_recorder_class(recorder_class)(**options)
+
+
 def make_chunk(*, chunk_id=0, first_sample_index=0, sample_count=16):
     samples = np.arange(sample_count, dtype=np.float32).astype(np.complex64)
     samples.setflags(write=False)
@@ -36,6 +127,273 @@ def make_chunk(*, chunk_id=0, first_sample_index=0, sample_count=16):
             sample_count=sample_count,
         ),
     )
+
+
+def test_iq_adapter_hot_path_uses_light_metadata_and_no_rf_reductions(
+    tmp_path,
+    monkeypatch,
+):
+    CapturingStructuredRecorder.instances.clear()
+    calls = {"summary": 0, "chunk": 0}
+
+    def summary_metadata():
+        calls["summary"] += 1
+        return {"profile": {"large": "payload"}}
+
+    def chunk_metadata():
+        calls["chunk"] += 1
+        return {
+            "sample_rate_hz": 2_000_000,
+            "target": "HERO",
+            "context_version": 4,
+        }
+
+    recorder = make_iq_adapter(
+        tmp_path,
+        prefix="hot",
+        metadata_provider=summary_metadata,
+        chunk_metadata_provider=chunk_metadata,
+    )
+
+    for name in ("abs", "max", "mean", "count_nonzero"):
+        monkeypatch.setattr(
+            np,
+            name,
+            lambda *args, _name=name, **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"unexpected producer reduction: {_name}")
+            ),
+        )
+    recorder.write(np.ones(32, dtype=np.complex64))
+
+    delegate = CapturingStructuredRecorder.instances[-1]
+    assert calls == {"summary": 0, "chunk": 1}
+    assert delegate.chunks[0].rf_metrics is None
+    assert delegate.chunk_metadata[0]["target"] == "HERO"
+    recorder.close()
+    assert calls == {"summary": 1, "chunk": 1}
+
+
+def test_iq_adapter_every_n_preserves_real_sample_gaps_without_copying_skips(
+    tmp_path,
+):
+    CapturingStructuredRecorder.instances.clear()
+    recorder = make_iq_adapter(
+        tmp_path,
+        prefix="stride",
+        every_n=2,
+    )
+    arrays = [np.full(4, value, dtype=np.complex64) for value in (1, 2, 3)]
+
+    for raw in arrays:
+        recorder.write(raw)
+
+    chunks = CapturingStructuredRecorder.instances[-1].chunks
+    assert [chunk.chunk_id for chunk in chunks] == [0, 2]
+    assert [chunk.first_sample_index for chunk in chunks] == [0, 8]
+    np.testing.assert_array_equal(chunks[1].samples, arrays[2])
+
+
+def test_iq_adapter_limit_finalizes_asynchronously_and_surfaces_errors(tmp_path):
+    class FailingFinalizer(CapturingStructuredRecorder):
+        finalized = threading.Event()
+
+        def close(self, *, stopped_reason="closed"):
+            self.finalized.set()
+            raise OSError("final fsync failed")
+
+    FailingFinalizer.instances.clear()
+    FailingFinalizer.finalized.clear()
+    recorder = make_iq_adapter(
+        tmp_path,
+        FailingFinalizer,
+        prefix="limit",
+        max_bytes=32,
+    )
+    recorder.write(np.ones(4, dtype=np.complex64))
+
+    recorder.write(np.ones(4, dtype=np.complex64))
+
+    assert FailingFinalizer.finalized.wait(timeout=3.0)
+    with pytest.raises(OSError, match="final fsync failed"):
+        recorder.close()
+    assert "final fsync failed" in recorder.status()["finalizer_error"]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["", "../escape", "a/b", "a\\b", ".", "..", "bad:name"],
+)
+def test_structured_recorder_rejects_unsafe_prefixes_before_starting_worker(
+    tmp_path,
+    monkeypatch,
+    prefix,
+):
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    with pytest.raises(ValueError, match="safe filename component"):
+        StructuredRecorder(tmp_path, prefix)
+
+
+def test_structured_recorder_never_overwrites_existing_capture(tmp_path):
+    first = StructuredRecorder(tmp_path, "collision")
+    first.write_chunk(make_chunk(chunk_id=1))
+    first.close()
+    original_iq = (tmp_path / "collision.c64").read_bytes()
+
+    second = StructuredRecorder(tmp_path, "collision")
+    with pytest.raises(RecorderError, match="worker failed"):
+        second.close()
+
+    assert (tmp_path / "collision.c64").read_bytes() == original_iq
+
+
+def test_partial_exclusive_open_cleans_only_new_empty_files(tmp_path):
+    existing = tmp_path / "partial.chunks.jsonl"
+    existing.write_text("preserve evidence\n", encoding="utf-8")
+    recorder = StructuredRecorder(tmp_path, "partial")
+
+    with pytest.raises(RecorderError, match="worker failed"):
+        recorder.close()
+
+    assert existing.read_text(encoding="utf-8") == "preserve evidence\n"
+    assert not (tmp_path / "partial.c64").exists()
+
+
+def test_iq_adapter_uses_collision_resistant_prefixes(tmp_path, monkeypatch):
+    CapturingStructuredRecorder.instances.clear()
+    monkeypatch.setattr(__import__("time"), "time", lambda: 1_700_000_000.0)
+    recorders = [
+        make_iq_adapter(
+            tmp_path,
+            prefix="same",
+        )
+        for _ in range(2)
+    ]
+
+    for recorder in recorders:
+        recorder.write(np.ones(1, dtype=np.complex64))
+
+    assert len({item.prefix for item in CapturingStructuredRecorder.instances}) == 2
+
+
+def test_destroy_node_propagates_recorder_error_after_destroying_base():
+    receiver_path = (
+        Path(__file__).parents[1] / "sdr_receiver_py_wrapper" / "receiver_node.py"
+    )
+    tree = ast.parse(receiver_path.read_text(encoding="utf-8"))
+    original_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SdrReceiverPyWrapperNode"
+    )
+    destroy_method = next(
+        node
+        for node in original_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "destroy_node"
+    )
+
+    class FakeNode:
+        destroyed = False
+
+        def destroy_node(self):
+            FakeNode.destroyed = True
+            return True
+
+    test_class = ast.ClassDef(
+        name="TestNode",
+        bases=[ast.Name(id="FakeNode", ctx=ast.Load())],
+        keywords=[],
+        body=[destroy_method],
+        decorator_list=[],
+    )
+    namespace = {"FakeNode": FakeNode}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[test_class], type_ignores=[])),
+            str(receiver_path),
+            "exec",
+        ),
+        namespace,
+    )
+    instance = namespace["TestNode"]()
+    instance.adapter = SimpleNamespace(stop=lambda: None, restore_patches=lambda: None)
+    instance.iq_recorder = SimpleNamespace(
+        close=lambda: (_ for _ in ()).throw(RecorderError("fsync failed"))
+    )
+
+    with pytest.raises(RecorderError, match="fsync failed"):
+        instance.destroy_node()
+    assert FakeNode.destroyed
+
+
+def test_target_generation_and_sidecar_target_follow_actual_changes(tmp_path):
+    CapturingStructuredRecorder.instances.clear()
+    targets = iter(["HERO", "HERO", "INFANTRY"])
+    recorder = make_iq_adapter(
+        tmp_path,
+        prefix="targets",
+        chunk_metadata_provider=lambda: {"target": next(targets)},
+    )
+    for _ in range(3):
+        recorder.write(np.ones(2, dtype=np.complex64))
+
+    delegate = CapturingStructuredRecorder.instances[-1]
+    assert [chunk.target_version for chunk in delegate.chunks] == [1, 1, 2]
+    assert [metadata["target"] for metadata in delegate.chunk_metadata] == [
+        "HERO",
+        "HERO",
+        "INFANTRY",
+    ]
+
+
+def test_nonfinite_values_are_encoded_as_strict_auditable_json(tmp_path):
+    chunk = make_chunk(sample_count=2)
+    object.__setattr__(
+        chunk,
+        "rf_metrics",
+        RfMetrics(
+            rms=float("nan"),
+            peak=float("inf"),
+            clipping_ratio=float("-inf"),
+            sample_count=2,
+        ),
+    )
+    provider_threads = []
+
+    def summary_provider():
+        provider_threads.append(threading.current_thread())
+        return {"calibration": np.float64(float("nan"))}
+
+    recorder = StructuredRecorder(
+        tmp_path,
+        "finite",
+        summary_metadata_provider=summary_provider,
+    )
+    recorder.write_chunk(chunk, metadata={"noise": float("inf")})
+    recorder.write_event("metrics", {"value": float("-inf")})
+    recorder.close()
+
+    def reject_constant(value):
+        raise AssertionError(f"non-standard JSON constant: {value}")
+
+    chunk_json = json.loads(
+        (tmp_path / "finite.chunks.jsonl").read_text(),
+        parse_constant=reject_constant,
+    )
+    event_json = json.loads(
+        (tmp_path / "finite.events.jsonl").read_text(),
+        parse_constant=reject_constant,
+    )
+    summary_json = json.loads(
+        (tmp_path / "finite.summary.json").read_text(),
+        parse_constant=reject_constant,
+    )
+    assert chunk_json["rf_metrics"]["rms"] == "NaN"
+    assert chunk_json["rf_metrics"]["peak"] == "Infinity"
+    assert chunk_json["metadata"]["noise"] == "Infinity"
+    assert event_json["payload"]["value"] == "-Infinity"
+    assert summary_json["calibration"] == "NaN"
+    assert len(provider_threads) == 1
+    assert provider_threads[0] is not threading.main_thread()
 
 
 def test_recorder_writes_iq_chunk_and_event_sidecars(tmp_path):
@@ -74,6 +432,7 @@ def test_chunk_sidecar_contains_replay_metadata_and_offsets(tmp_path):
         "context_version": 4,
         "first_sample_index": 20,
         "lo_hz": 434_920_000,
+        "metadata": {},
         "rf_bandwidth_hz": 940_000,
         "rf_metrics": {
             "clipping_ratio": 0.0,
@@ -87,6 +446,7 @@ def test_chunk_sidecar_contains_replay_metadata_and_offsets(tmp_path):
         "sample_count": 3,
         "sample_rate_hz": 2_000_000,
         "target_version": 3,
+        "target": None,
     }
     assert lines[1]["byte_offset"] == 24
     assert lines[1]["byte_length"] == 16
@@ -130,7 +490,13 @@ def test_queue_overflow_is_nonblocking_counted_and_auditable(tmp_path, monkeypat
     assert worker_entered_open.wait(timeout=3.0)
 
     assert recorder.write_chunk(make_chunk())
-    assert not recorder.write_event("dropped-event", {"value": 1})
+    assert not recorder.write_chunk(make_chunk(chunk_id=7, first_sample_index=112))
+    assert not recorder.write_chunk(make_chunk(chunk_id=9, first_sample_index=144))
+    assert not recorder.write_event("context_rejected", {})
+    assert not recorder.write_event("context_rejected", {})
+    assert not recorder.write_event("decode_error", {})
+    for index in range(20):
+        assert not recorder.write_event(f"other-{index}", {})
     release_worker.set()
     recorder.close()
 
@@ -139,15 +505,38 @@ def test_queue_overflow_is_nonblocking_counted_and_auditable(tmp_path, monkeypat
         for line in (tmp_path / "overflow.events.jsonl").read_text().splitlines()
     ]
     overflow = next(event for event in events if event["kind"] == "recorder_queue_overflow")
-    assert overflow["payload"] == {
-        "dropped_chunks": 0,
-        "dropped_events": 1,
-        "total_drops": 1,
+    payload = overflow["payload"]
+    assert payload["dropped_chunks"] == 2
+    assert payload["dropped_events"] == 23
+    assert payload["total_drops"] == 25
+    assert payload["dropped_chunk_range"] == {
+        "first_chunk_id": 7,
+        "last_chunk_id": 9,
+        "first_sample_index": 112,
+        "last_sample_index_exclusive": 160,
     }
+    assert payload["dropped_chunk_ranges"] == [
+        {
+            "first_chunk_id": 7,
+            "last_chunk_id": 7,
+            "first_sample_index": 112,
+            "last_sample_index_exclusive": 128,
+        },
+        {
+            "first_chunk_id": 9,
+            "last_chunk_id": 9,
+            "first_sample_index": 144,
+            "last_sample_index_exclusive": 160,
+        },
+    ]
+    assert payload["dropped_event_kinds"]["context_rejected"] == 2
+    assert payload["dropped_event_kinds"]["decode_error"] == 1
+    assert payload["dropped_event_kinds"]["__other__"] == 6
+    assert len(payload["dropped_event_kinds"]) == 17
     summary = json.loads((tmp_path / "overflow.summary.json").read_text())
-    assert summary["dropped_chunks"] == 0
-    assert summary["dropped_events"] == 1
-    assert summary["queue_overflows"] == 1
+    assert summary["dropped_chunks"] == 2
+    assert summary["dropped_events"] == 23
+    assert summary["queue_overflows"] == 25
 
 
 def test_close_drains_is_idempotent_and_rejects_later_writes(tmp_path):
@@ -300,80 +689,10 @@ def test_receiver_iq_recorder_delegates_without_synchronous_disk_calls():
 
 
 def test_receiver_iq_recorder_preserves_compatibility_and_snapshots_raw_iq(tmp_path):
-    receiver_path = (
-        Path(__file__).parents[1]
-        / "sdr_receiver_py_wrapper"
-        / "receiver_node.py"
-    )
-    tree = ast.parse(receiver_path.read_text(encoding="utf-8"))
-    recorder_class = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "IqRecorder"
-    )
-
-    class FakeStructuredRecorder:
-        instances = []
-
-        def __init__(self, record_dir, prefix, *, summary_metadata):
-            self.record_dir = Path(record_dir)
-            self.prefix = prefix
-            self.summary_metadata = summary_metadata
-            self.iq_path = self.record_dir / f"{prefix}.c64"
-            self.summary_path = self.record_dir / f"{prefix}.summary.json"
-            self.chunks = []
-            self.events = []
-            self.close_reason = None
-            self.stats = SimpleNamespace(
-                chunks_written=0,
-                samples_written=0,
-                bytes_written=0,
-                dropped_chunks=0,
-                dropped_events=0,
-                worker_error=None,
-            )
-            self.instances.append(self)
-
-        def write_chunk(self, chunk):
-            self.chunks.append(chunk)
-            self.stats.chunks_written += 1
-            self.stats.samples_written += chunk.samples.size
-            self.stats.bytes_written += chunk.samples.nbytes
-            return True
-
-        def write_event(self, kind, payload):
-            self.events.append((kind, payload))
-            return True
-
-        def close(self, *, stopped_reason="closed"):
-            self.close_reason = stopped_reason
-
-    namespace = {
-        "IqChunk": IqChunk,
-        "Optional": Optional,
-        "Path": Path,
-        "RfMetrics": RfMetrics,
-        "StructuredRecorder": FakeStructuredRecorder,
-        "np": np,
-        "os": os,
-        "threading": threading,
-        "time": __import__("time"),
-    }
-    exec(
-        compile(
-            ast.fix_missing_locations(ast.Module(body=[recorder_class], type_ignores=[])),
-            str(receiver_path),
-            "exec",
-        ),
-        namespace,
-    )
-    compatibility_class = namespace["IqRecorder"]
-    recorder = compatibility_class(
-        record_dir=str(tmp_path),
+    CapturingStructuredRecorder.instances.clear()
+    recorder = make_iq_adapter(
+        tmp_path,
         prefix="base",
-        max_sec=0.0,
-        max_bytes=0,
-        every_n=1,
         metadata_provider=lambda: {
             "sample_rate_hz": 2_000_000,
             "rx_lo_hz": 434_920_000,
@@ -392,7 +711,7 @@ def test_receiver_iq_recorder_preserves_compatibility_and_snapshots_raw_iq(tmp_p
     reused_device_buffer[:] = 99 + 100j
     recorder.close()
 
-    delegate = FakeStructuredRecorder.instances[0]
+    delegate = CapturingStructuredRecorder.instances[0]
     chunk = delegate.chunks[0]
     np.testing.assert_array_equal(chunk.samples, expected)
     assert chunk.samples.flags.owndata
@@ -404,40 +723,27 @@ def test_receiver_iq_recorder_preserves_compatibility_and_snapshots_raw_iq(tmp_p
     assert chunk.lo_hz == 434_920_000
     assert chunk.rf_bandwidth_hz == 940_000
     assert chunk.rx_gain_db == 20
-    assert chunk.target_version == 7
+    assert chunk.target_version == 1
     assert chunk.context_version == 8
-    assert delegate.summary_metadata["target"] == "HERO"
     assert delegate.prefix.startswith("dynamic_")
     assert delegate.close_reason == "closed"
     assert recorder.status()["chunks_written"] == 1
 
 
-def test_receiver_metadata_provider_exposes_explicit_chunk_versions():
-    receiver_path = (
-        Path(__file__).parents[1]
-        / "sdr_receiver_py_wrapper"
-        / "receiver_node.py"
-    )
-    tree = ast.parse(receiver_path.read_text(encoding="utf-8"))
-    node_class = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "SdrReceiverPyWrapperNode"
-    )
-    provider = next(
-        node
-        for node in node_class.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_iq_record_metadata"
-    )
-    returned_mapping = next(
-        node.value
-        for node in ast.walk(provider)
-        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
-    )
-    keys = {
-        key.value
-        for key in returned_mapping.keys
-        if isinstance(key, ast.Constant) and isinstance(key.value, str)
-    }
+def test_iq_adapter_repeated_close_preserves_first_finalize_error(tmp_path):
+    class FailingClose(CapturingStructuredRecorder):
+        def close(self, *, stopped_reason="closed"):
+            raise OSError("fsync failed")
 
-    assert {"target_version", "context_version"} <= keys
+    FailingClose.instances.clear()
+    recorder = make_iq_adapter(
+        tmp_path,
+        FailingClose,
+        prefix="close-error",
+    )
+    recorder.write(np.ones(1, dtype=np.complex64))
+
+    with pytest.raises(OSError, match="fsync failed"):
+        recorder.close()
+    with pytest.raises(OSError, match="fsync failed"):
+        recorder.close()

@@ -29,7 +29,7 @@ from .context_arbiter import (
 from .original_receiver_adapter import ReceiverCoreAdapter
 from .patches import JamKeyEvent, PatchCallbacks, RawFrameEvent, TargetChangeEvent
 from .profile_import import AdaptiveProfileLoadError, load_adaptive_profile
-from .models import IqChunk, RfMetrics
+from .models import IqChunk
 from .structured_recorder import StructuredRecorder
 
 
@@ -49,6 +49,7 @@ class IqRecorder:
         every_n: int,
         metadata_provider,
         prefix_provider=None,
+        chunk_metadata_provider=None,
     ) -> None:
         self.record_dir = Path(os.path.expandvars(str(record_dir))).expanduser()
         self.prefix = self._sanitize_prefix(prefix or "sdr_iq")
@@ -57,7 +58,9 @@ class IqRecorder:
         self.max_bytes = int(max_bytes)
         self.every_n = max(1, int(every_n))
         self.metadata_provider = metadata_provider
+        self.chunk_metadata_provider = chunk_metadata_provider or metadata_provider
         self.lock = threading.RLock()
+        self._close_lock = threading.Lock()
         self.path: Optional[Path] = None
         self.meta_path: Optional[Path] = None
         self._recorder: Optional[StructuredRecorder] = None
@@ -67,50 +70,66 @@ class IqRecorder:
         self._next_chunk_id = 0
         self._next_sample_index = 0
         self._accepted_bytes = 0
+        self._last_target: Optional[str] = None
+        self._target_version = 0
+        self._cached_sample_rate_hz: Optional[int] = None
+        self._finalizer_thread: Optional[threading.Thread] = None
+        self._finalizer_error: Optional[BaseException] = None
+        self._closed = False
         self.last_peak = 0.0
         self.last_rms = 0.0
         self.stopped_reason = ""
 
     def write(self, raw_iq: np.ndarray) -> None:
         with self.lock:
+            if self._closed:
+                raise RuntimeError("IQ recorder is closed")
             if self.stopped_reason:
                 return
             self.chunks_seen += 1
+            raw_view = np.asarray(raw_iq)
+            sample_count = int(raw_view.size)
+            chunk_id = self._next_chunk_id
+            first_sample_index = self._next_sample_index
+            self._next_chunk_id += 1
+            self._next_sample_index += sample_count
             if (self.chunks_seen - 1) % self.every_n != 0:
                 return
-
-            arr = np.asarray(raw_iq, dtype=np.complex64).reshape(-1).copy(order="C")
-            if arr.size == 0:
+            if sample_count == 0:
                 return
-            arr.setflags(write=False)
             now = time.time()
+            monotonic_ns = time.monotonic_ns()
+            if self._recorder is None:
+                self._create_recorder(now)
             if self.start_wall and self.max_sec > 0.0 and now - self.start_wall >= self.max_sec:
                 self._stop_accepting(f"max_sec {self.max_sec:.1f} reached")
                 return
-            next_bytes = int(arr.nbytes)
+            next_bytes = sample_count * np.dtype(np.complex64).itemsize
             if self.max_bytes > 0 and self._accepted_bytes + next_bytes > self.max_bytes:
                 self._stop_accepting(f"max_bytes {self.max_bytes} reached")
                 return
 
-            abs_arr = np.abs(arr)
-            self.last_peak = float(np.max(abs_arr))
-            self.last_rms = float(np.sqrt(np.mean(abs_arr ** 2)))
-            metadata = self._metadata_snapshot()
-            if self._recorder is None:
-                self._create_recorder(now, metadata)
-            chunk_id = self._next_chunk_id
-            first_sample_index = self._next_sample_index
-            self._next_chunk_id += 1
-            self._next_sample_index += int(arr.size)
+            arr = np.asarray(raw_iq, dtype=np.complex64).reshape(-1).copy(order="C")
+            arr.setflags(write=False)
+            metadata = self._chunk_metadata_snapshot()
+            sample_rate_hz = self._metadata_int(
+                metadata, "sample_rate_hz", "sample_rate", default=0
+            )
+            if sample_rate_hz:
+                self._cached_sample_rate_hz = sample_rate_hz
+            elif self._cached_sample_rate_hz is not None:
+                sample_rate_hz = self._cached_sample_rate_hz
+            target = str(metadata.get("target") or "UNKNOWN")
+            if target != self._last_target:
+                self._target_version += 1
+                self._last_target = target
             chunk = IqChunk(
                 chunk_id=chunk_id,
                 first_sample_index=first_sample_index,
                 samples=arr,
-                sample_rate_hz=self._metadata_int(
-                    metadata, "sample_rate_hz", "sample_rate", default=0
-                ),
+                sample_rate_hz=sample_rate_hz,
                 rx_wall_time=now,
-                rx_monotonic_ns=time.monotonic_ns(),
+                rx_monotonic_ns=monotonic_ns,
                 lo_hz=self._metadata_int(
                     metadata, "lo_hz", "rx_lo_hz", default=0
                 ),
@@ -120,30 +139,44 @@ class IqRecorder:
                 rx_gain_db=self._metadata_int(
                     metadata, "rx_gain_db", "rx_gain", default=0
                 ),
-                target_version=self._metadata_int(
-                    metadata, "target_version", default=0
-                ),
+                target_version=self._target_version,
                 context_version=self._metadata_int(
                     metadata, "context_version", default=0
                 ),
-                rf_metrics=RfMetrics(
-                    rms=self.last_rms,
-                    peak=self.last_peak,
-                    clipping_ratio=float(np.count_nonzero(abs_arr >= 1.0) / arr.size),
-                    sample_count=int(arr.size),
-                ),
+                rf_metrics=None,
             )
-            accepted = self._recorder.write_chunk(chunk)
+            accepted = self._recorder.write_chunk(
+                chunk,
+                metadata={**metadata, "target": target},
+            )
             if accepted:
                 self._accepted_bytes += next_bytes
             self.last_wall = now
 
     def close(self) -> None:
-        with self.lock:
-            recorder = self._recorder
-            stopped_reason = self.stopped_reason or "closed"
-        if recorder is not None:
-            recorder.close(stopped_reason=stopped_reason)
+        with self._close_lock:
+            with self.lock:
+                if self._closed:
+                    error = self._finalizer_error
+                    if error is not None:
+                        raise error
+                    return
+                self._closed = True
+                recorder = self._recorder
+                finalizer = self._finalizer_thread
+                stopped_reason = self.stopped_reason or "closed"
+            if finalizer is not None:
+                finalizer.join()
+            elif recorder is not None:
+                try:
+                    recorder.close(stopped_reason=stopped_reason)
+                except BaseException as exc:
+                    with self.lock:
+                        self._finalizer_error = exc
+                    raise
+            with self.lock:
+                if self._finalizer_error is not None:
+                    raise self._finalizer_error
 
     def status(self) -> dict:
         with self.lock:
@@ -159,12 +192,15 @@ class IqRecorder:
                 "dropped_chunks": 0 if stats is None else stats.dropped_chunks,
                 "dropped_events": 0 if stats is None else stats.dropped_events,
                 "worker_error": None if stats is None else stats.worker_error,
+                "finalizer_error": None
+                if self._finalizer_error is None
+                else str(self._finalizer_error),
                 "last_peak": self.last_peak,
                 "last_rms": self.last_rms,
                 "stopped_reason": self.stopped_reason,
             }
 
-    def _create_recorder(self, now: float, metadata: dict) -> None:
+    def _create_recorder(self, now: float) -> None:
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
         prefix = self.prefix
         if self.prefix_provider is not None:
@@ -172,16 +208,18 @@ class IqRecorder:
                 prefix = self._sanitize_prefix(self.prefix_provider() or self.prefix)
             except Exception:
                 prefix = self.prefix
-        recording_prefix = f"{prefix}_{stamp}"
+        recording_prefix = (
+            f"{prefix}_{stamp}_{time.time_ns()}_{os.getpid()}_{id(self):x}"
+        )
         self._recorder = StructuredRecorder(
             self.record_dir,
             recording_prefix,
             summary_metadata={
-                **metadata,
                 "every_n": self.every_n,
                 "max_sec": self.max_sec,
                 "max_bytes": self.max_bytes,
             },
+            summary_metadata_provider=self.metadata_provider,
         )
         self.path = self._recorder.iq_path
         self.meta_path = self._recorder.summary_path
@@ -192,9 +230,9 @@ class IqRecorder:
     def _sanitize_prefix(prefix: str) -> str:
         return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(prefix or "sdr_iq"))
 
-    def _metadata_snapshot(self) -> dict:
+    def _chunk_metadata_snapshot(self) -> dict:
         try:
-            return dict(self.metadata_provider() or {})
+            return dict(self.chunk_metadata_provider() or {})
         except Exception as exc:
             return {"metadata_error": str(exc)}
 
@@ -216,6 +254,20 @@ class IqRecorder:
         self.stopped_reason = reason
         if self._recorder is not None:
             self._recorder.write_event("recording_stopped", {"reason": reason})
+            self._finalizer_thread = threading.Thread(
+                target=self._finalize,
+                args=(self._recorder, reason),
+                name="iq-recorder-finalizer",
+                daemon=True,
+            )
+            self._finalizer_thread.start()
+
+    def _finalize(self, recorder: StructuredRecorder, reason: str) -> None:
+        try:
+            recorder.close(stopped_reason=reason)
+        except BaseException as exc:
+            with self.lock:
+                self._finalizer_error = exc
 
 
 def _radar_info_to_level(raw: int) -> int:
@@ -345,13 +397,15 @@ class SdrReceiverPyWrapperNode(Node):
             )
 
     def destroy_node(self) -> bool:
+        result = False
         try:
             self.adapter.stop()
             self.adapter.restore_patches()
             if self.iq_recorder is not None:
                 self.iq_recorder.close()
         finally:
-            return super().destroy_node()
+            result = super().destroy_node()
+        return result
 
     def _declare_parameters(self) -> None:
         self.declare_parameter("run_mode", "debug")
@@ -446,7 +500,26 @@ class SdrReceiverPyWrapperNode(Node):
             every_n=int(self.get_parameter("iq_record_every_n").value),
             metadata_provider=self._iq_record_metadata,
             prefix_provider=self._iq_record_prefix,
+            chunk_metadata_provider=self._iq_chunk_metadata,
         )
+
+    def _iq_chunk_metadata(self) -> dict:
+        sample_rate_hz = getattr(self, "_iq_record_sample_rate_hz", None)
+        if sample_rate_hz is None:
+            config = self.adapter.get_core_config_snapshot()
+            sample_rate_hz = int(config.get("sample_rate", 0) or 0)
+            self._iq_record_sample_rate_hz = sample_rate_hz
+        radio = self.adapter.get_current_radio_snapshot()
+        return {
+            "sample_rate_hz": sample_rate_hz,
+            "lo_hz": radio.get("rx_lo_hz", 0),
+            "rf_bandwidth_hz": radio.get("rf_bandwidth_hz", 0),
+            "rx_gain_db": radio.get("rx_gain", 0),
+            "target": radio.get("target") or "UNKNOWN",
+            "context_version": int(
+                getattr(self.context_arbiter, "context_version", 0)
+            ),
+        }
 
     def _iq_record_metadata(self) -> dict:
         status = self.adapter.get_stats_snapshot()

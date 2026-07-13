@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from enum import Enum
 import json
+import math
 import numbers
 import os
 from pathlib import Path
@@ -46,17 +47,38 @@ class StructuredRecorder:
         *,
         queue_size: int = 256,
         summary_metadata: Mapping[str, object] | None = None,
+        summary_metadata_provider=None,
     ) -> None:
         if isinstance(queue_size, bool) or not isinstance(queue_size, numbers.Integral) or queue_size <= 0:
             raise ValueError("queue_size must be a positive integer")
 
         self.record_dir = Path(record_dir)
-        self.prefix = str(prefix)
+        if (
+            not isinstance(prefix, str)
+            or not prefix
+            or prefix in (".", "..")
+            or "/" in prefix
+            or "\\" in prefix
+            or any(not (character.isalnum() or character in "-_.") for character in prefix)
+            or Path(prefix).name != prefix
+        ):
+            raise ValueError("prefix must be a non-empty safe filename component")
+        self.prefix = prefix
         self.iq_path = self.record_dir / f"{self.prefix}.c64"
         self.chunks_path = self.record_dir / f"{self.prefix}.chunks.jsonl"
         self.events_path = self.record_dir / f"{self.prefix}.events.jsonl"
         self.summary_path = self.record_dir / f"{self.prefix}.summary.json"
+        resolved_dir = self.record_dir.resolve(strict=False)
+        for output_path in (
+            self.iq_path,
+            self.chunks_path,
+            self.events_path,
+            self.summary_path,
+        ):
+            if output_path.resolve(strict=False).parent != resolved_dir:
+                raise ValueError("prefix must be a non-empty safe filename component")
         self._summary_metadata = _json_snapshot(summary_metadata or {})
+        self._summary_metadata_provider = summary_metadata_provider
         self._queue: Queue[object] = Queue(maxsize=int(queue_size))
         self._lock = threading.Lock()
         self._accepting = True
@@ -68,6 +90,10 @@ class StructuredRecorder:
         self._bytes_written = 0
         self._dropped_chunks = 0
         self._dropped_events = 0
+        self._dropped_chunk_range: dict[str, int] | None = None
+        self._dropped_chunk_ranges: list[dict[str, int]] = []
+        self._dropped_chunk_ranges_overflow: dict[str, int] | None = None
+        self._dropped_event_kinds: dict[str, int] = {}
         self._stopped_reason = "closed"
         self._started_wall_time = time.time()
         self._worker = threading.Thread(
@@ -77,10 +103,17 @@ class StructuredRecorder:
         )
         self._worker.start()
 
-    def write_chunk(self, chunk: IqChunk) -> bool:
+    def write_chunk(
+        self,
+        chunk: IqChunk,
+        metadata: Mapping[str, object] | None = None,
+    ) -> bool:
         if not isinstance(chunk, IqChunk):
             raise TypeError("chunk must be an IqChunk")
-        return self._enqueue(("chunk", chunk), dropped_kind="chunk")
+        return self._enqueue(
+            ("chunk", chunk, _json_snapshot(metadata or {})),
+            dropped_kind="chunk",
+        )
 
     def write_event(self, kind: str, payload: Mapping[str, object]) -> bool:
         if not isinstance(kind, str) or not kind:
@@ -108,8 +141,67 @@ class StructuredRecorder:
             except Full:
                 if dropped_kind == "chunk":
                     self._dropped_chunks += 1
+                    chunk = item[1]
+                    last_sample = chunk.first_sample_index + int(chunk.samples.size)
+                    if self._dropped_chunk_range is None:
+                        self._dropped_chunk_range = {
+                            "first_chunk_id": chunk.chunk_id,
+                            "last_chunk_id": chunk.chunk_id,
+                            "first_sample_index": chunk.first_sample_index,
+                            "last_sample_index_exclusive": last_sample,
+                        }
+                    else:
+                        self._dropped_chunk_range["last_chunk_id"] = chunk.chunk_id
+                        self._dropped_chunk_range[
+                            "last_sample_index_exclusive"
+                        ] = last_sample
+                    dropped_range = {
+                        "first_chunk_id": chunk.chunk_id,
+                        "last_chunk_id": chunk.chunk_id,
+                        "first_sample_index": chunk.first_sample_index,
+                        "last_sample_index_exclusive": last_sample,
+                    }
+                    if (
+                        self._dropped_chunk_ranges
+                        and chunk.chunk_id
+                        == self._dropped_chunk_ranges[-1]["last_chunk_id"] + 1
+                        and chunk.first_sample_index
+                        == self._dropped_chunk_ranges[-1][
+                            "last_sample_index_exclusive"
+                        ]
+                    ):
+                        self._dropped_chunk_ranges[-1][
+                            "last_chunk_id"
+                        ] = chunk.chunk_id
+                        self._dropped_chunk_ranges[-1][
+                            "last_sample_index_exclusive"
+                        ] = last_sample
+                    elif len(self._dropped_chunk_ranges) < 16:
+                        self._dropped_chunk_ranges.append(dropped_range)
+                    elif self._dropped_chunk_ranges_overflow is None:
+                        self._dropped_chunk_ranges_overflow = {
+                            **dropped_range,
+                            "range_count": 1,
+                        }
+                    else:
+                        self._dropped_chunk_ranges_overflow[
+                            "last_chunk_id"
+                        ] = chunk.chunk_id
+                        self._dropped_chunk_ranges_overflow[
+                            "last_sample_index_exclusive"
+                        ] = last_sample
+                        self._dropped_chunk_ranges_overflow["range_count"] += 1
                 else:
                     self._dropped_events += 1
+                    event_kind = str(item[1]["kind"])
+                    if event_kind in self._dropped_event_kinds:
+                        self._dropped_event_kinds[event_kind] += 1
+                    elif len(self._dropped_event_kinds) < 16:
+                        self._dropped_event_kinds[event_kind] = 1
+                    else:
+                        self._dropped_event_kinds["__other__"] = (
+                            self._dropped_event_kinds.get("__other__", 0) + 1
+                        )
                 return False
             return True
 
@@ -153,21 +245,30 @@ class StructuredRecorder:
             raise RecorderError("recorder worker failed") from self._worker_error
 
     def _run(self) -> None:
-        iq_handle = chunks_handle = events_handle = None
+        iq_handle = chunks_handle = events_handle = summary_handle = None
+        created_paths: list[Path] = []
+        opening_outputs = True
         try:
             self.record_dir.mkdir(parents=True, exist_ok=True)
-            iq_handle = self.iq_path.open("wb")
-            chunks_handle = self.chunks_path.open("w", encoding="utf-8", newline="\n")
-            events_handle = self.events_path.open("w", encoding="utf-8", newline="\n")
+            iq_handle = self.iq_path.open("xb")
+            created_paths.append(self.iq_path)
+            chunks_handle = self.chunks_path.open("x", encoding="utf-8", newline="\n")
+            created_paths.append(self.chunks_path)
+            events_handle = self.events_path.open("x", encoding="utf-8", newline="\n")
+            created_paths.append(self.events_path)
+            summary_handle = self.summary_path.open("x", encoding="utf-8", newline="\n")
+            created_paths.append(self.summary_path)
+            opening_outputs = False
             byte_offset = 0
             while True:
                 item = self._queue.get()
                 try:
                     if item is self._STOP:
                         break
-                    item_kind, value = item
+                    item_kind, value, *extra = item
                     if item_kind == "chunk":
                         chunk = value
+                        chunk_metadata = extra[0]
                         raw = chunk.samples.astype("<c8", copy=False).tobytes(order="C")
                         iq_handle.write(raw)
                         metadata = {
@@ -181,6 +282,8 @@ class StructuredRecorder:
                             "rx_gain_db": chunk.rx_gain_db,
                             "target_version": chunk.target_version,
                             "context_version": chunk.context_version,
+                            "target": chunk_metadata.get("target"),
+                            "metadata": chunk_metadata,
                             "rf_metrics": None if chunk.rf_metrics is None else asdict(chunk.rf_metrics),
                             "sample_count": int(chunk.samples.size),
                             "byte_offset": byte_offset,
@@ -202,6 +305,16 @@ class StructuredRecorder:
             with self._lock:
                 dropped_chunks = self._dropped_chunks
                 dropped_events = self._dropped_events
+                dropped_chunk_range = self._dropped_chunk_range
+                dropped_chunk_ranges = [
+                    dict(item) for item in self._dropped_chunk_ranges
+                ]
+                dropped_chunk_ranges_overflow = (
+                    None
+                    if self._dropped_chunk_ranges_overflow is None
+                    else dict(self._dropped_chunk_ranges_overflow)
+                )
+                dropped_event_kinds = dict(self._dropped_event_kinds)
             if dropped_chunks or dropped_events:
                 events_handle.write(
                     _json_line(
@@ -211,6 +324,12 @@ class StructuredRecorder:
                                 "dropped_chunks": dropped_chunks,
                                 "dropped_events": dropped_events,
                                 "total_drops": dropped_chunks + dropped_events,
+                                "dropped_chunk_range": dropped_chunk_range,
+                                "dropped_chunk_ranges": dropped_chunk_ranges,
+                                "dropped_chunk_ranges_overflow": (
+                                    dropped_chunk_ranges_overflow
+                                ),
+                                "dropped_event_kinds": dropped_event_kinds,
                             },
                             "wall_time": time.time(),
                             "monotonic_ns": time.monotonic_ns(),
@@ -223,22 +342,38 @@ class StructuredRecorder:
             for handle in (iq_handle, chunks_handle, events_handle):
                 handle.flush()
                 os.fsync(handle.fileno())
-            self._write_summary(self._stopped_reason)
+            self._write_summary(self._stopped_reason, summary_handle)
         except BaseException as exc:
             with self._lock:
                 self._worker_error = exc
         finally:
-            for handle in (iq_handle, chunks_handle, events_handle):
+            for handle in (iq_handle, chunks_handle, events_handle, summary_handle):
                 if handle is not None:
                     try:
                         handle.close()
                     except Exception:
                         pass
+            if opening_outputs:
+                for path in reversed(created_paths):
+                    try:
+                        if path.stat().st_size == 0:
+                            path.unlink()
+                    except FileNotFoundError:
+                        pass
 
-    def _write_summary(self, stopped_reason: str) -> None:
+    def _write_summary(self, stopped_reason: str, handle) -> None:
+        provider_metadata = {}
+        if self._summary_metadata_provider is not None:
+            try:
+                provider_metadata = _json_snapshot(
+                    self._summary_metadata_provider() or {}
+                )
+            except Exception as exc:
+                provider_metadata = {"metadata_error": str(exc)}
         with self._lock:
             payload = {
                 **self._summary_metadata,
+                **provider_metadata,
                 "format": "numpy.complex64 little-endian interleaved IQ",
                 "files": {
                     "iq": self.iq_path.name,
@@ -253,30 +388,54 @@ class StructuredRecorder:
                 "dropped_chunks": self._dropped_chunks,
                 "dropped_events": self._dropped_events,
                 "queue_overflows": self._dropped_chunks + self._dropped_events,
+                "dropped_chunk_range": self._dropped_chunk_range,
+                "dropped_chunk_ranges": [
+                    dict(item) for item in self._dropped_chunk_ranges
+                ],
+                "dropped_chunk_ranges_overflow": self._dropped_chunk_ranges_overflow,
+                "dropped_event_kinds": dict(self._dropped_event_kinds),
                 "started_wall_time": self._started_wall_time,
                 "closed_wall_time": time.time(),
                 "stopped_reason": stopped_reason,
             }
-        with self.summary_path.open("w", encoding="utf-8", newline="\n") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        json.dump(
+            _json_snapshot(payload),
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _json_line(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    return json.dumps(
+        _json_snapshot(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n"
 
 
 def _json_snapshot(value: object) -> object:
-    if value is None or type(value) in (str, bool, int, float):
+    if value is None or type(value) in (str, bool, int):
+        return value
+    if type(value) is float:
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
         return value
     if isinstance(value, np.generic):
         return _json_snapshot(value.item())
     if isinstance(value, numbers.Integral):
         return int(value)
     if isinstance(value, numbers.Real):
-        return float(value)
+        return _json_snapshot(float(value))
     if isinstance(value, Enum):
         return _json_snapshot(value.value)
     if isinstance(value, Path):
