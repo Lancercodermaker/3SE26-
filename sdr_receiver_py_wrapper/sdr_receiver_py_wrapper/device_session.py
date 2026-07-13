@@ -83,22 +83,19 @@ class DeviceSession:
         this session's last-known configuration snapshot is committed atomically.
         """
         with self._lock:
-            try:
-                backend = self._require_backend_locked()
-                backend.sample_rate = sample_rate
-                backend.rx_lo = lo_hz
-                backend.rx_rf_bandwidth = rf_bandwidth
-                backend.gain_control_mode_chan0 = "manual"
-                backend.rx_hardwaregain_chan0 = gain
-            except Exception as exc:
-                self._connection_errors += 1
-                raise DeviceConnectionError("failed to configure receiver") from exc
-            self._settings = {
+            settings = {
                 "sample_rate_hz": sample_rate,
                 "lo_hz": lo_hz,
                 "rf_bandwidth_hz": rf_bandwidth,
                 "rx_gain_db": gain,
             }
+            try:
+                backend = self._require_backend_locked()
+                self._apply_settings(backend, settings)
+            except Exception as exc:
+                self._connection_errors += 1
+                raise DeviceConnectionError("failed to configure receiver") from exc
+            self._settings = settings
 
     def set_gain(self, gain):
         """Force manual gain and commit it only after both writes succeed.
@@ -116,11 +113,11 @@ class DeviceSession:
                 raise DeviceConnectionError("failed to set receiver gain") from exc
             self._settings = {**self._settings, "rx_gain_db": gain}
 
-    def read(self):
+    def read(self, *, with_snapshot=False):
         with self._lock:
             try:
                 backend = self._require_backend_locked()
-                return backend.rx()
+                iq = backend.rx()
             except Exception as exc:
                 self._read_errors += 1
                 try:
@@ -128,6 +125,9 @@ class DeviceSession:
                 except Exception:
                     self._connection_errors += 1
                 raise DeviceReadError("failed to read receiver IQ") from exc
+            if with_snapshot:
+                return iq, dict(self._settings)
+            return iq
 
     def reconnect(self):
         with self._lock:
@@ -140,8 +140,13 @@ class DeviceSession:
             try:
                 self._release_backend_locked()
                 self._connect_locked()
+                self._apply_settings(self._backend, self._settings)
             except Exception as exc:
                 self._connection_errors += 1
+                try:
+                    self._release_backend_locked()
+                except Exception:
+                    pass
                 raise DeviceConnectionError("failed to reconnect receiver") from exc
             self._reconnects += 1
             return True
@@ -179,6 +184,18 @@ class DeviceSession:
         if cleanup is not None:
             cleanup()
         self._closes += 1
+
+    @staticmethod
+    def _apply_settings(backend, settings):
+        if "sample_rate_hz" in settings:
+            backend.sample_rate = settings["sample_rate_hz"]
+        if "lo_hz" in settings:
+            backend.rx_lo = settings["lo_hz"]
+        if "rf_bandwidth_hz" in settings:
+            backend.rx_rf_bandwidth = settings["rf_bandwidth_hz"]
+        if "rx_gain_db" in settings:
+            backend.gain_control_mode_chan0 = "manual"
+            backend.rx_hardwaregain_chan0 = settings["rx_gain_db"]
 
     @staticmethod
     def _find_cleanup(backend):

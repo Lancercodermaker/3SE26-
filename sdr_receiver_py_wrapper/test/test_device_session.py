@@ -307,6 +307,27 @@ def test_read_failure_closes_and_clears_backend_then_reconnects_to_next_one():
     assert session.read() is iq
 
 
+def test_reconnect_replay_failure_cleans_replacement_and_is_not_successful():
+    first = FakePlutoBackend()
+    replacement = ConfigureFailingBackend()
+    replacement.fail_bandwidth_write = True
+    session = DeviceSession(SequenceFactory(first, replacement))
+    session.configure(
+        sample_rate=2_000_000,
+        lo_hz=434_920_000,
+        rf_bandwidth=940_000,
+        gain=20,
+    )
+
+    with pytest.raises(DeviceConnectionError) as error:
+        session.reconnect()
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert replacement.close_calls == 1
+    assert session.stats.reconnects == 0
+    assert session.stats.connection_errors == 1
+
+
 def test_reconnect_failure_is_chained_and_does_not_increment_reconnects():
     first = FakePlutoBackend()
     connect_error = RuntimeError("reconnect failed")
