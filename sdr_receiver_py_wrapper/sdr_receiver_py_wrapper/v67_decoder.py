@@ -28,20 +28,8 @@ class V67Decoder:
         context: DecodeContext,
     ) -> list[DecodedCommand]:
         commands: list[DecodedCommand] = []
-        seen_events: list[object] = []
-        seen_event_ids: set[int] = set()
-
-        def first_observation(event: object) -> bool:
-            event_id = id(event)
-            if event_id in seen_event_ids:
-                return False
-            seen_event_ids.add(event_id)
-            seen_events.append(event)
-            return True
 
         def on_jam_key(event: JamKeyEvent) -> None:
-            if not first_observation(event):
-                return
             commands.append(
                 DecodedCommand(
                     cmd_id=event.cmd_id,
@@ -70,8 +58,6 @@ class V67Decoder:
             )
 
         def on_raw_frame(event: RawFrameEvent) -> None:
-            if not first_observation(event):
-                return
             commands.append(
                 DecodedCommand(
                     cmd_id=event.cmd_id,
@@ -128,11 +114,13 @@ class V67Decoder:
             )
 
     def reset(self, reason: ResetReason, context: DecodeContext) -> None:
-        with self._stats_lock:
-            self._resets += 1
+        """Reset core demodulator state; only successful resets are counted."""
+
         reset_decoder = getattr(self._core, "reset_decoder", None)
         if not callable(reset_decoder):
-            return
+            with self._stats_lock:
+                self._decode_errors += 1
+            raise RuntimeError("decoder core has no callable reset_decoder hook")
         try:
             reset_decoder(
                 reason=reason,
@@ -142,6 +130,8 @@ class V67Decoder:
             with self._stats_lock:
                 self._decode_errors += 1
             raise
+        with self._stats_lock:
+            self._resets += 1
 
     @staticmethod
     def _profile(context: DecodeContext) -> dict[str, str]:

@@ -13,6 +13,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from .iq_file_source import IqFilePluto
+from .models import ResetReason
 from .patches import PatchCallbacks, PatchManager
 
 
@@ -256,6 +257,36 @@ class ReceiverCoreAdapter:
                 tune_cfg.update(saved_tune_cfg)
                 if persistent_was_applied:
                     persistent_manager.apply()
+
+    def reset_decoder(
+        self,
+        *,
+        reason: ResetReason,
+        profile: dict[str, str],
+    ) -> None:
+        """Clear only v67 demodulator tracking state, without device control."""
+
+        if not isinstance(reason, ResetReason):
+            raise TypeError("reason must be a ResetReason")
+        if type(profile) is not dict:
+            raise TypeError("profile must be a dict")
+        if set(profile) != {"name", "team", "target"}:
+            raise ValueError(
+                "profile must contain exactly name, team, and target"
+            )
+        if any(type(profile[key]) is not str for key in ("name", "team", "target")):
+            raise TypeError("profile name, team, and target must be strings")
+        if not all(profile[key].strip() for key in ("name", "team", "target")):
+            raise ValueError("profile name, team, and target must be non-empty")
+
+        module = self._require_module()
+        with self.lock:
+            reset_tracking_state = getattr(module, "reset_tracking_state", None)
+            if not callable(reset_tracking_state):
+                raise RuntimeError(
+                    "original receiver core does not support pure decoder reset"
+                )
+            reset_tracking_state(clear_scores=True)
 
     def configure_iq_file_source(
         self,

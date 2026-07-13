@@ -188,7 +188,7 @@ def test_core_exception_is_counted_and_propagated_without_success_counts():
     assert decoder.stats().commands_emitted == 0
 
 
-def test_reset_uses_only_optional_pure_hook_and_counts_attempt():
+def test_reset_uses_pure_hook_and_counts_only_success():
     calls = []
 
     class ResettableCore:
@@ -227,8 +227,94 @@ def test_reset_hook_exception_is_counted_and_propagated():
     with pytest.raises(RuntimeError, match="reset failed"):
         decoder.reset(ResetReason.MANUAL, decode_context("BLUE", "L1"))
 
-    assert decoder.stats().resets == 1
+    assert decoder.stats().resets == 0
     assert decoder.stats().decode_errors == 1
+
+
+def test_reset_without_pure_core_hook_is_an_error():
+    decoder = V67Decoder(core=SimpleNamespace(demodulate_iq=lambda **kwargs: None))
+
+    with pytest.raises(RuntimeError, match="reset_decoder"):
+        decoder.reset(ResetReason.CONTEXT_CHANGE, decode_context("BLUE", "L1"))
+
+    assert decoder.stats().resets == 0
+    assert decoder.stats().decode_errors == 1
+
+
+def test_adapter_reset_clears_vendor_decoder_state_without_leaking_profile_or_callbacks():
+    module = ModuleType("resettable_v67")
+    module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}
+    module.STATE = {
+        "BIT_POOLS": {"pool": "bits"},
+        "PENDING_FRAMES": {"frame": {"seen": 1}},
+        "POOL_SCORES": {"pool": 2.5},
+        "TRACK": {
+            "TARGET": "L1",
+            "PROFILE": {"k": 0.1},
+            "LOCK_UNTIL": 99.0,
+            "LAST_CRC16": 88.0,
+            "MISS": 3,
+        },
+    }
+    calls = []
+
+    def reset_tracking_state(clear_scores=True):
+        calls.append(clear_scores)
+        module.STATE["BIT_POOLS"].clear()
+        module.STATE["PENDING_FRAMES"].clear()
+        if clear_scores:
+            module.STATE["POOL_SCORES"].clear()
+        module.STATE["TRACK"].update(
+            TARGET=None,
+            PROFILE=None,
+            LOCK_UNTIL=0.0,
+            LAST_CRC16=0.0,
+            MISS=0,
+        )
+
+    module.reset_tracking_state = reset_tracking_state
+    adapter = ReceiverCoreAdapter()
+    adapter.module = module
+    callbacks = PatchCallbacks(on_jam_key=lambda _event: None)
+    manager = SimpleNamespace(callbacks=callbacks)
+    adapter.patch_manager = manager
+
+    adapter.reset_decoder(
+        reason=ResetReason.TARGET_CHANGE,
+        profile={"name": "BLUE-L1", "team": "BLUE", "target": "L1"},
+    )
+
+    assert calls == [True]
+    assert module.STATE["BIT_POOLS"] == {}
+    assert module.STATE["PENDING_FRAMES"] == {}
+    assert module.STATE["POOL_SCORES"] == {}
+    assert module.STATE["TRACK"] == {
+        "TARGET": None,
+        "PROFILE": None,
+        "LOCK_UNTIL": 0.0,
+        "LAST_CRC16": 0.0,
+        "MISS": 0,
+    }
+    assert module.TUNE_CFG == {"TEAM": "RED", "TARGET": "INFO"}
+    assert adapter.patch_manager is manager
+    assert adapter.patch_manager.callbacks is callbacks
+
+
+def test_adapter_reset_fails_clearly_when_vendor_has_no_reset_hook():
+    module = ModuleType("unsupported_reset_v67")
+    module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}
+    module.STATE = {"BIT_POOLS": {"pool": "bits"}}
+    adapter = ReceiverCoreAdapter()
+    adapter.module = module
+
+    with pytest.raises(RuntimeError, match="does not support pure decoder reset"):
+        adapter.reset_decoder(
+            reason=ResetReason.CONTEXT_CHANGE,
+            profile={"name": "BLUE-L1", "team": "BLUE", "target": "L1"},
+        )
+
+    assert module.STATE["BIT_POOLS"] == {"pool": "bits"}
+    assert module.TUNE_CFG == {"TEAM": "RED", "TARGET": "INFO"}
 
 
 def test_adapter_demodulates_copied_iq_with_temporary_profile_and_callbacks():
@@ -458,7 +544,7 @@ def test_stats_snapshot_is_consistent_under_concurrent_decodes():
     assert stats.decode_errors == 0
 
 
-def test_same_callback_event_object_is_not_emitted_twice():
+def test_same_jam_and_raw_objects_are_emitted_for_each_callback_occurrence():
     jam_event = JamKeyEvent(
         cmd_id=0x0A06,
         payload=b"ABC123",
@@ -470,14 +556,32 @@ def test_same_callback_event_object_is_not_emitted_twice():
         source="direct",
         timestamp=12.6,
     )
+    raw_event = RawFrameEvent(
+        cmd_id=0x0A02,
+        payload=b"raw-frame",
+        source="assembled",
+        source_target="L1",
+        team="BLUE",
+        crc8_ok=True,
+        crc16_ok=False,
+        air_chunk_index=7,
+        timestamp=12.7,
+    )
 
     class DuplicateCore:
         def demodulate_iq(self, *, samples, profile, callbacks):
             callbacks.on_jam_key(jam_event)
+            callbacks.on_raw_frame(raw_event)
             callbacks.on_jam_key(jam_event)
+            callbacks.on_raw_frame(raw_event)
 
     decoder = V67Decoder(core=DuplicateCore())
     commands = decoder.decode(make_chunk(), decode_context("BLUE", "L1"))
 
-    assert [command.payload for command in commands] == [b"ABC123"]
-    assert decoder.stats().commands_emitted == 1
+    assert [command.payload for command in commands] == [
+        b"ABC123",
+        b"raw-frame",
+        b"ABC123",
+        b"raw-frame",
+    ]
+    assert decoder.stats().commands_emitted == 4
