@@ -781,30 +781,40 @@ class SdrReceiverPyWrapperNode(Node):
                 self.get_logger().debug(prevalidation.reason)
                 return
             controller_snapshot = self._snapshot_jam_key_controller_state()
-            decision = self.controller.handle_jam_key(level=event.level, key=event.key)
-            for warning in decision.warnings:
-                self.get_logger().warn(warning)
-            if decision.publish:
-                if not self.publish_ros_outputs:
-                    self._restore_jam_key_controller_state(controller_snapshot)
-                    self.get_logger().debug(
-                        "ROS output disabled; controller key decision aborted"
-                    )
-                    return
-                try:
+            publication_committed = False
+            try:
+                decision = self.controller.handle_jam_key(
+                    level=event.level,
+                    key=event.key,
+                )
+                for warning in decision.warnings:
+                    self.get_logger().warn(warning)
+                if decision.publish:
+                    if not self.publish_ros_outputs:
+                        self._restore_jam_key_controller_state(
+                            controller_snapshot
+                        )
+                        self.get_logger().debug(
+                            "ROS output disabled; controller key decision aborted"
+                        )
+                        return
                     result = self._handle_controller_decoded_command(
                         self._decoded_command_from_legacy_event(
                             event,
                             decision.level,
                         )
                     )
-                except Exception:
+                    if not result.accepted:
+                        self._restore_jam_key_controller_state(
+                            controller_snapshot
+                        )
+                        self.get_logger().debug(result.reason)
+                        return
+                    publication_committed = True
+            except Exception:
+                if not publication_committed:
                     self._restore_jam_key_controller_state(controller_snapshot)
-                    raise
-                if not result.accepted:
-                    self._restore_jam_key_controller_state(controller_snapshot)
-                    self.get_logger().debug(result.reason)
-                    return
+                raise
             if decision.target:
                 self._set_receiver_target_or_profile(
                     decision.target,
@@ -1032,10 +1042,14 @@ class SdrReceiverPyWrapperNode(Node):
             raise
         if not self.command_validator.commit_publish_authorization(command, result):
             raise RuntimeError("Jam publisher transaction could not be committed")
-        self.get_logger().info(
-            f"published jam code level={msg.level} team={msg.team} "
-            f"target={msg.target} key={msg.ascii_code}"
-        )
+        try:
+            self.get_logger().info(
+                f"published jam code level={msg.level} team={msg.team} "
+                f"target={msg.target} key={msg.ascii_code}"
+            )
+        except Exception:
+            # ROS publication is irreversible; logging is post-commit only.
+            pass
 
     def _publish_status(self) -> None:
         adapter_status = {}

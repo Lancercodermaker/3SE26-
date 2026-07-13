@@ -652,6 +652,134 @@ def test_final_l3_commits_info_and_rf_target_only_after_ros_success(
     assert node.adapter.targets == ["INFO"]
 
 
+def test_post_commit_success_log_failure_does_not_undo_publication(
+    receiver_node_module,
+):
+    node = make_real_controller_node(
+        receiver_node_module,
+        min_interval=60.0,
+        retry_limit=-1,
+    )
+
+    def fail_info(_message):
+        raise RuntimeError("success log unavailable")
+
+    node.get_logger = lambda: SimpleNamespace(
+        info=fail_info,
+        debug=lambda _message: None,
+        warn=lambda _message: None,
+    )
+    event = jam_event(b"LOG123")
+
+    node._on_jam_key(event)
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.WAIT_LEVEL_L2
+    assert node.controller.completed_level == 1
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 1}
+
+    node._on_jam_key(event)
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 1}
+
+
+def test_handle_exception_after_real_mutation_restores_controller(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module)
+    before = node.controller.status_snapshot()
+    real_handle = node.controller.handle_jam_key
+
+    def mutate_then_fail(**kwargs):
+        real_handle(**kwargs)
+        raise RuntimeError("controller failed after mutation")
+
+    node.controller.handle_jam_key = mutate_then_fail
+    with pytest.raises(RuntimeError, match="controller failed after mutation"):
+        node._on_jam_key(jam_event(b"MUT123"))
+
+    assert node.controller.status_snapshot() == before
+    assert node.controller.state == CompetitionState.JAM_L1
+    assert node.controller.completed_level == 0
+    assert node.controller.desired_target == "L1"
+    assert node.controller.published_keys == {}
+    assert node.jam_code_pub.messages == []
+    assert node.adapter.targets == []
+
+    node.controller.handle_jam_key = real_handle
+    node._on_jam_key(jam_event(b"MUT123"))
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 1}
+
+
+def test_precommit_warning_log_exception_restores_controller(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module)
+    before = node.controller.status_snapshot()
+    real_handle = node.controller.handle_jam_key
+
+    def mutate_with_warning(**kwargs):
+        decision = real_handle(**kwargs)
+        decision.warnings.append("controller warning")
+        return decision
+
+    def fail_warning(_message):
+        raise RuntimeError("warning log unavailable")
+
+    node.controller.handle_jam_key = mutate_with_warning
+    node.get_logger = lambda: SimpleNamespace(
+        info=lambda _message: None,
+        debug=lambda _message: None,
+        warn=fail_warning,
+    )
+    with pytest.raises(RuntimeError, match="warning log unavailable"):
+        node._on_jam_key(jam_event(b"WARN01"))
+
+    assert node.controller.status_snapshot() == before
+    assert node.controller.published_keys == {}
+    assert node.jam_code_pub.messages == []
+    assert node.adapter.targets == []
+
+    node.get_logger = lambda: SimpleNamespace(
+        info=lambda _message: None,
+        debug=lambda _message: None,
+        warn=lambda _message: None,
+    )
+    node._on_jam_key(jam_event(b"WARN01"))
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.status_snapshot()["published_key_counts"] == {"1": 1}
+
+
+def test_rf_target_exception_after_commit_does_not_restore_controller(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module, level=3)
+
+    def fail_target(target):
+        node.adapter.targets.append(target)
+        raise RuntimeError("RF target failed")
+
+    node.adapter.set_target = fail_target
+    event = jam_event(b"RFERR3", level=3)
+
+    with pytest.raises(RuntimeError, match="RF target failed"):
+        node._on_jam_key(event)
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.INFO
+    assert node.controller.completed_level == 3
+    assert node.controller.desired_target == "INFO"
+    assert node.controller.status_snapshot()["published_key_counts"] == {"3": 1}
+    assert node.adapter.targets == ["INFO"]
+
+    node._on_jam_key(event)
+    assert len(node.jam_code_pub.messages) == 1
+
+
 def test_legacy_callback_preserves_controller_target_without_publish(
     receiver_node_module,
 ):
