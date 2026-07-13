@@ -18,7 +18,12 @@ from sdr_receiver_py_wrapper.competition_controller import (
 )
 from sdr_receiver_py_wrapper.context_arbiter import ContextArbiter, Observation
 from sdr_receiver_py_wrapper.models import DecodedCommand
-from sdr_receiver_py_wrapper.patches import JamKeyEvent
+from sdr_receiver_py_wrapper.original_receiver_adapter import ReceiverCoreAdapter
+from sdr_receiver_py_wrapper.patches import (
+    JamKeyEvent,
+    PatchCallbacks,
+    PatchManager,
+)
 
 
 MISSING = object()
@@ -1019,6 +1024,90 @@ def test_successful_info_rf_apply_is_not_retried_when_success_log_fails(
     assert node._pending_rf_transition is None
     assert len(node.jam_code_pub.messages) == 1
     assert node.controller.state == CompetitionState.INFO
+
+
+def test_unpublished_target_failure_does_not_create_postcommit_pending(
+    receiver_node_module,
+):
+    node = make_node(receiver_node_module)
+    target_attempts = []
+    node.controller.handle_jam_key = lambda **_kwargs: SimpleNamespace(
+        publish=False,
+        warnings=(),
+        level=1,
+        target="L2",
+        reason="unpublished target decision",
+    )
+
+    def fail_target(target):
+        target_attempts.append(target)
+        raise RuntimeError("unpublished target failed")
+
+    node.adapter.set_target = fail_target
+    with pytest.raises(RuntimeError, match="unpublished target failed"):
+        node._on_jam_key(jam_event(b"NOPUB1"))
+
+    assert node.jam_code_pub.messages == []
+    assert getattr(node, "_pending_rf_transition", None) is None
+    assert target_attempts == ["L2"]
+
+    node.controller.handle_jam_key = lambda **_kwargs: SimpleNamespace(
+        publish=False,
+        warnings=(),
+        level=1,
+        target=None,
+        reason="no transition",
+    )
+    node.adapter.set_target = lambda target: target_attempts.append(target)
+    node._on_jam_key(jam_event(b"NOPUB1"))
+
+    assert target_attempts == ["L2"]
+    assert node.jam_code_pub.messages == []
+
+
+def test_real_patch_target_callback_log_failure_does_not_retry_rf_or_ros(
+    receiver_node_module,
+):
+    node = make_real_controller_node(receiver_node_module, level=3)
+    module = ModuleType("probe_receiver_core")
+    module.TUNE_CFG = {"TEAM": "BLUE", "TARGET": "L3"}
+    module.STATE = {"STATS": {"RF_STATE": "receiving"}}
+    underlying_target_calls = []
+
+    def select_tune_target(target, **_kwargs):
+        underlying_target_calls.append(target)
+        module.TUNE_CFG["TARGET"] = target
+
+    def fail_log(_message):
+        raise RuntimeError("target-change logging failed")
+
+    module.select_tune_target = select_tune_target
+    adapter = ReceiverCoreAdapter(logger=fail_log)
+    adapter.module = module
+    adapter.patch_manager = PatchManager(
+        module,
+        run_mode="competition",
+        callbacks=PatchCallbacks(on_target_change=node._on_target_change),
+        logger=adapter.logger,
+    )
+    adapter.patch_manager._patch_select_tune_target()
+    node.adapter = adapter
+    node.get_logger = lambda: SimpleNamespace(
+        info=fail_log,
+        debug=lambda _message: None,
+        warn=lambda _message: None,
+    )
+    event = jam_event(b"PATCH3", level=3)
+
+    node._on_jam_key(event)
+    node._on_jam_key(event)
+
+    assert len(node.jam_code_pub.messages) == 1
+    assert node.controller.state == CompetitionState.INFO
+    assert node.controller.status_snapshot()["published_key_counts"] == {"3": 1}
+    assert module.TUNE_CFG["TARGET"] == "INFO"
+    assert underlying_target_calls == ["INFO"]
+    assert node._pending_rf_transition is None
 
 
 def test_legacy_callback_preserves_controller_target_without_publish(

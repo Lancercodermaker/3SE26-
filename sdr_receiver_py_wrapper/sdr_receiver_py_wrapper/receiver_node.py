@@ -844,7 +844,8 @@ class SdrReceiverPyWrapperNode(Node):
                             team=transition.team,
                         )
                     except Exception:
-                        self._pending_rf_transition = transition
+                        if publication_committed:
+                            self._pending_rf_transition = transition
                         raise
                     self._pending_rf_transition = None
                 elif decision.reason:
@@ -1011,9 +1012,14 @@ class SdrReceiverPyWrapperNode(Node):
         self.raw_frame_pub.publish(msg)
 
     def _on_target_change(self, event: TargetChangeEvent) -> None:
-        self.get_logger().info(
-            f"receiver core target changed {event.before}->{event.after} team={event.team}"
-        )
+        try:
+            self.get_logger().info(
+                f"receiver core target changed {event.before}->{event.after} "
+                f"team={event.team}"
+            )
+        except Exception:
+            # The RF mutation already happened inside the receiver core.
+            pass
 
     def _on_raw_iq(self, raw_iq: np.ndarray) -> None:
         if self.iq_recorder is not None:
