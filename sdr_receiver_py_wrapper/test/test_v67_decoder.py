@@ -586,6 +586,12 @@ def test_adapter_rejects_profiles_outside_exact_contract(profile, error, message
         ("missing_ac", "RADAR_PARAMS.*BLUE.*L1.*ac"),
         ("fast_demod", "fast_demod.*callable"),
         ("validate_and_parse", "validate_and_parse.*callable"),
+        ("state_none", "STATE.*mutable dict"),
+        ("state_list", "STATE.*mutable dict"),
+        ("state_custom", "STATE.*mutable dict"),
+        ("stats_none", "STATE.STATS.*mutable dict"),
+        ("stats_list", "STATE.STATS.*mutable dict"),
+        ("stats_custom", "STATE.STATS.*mutable dict"),
     ],
 )
 def test_adapter_validates_core_contract_before_any_state_change(fault, message):
@@ -594,7 +600,10 @@ def test_adapter_validates_core_contract_before_any_state_change(fault, message)
     module.STATE = {"STATS": {}}
     module.RADAR_PARAMS = {"BLUE": {"L1": {"ac": "ac"}}}
     module.validate_and_parse = lambda cmd_id, payload, source="direct": True
-    module.fast_demod = lambda samples, ac_target: False
+    core_calls = []
+    module.fast_demod = lambda samples, ac_target: core_calls.append(
+        (samples, ac_target)
+    )
     if fault == "tune_cfg":
         module.TUNE_CFG = MappingProxyType(module.TUNE_CFG)
     elif fault == "missing_target":
@@ -607,6 +616,18 @@ def test_adapter_validates_core_contract_before_any_state_change(fault, message)
         module.fast_demod = None
     elif fault == "validate_and_parse":
         module.validate_and_parse = None
+    elif fault == "state_none":
+        module.STATE = None
+    elif fault == "state_list":
+        module.STATE = []
+    elif fault == "state_custom":
+        module.STATE = type("StateDict", (dict,), {})({"STATS": {}})
+    elif fault == "stats_none":
+        module.STATE["STATS"] = None
+    elif fault == "stats_list":
+        module.STATE["STATS"] = []
+    elif fault == "stats_custom":
+        module.STATE["STATS"] = type("StatsDict", (dict,), {})()
 
     class PersistentManager:
         _applied = True
@@ -626,6 +647,7 @@ def test_adapter_validates_core_contract_before_any_state_change(fault, message)
     adapter.module = module
     adapter.patch_manager = manager
     tune_cfg_before = module.TUNE_CFG
+    state_before = module.STATE
 
     with pytest.raises(ReceiverCoreLoadError, match=message):
         adapter.demodulate_iq(
@@ -635,6 +657,8 @@ def test_adapter_validates_core_contract_before_any_state_change(fault, message)
         )
 
     assert module.TUNE_CFG is tune_cfg_before
+    assert module.STATE is state_before
+    assert core_calls == []
     assert manager.restore_calls == 0
     assert manager.apply_calls == 0
 
@@ -685,14 +709,15 @@ def test_adapter_restores_persistent_callbacks_after_success_and_exception():
 
 
 @pytest.mark.parametrize(
-    ("demod_fails", "expected_error"),
+    ("demod_fails", "logger_raises", "expected_error"),
     [
-        (True, "demod primary"),
-        (False, "temporary restore cleanup"),
+        (True, False, "demod primary"),
+        (True, True, "demod primary"),
+        (False, False, "temporary restore cleanup"),
     ],
 )
 def test_adapter_cleanup_steps_are_independent_and_preserve_first_error(
-    monkeypatch, demod_fails, expected_error
+    monkeypatch, demod_fails, logger_raises, expected_error
 ):
     module = ModuleType("cleanup_v67")
     module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}
@@ -730,11 +755,18 @@ def test_adapter_cleanup_steps_are_independent_and_preserve_first_error(
             raise RuntimeError("temporary restore cleanup")
 
     monkeypatch.setattr(adapter_module, "PatchManager", TemporaryManager)
-    adapter = ReceiverCoreAdapter()
+    log_messages = []
+
+    def logger(message):
+        log_messages.append(message)
+        if logger_raises:
+            raise RuntimeError("logger cleanup failure")
+
+    adapter = ReceiverCoreAdapter(logger=logger)
     adapter.module = module
     adapter.patch_manager = PersistentManager()
 
-    with pytest.raises(RuntimeError, match=expected_error):
+    with pytest.raises(RuntimeError, match=expected_error) as caught:
         adapter.demodulate_iq(
             samples=np.zeros(4, dtype=np.complex64),
             profile={"name": "BLUE-L1", "team": "BLUE", "target": "L1"},
@@ -749,6 +781,17 @@ def test_adapter_cleanup_steps_are_independent_and_preserve_first_error(
         "persistent_apply",
     ]
     assert module.TUNE_CFG == {"TEAM": "RED", "TARGET": "INFO"}
+    if demod_fails:
+        assert type(caught.value) is RuntimeError
+        traceback_names = []
+        current = caught.value.__traceback__
+        while current is not None:
+            traceback_names.append(current.tb_frame.f_code.co_name)
+            current = current.tb_next
+        assert "fast_demod" in traceback_names
+        assert len(log_messages) == 2
+        assert "temporary restore cleanup" in log_messages[0]
+        assert "persistent apply cleanup" in log_messages[1]
 
 
 def test_v67_plugin_source_has_no_device_ros_io_or_thread_creation():

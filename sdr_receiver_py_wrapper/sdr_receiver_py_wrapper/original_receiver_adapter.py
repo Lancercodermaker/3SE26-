@@ -230,6 +230,15 @@ class ReceiverCoreAdapter:
                 raise ReceiverCoreLoadError(
                     "original receiver core TUNE_CFG must be a mutable dict"
                 )
+            state = getattr(module, "STATE", None)
+            if type(state) is not dict:
+                raise ReceiverCoreLoadError(
+                    "original receiver core STATE must be an exact mutable dict"
+                )
+            if "STATS" in state and type(state["STATS"]) is not dict:
+                raise ReceiverCoreLoadError(
+                    "original receiver core STATE.STATS must be an exact mutable dict"
+                )
             if not isinstance(radar_params, Mapping):
                 raise ReceiverCoreLoadError(
                     "original receiver core RADAR_PARAMS must be a mapping"
@@ -300,6 +309,14 @@ class ReceiverCoreAdapter:
                     cleanup_errors.append(exc)
 
             if primary_error is not None:
+                for cleanup_error in cleanup_errors:
+                    try:
+                        self.logger(
+                            "pure decoder cleanup failed while preserving "
+                            f"{type(primary_error).__name__}: {cleanup_error}"
+                        )
+                    except BaseException:
+                        pass
                 raise primary_error.with_traceback(primary_traceback)
             if cleanup_errors:
                 cleanup_error = cleanup_errors[0]
