@@ -16,6 +16,7 @@ from std_msgs.msg import String, UInt8
 
 from sdr_receiver.msg import JamCode, RadarContext as RadarContextMsg, RadarWirelessFrame
 
+from .command_validator import CommandValidator, ValidationResult
 from .competition_controller import CompetitionController, RadarContext
 from .context_arbiter import (
     ContextArbiter,
@@ -28,11 +29,12 @@ from .context_arbiter import (
 from .original_receiver_adapter import ReceiverCoreAdapter
 from .patches import JamKeyEvent, PatchCallbacks, RawFrameEvent, TargetChangeEvent
 from .profile_import import AdaptiveProfileLoadError, load_adaptive_profile
-from .models import IqChunk
+from .models import DecodedCommand, IqChunk
 from .structured_recorder import StructuredRecorder, _json_snapshot
 
 
 DEFAULT_ORIGINAL_SCRIPT = "auto"
+PRIMARY_DECODER_ID = "improved_v67"
 
 
 class IqRecorder:
@@ -345,6 +347,8 @@ class SdrReceiverPyWrapperNode(Node):
             ),
             key_retry_limit=int(self.get_parameter("key_retry_limit").value),
         )
+        self.primary_decoder_id = PRIMARY_DECODER_ID
+        self.command_validator = CommandValidator()
 
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -771,7 +775,9 @@ class SdrReceiverPyWrapperNode(Node):
             for warning in decision.warnings:
                 self.get_logger().warn(warning)
             if decision.publish and self.publish_ros_outputs:
-                self._publish_jam_code(event, decision.level)
+                self._handle_decoded_command(
+                    self._decoded_command_from_legacy_event(event, decision.level)
+                )
             if decision.target:
                 self._set_receiver_target_or_profile(
                     decision.target,
@@ -783,7 +789,69 @@ class SdrReceiverPyWrapperNode(Node):
             return
 
         if self.publish_ros_outputs:
-            self._publish_jam_code(event, event.level)
+            self._handle_decoded_command(
+                self._decoded_command_from_legacy_event(event, event.level)
+            )
+
+    def _decoded_command_from_legacy_event(
+        self,
+        event: JamKeyEvent,
+        level: int,
+    ) -> DecodedCommand:
+        """Bridge the legacy callback into the common immutable contract."""
+
+        context_arbiter = getattr(self, "context_arbiter", None)
+        return DecodedCommand(
+            cmd_id=event.cmd_id,
+            payload=bytes(event.key),
+            decoder_id=self.primary_decoder_id,
+            profile=self.run_mode,
+            crc8_ok=True,
+            crc16_ok=True,
+            crc_mode="legacy_v67_validated",
+            first_sample_index=0,
+            last_sample_index=0,
+            receive_wall_time=event.timestamp,
+            target=(
+                f"JAM_L{level}_KEY" if level in (1, 2, 3) else event.target
+            ),
+            team=self._current_team(event.team),
+            context_version=int(
+                getattr(context_arbiter, "context_version", 0)
+            ),
+            evidence={
+                "event_type": "jam_key",
+                "source": event.source,
+                "source_target": event.target,
+                "event_team": event.team,
+                "level": level,
+                "ascii": event.ascii_code,
+                "event_timestamp": event.timestamp,
+            },
+        )
+
+    def _handle_decoded_command(
+        self,
+        command: DecodedCommand,
+    ) -> ValidationResult:
+        """Gate one decoder command into the sole production Jam publisher."""
+
+        if command.decoder_id != self.primary_decoder_id:
+            result = ValidationResult(
+                False,
+                f"decoder_id {command.decoder_id!r} is not primary decoder "
+                f"{self.primary_decoder_id!r}",
+            )
+            self.get_logger().debug(result.reason)
+            return result
+
+        result = self.command_validator.validate(command)
+        if result.accepted:
+            if self.publish_ros_outputs:
+                self._publish_validated_jam_code(command, result)
+        else:
+            self.get_logger().debug(result.reason)
+        return result
 
     def _on_raw_frame(self, event: RawFrameEvent) -> None:
         if not self.publish_ros_outputs:
@@ -842,22 +910,30 @@ class SdrReceiverPyWrapperNode(Node):
         )
         return True
 
-    def _publish_jam_code(self, event: JamKeyEvent, level: int) -> None:
+    def _publish_validated_jam_code(
+        self,
+        command: DecodedCommand,
+        result: ValidationResult,
+    ) -> None:
+        if not self.command_validator.consume_publish_authorization(command, result):
+            raise ValueError(
+                "Jam publisher requires a fresh validated command result"
+            )
         context = self.latest_context
         msg = JamCode()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.valid = True
-        msg.command_id = 0x0A06
-        msg.level = int(level) & 0xFF
-        msg.team = self._current_team(event.team)
-        msg.target = f"JAM_L{int(level)}_KEY" if int(level) in (1, 2, 3) else event.target
+        msg.command_id = int(command.cmd_id) & 0xFFFF
+        msg.level = int(result.level) & 0xFF
+        msg.team = self._current_team(command.team)
+        msg.target = command.target
         msg.radio_mode = self.run_mode
         stats = self.adapter.get_stats_snapshot()
         msg.rf_state = str(stats.get("rf_state") or "")
         msg.radar_info_raw = int(context.radar_info_raw) & 0xFF if context else 0
         msg.key_mutable = bool(context.key_mutable) if context else False
-        msg.key = list(event.key[:6])
-        msg.ascii_code = event.ascii_code
+        msg.key = list(command.payload)
+        msg.ascii_code = str(result.ascii_code)
         self.jam_code_pub.publish(msg)
         self.get_logger().info(
             f"published jam code level={msg.level} team={msg.team} "
