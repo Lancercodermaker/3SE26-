@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import islice
 import json
 from pathlib import Path
 import re
@@ -112,14 +113,12 @@ def confirmed_fixtures(
 
     if not isinstance(manifest, Mapping):
         raise FixtureManifestError("manifest must be a mapping of FixtureSpec values")
-    if len(manifest) > MAX_FIXTURE_COUNT:
-        raise FixtureManifestError(
-            f"manifest fixture count exceeds {MAX_FIXTURE_COUNT}-entry limit"
-        )
-    _validate_fixture_names(manifest.keys())
+
+    items = _snapshot_mapping_items(manifest)
+    _validate_fixture_names(name for name, _entry in items)
 
     confirmed: dict[str, FixtureSpec] = {}
-    for name, entry in manifest.items():
+    for name, entry in items:
         snapshot = _snapshot_fixture_spec(name, entry)
         if snapshot.requires_decode_assertion:
             confirmed[name] = snapshot
@@ -130,7 +129,7 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str,
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
-            raise _DuplicateJsonKeyError(f"duplicate JSON key: {key}")
+            raise _DuplicateJsonKeyError(f"duplicate JSON key: {_safe_repr(key)}")
         result[key] = value
     return result
 
@@ -141,11 +140,11 @@ def _reject_nonstandard_json_constant(value: str) -> None:
 
 def _validate_fixture_name(name: object) -> None:
     if type(name) is not str or _FIXTURE_NAME_PATTERN.fullmatch(name) is None:
-        raise FixtureManifestError(f"invalid fixture name: {name!r}")
+        raise FixtureManifestError(f"invalid fixture name: {_safe_repr(name)}")
     base_name = name.split(".", 1)[0].upper()
     if base_name in _WINDOWS_RESERVED_BASE_NAMES:
         raise FixtureManifestError(
-            f"fixture name {name!r} uses a Windows reserved device name"
+            f"fixture name {_safe_repr(name)} uses a Windows reserved device name"
         )
 
 
@@ -158,7 +157,7 @@ def _validate_fixture_names(names: Iterable[object]) -> None:
         if previous is not None:
             raise FixtureManifestError(
                 "fixture names have a case-insensitive collision: "
-                f"{previous!r} and {name!r}"
+                f"{_safe_repr(previous)} and {_safe_repr(name)}"
             )
         folded_names[folded] = name
 
@@ -172,14 +171,15 @@ def _validate_entry(name: str, raw: object) -> FixtureSpec:
         _raise_missing(name, missing_common)
 
     verification = raw["verification"]
-    _validate_verification(verification, f"fixture {name!r}")
+    label = _fixture_label(name)
+    _validate_verification(verification, label)
 
     if verification == "candidate":
         forbidden = _VERIFIED_FIELDS & raw.keys()
         if forbidden:
             fields = ", ".join(sorted(forbidden))
             raise FixtureManifestError(
-                f"candidate fixture {name!r} must not contain unverified field(s): {fields}"
+                f"candidate {label} must not contain unverified field(s): {fields}"
             )
         allowed = _COMMON_FIELDS
     else:
@@ -190,10 +190,15 @@ def _validate_entry(name: str, raw: object) -> FixtureSpec:
 
     unknown = raw.keys() - allowed
     if unknown:
-        fields = ", ".join(sorted(unknown))
-        raise FixtureManifestError(f"fixture {name!r} has unknown field(s): {fields}")
+        fields = ", ".join(_safe_repr(field) for field in sorted(unknown))
+        raise FixtureManifestError(f"{label} has unknown field(s): {fields}")
 
-    return FixtureSpec(**raw)
+    try:
+        return FixtureSpec(**raw)
+    except FixtureManifestError as exc:
+        raise FixtureManifestError(
+            f"{label}: {_safe_error_text(exc)}"
+        ) from None
 
 
 def _validate_fixture_spec_values(spec: FixtureSpec, label: str) -> None:
@@ -265,8 +270,9 @@ def _validate_verification(value: object, label: str) -> None:
 
 
 def _snapshot_fixture_spec(name: str, entry: object) -> FixtureSpec:
+    label = _fixture_label(name)
     if type(entry) is not FixtureSpec:
-        raise FixtureManifestError(f"fixture {name!r} must be an exact FixtureSpec")
+        raise FixtureManifestError(f"{label} must be an exact FixtureSpec")
     try:
         return FixtureSpec(
             format=entry.format,
@@ -278,15 +284,65 @@ def _snapshot_fixture_spec(name: str, entry: object) -> FixtureSpec:
             expected_cmd_id=entry.expected_cmd_id,
             expected_ascii=entry.expected_ascii,
         )
-    except (AttributeError, FixtureManifestError) as exc:
-        raise FixtureManifestError(str(exc)) from None
+    except AttributeError:
+        raise FixtureManifestError(f"{label} is an incomplete FixtureSpec") from None
+    except FixtureManifestError as exc:
+        raise FixtureManifestError(f"{label}: {_safe_error_text(exc)}") from None
+
+
+def _snapshot_mapping_items(
+    manifest: Mapping[str, FixtureSpec],
+) -> tuple[tuple[object, object], ...]:
+    try:
+        bounded = tuple(islice(iter(manifest.items()), MAX_FIXTURE_COUNT + 1))
+    except Exception as exc:
+        error_type = _escape_text(type(exc).__name__)
+        raise FixtureManifestError(
+            f"cannot consume manifest mapping items: {error_type}"
+        ) from None
+
+    if len(bounded) > MAX_FIXTURE_COUNT:
+        raise FixtureManifestError(
+            f"manifest fixture count exceeds {MAX_FIXTURE_COUNT}-entry limit"
+        )
+    for index, item in enumerate(bounded):
+        if type(item) is not tuple or len(item) != 2:
+            raise FixtureManifestError(
+                f"manifest mapping item {index} must be an exact 2-tuple, "
+                f"got {_safe_repr(item)}"
+            )
+    return bounded
 
 
 def _raise_missing(name: str, fields: set[str]) -> None:
     formatted = ", ".join(sorted(fields))
     raise FixtureManifestError(
-        f"fixture {name!r} is missing required field(s): {formatted}"
+        f"{_fixture_label(name)} is missing required field(s): {formatted}"
     )
+
+
+def _fixture_label(name: object) -> str:
+    return f"fixture {_safe_repr(name)}"
+
+
+def _safe_repr(value: object) -> str:
+    try:
+        rendered = repr(value)
+    except Exception:
+        rendered = f"<unrepresentable {type(value).__name__}>"
+    return _escape_text(rendered)
+
+
+def _safe_error_text(error: BaseException) -> str:
+    try:
+        rendered = str(error)
+    except Exception:
+        rendered = type(error).__name__
+    return _escape_text(rendered)
+
+
+def _escape_text(value: str) -> str:
+    return value.encode("unicode_escape", errors="backslashreplace").decode("ascii")
 
 
 __all__ = [

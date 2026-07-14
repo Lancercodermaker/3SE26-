@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
@@ -47,6 +48,34 @@ def write_manifest(tmp_path: Path, payload: object) -> Path:
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+class AdversarialMapping(Mapping):
+    def __init__(self, items):
+        self._items = items
+        self.items_calls = 0
+        self.len_calls = 0
+        self.keys_calls = 0
+
+    def __getitem__(self, key):
+        raise AssertionError("confirmed_fixtures must consume only items()")
+
+    def __iter__(self) -> Iterator:
+        raise AssertionError("confirmed_fixtures must consume only items()")
+
+    def __len__(self) -> int:
+        self.len_calls += 1
+        return 1
+
+    def keys(self):
+        self.keys_calls += 1
+        return ("safe",)
+
+    def items(self):
+        self.items_calls += 1
+        if callable(self._items):
+            return self._items()
+        return iter(self._items)
 
 
 def test_shipped_manifest_registers_confirmed_l1_and_candidate_l2_l3():
@@ -209,6 +238,25 @@ def test_duplicate_json_keys_are_rejected(tmp_path: Path):
         load_fixture_manifest(path)
 
 
+@pytest.mark.parametrize("escaped_key", [r"\ud800", r"bad\u000akey"])
+def test_duplicate_json_key_errors_are_ascii_safe(
+    tmp_path: Path, escaped_key: str
+):
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        '{"capture":{"format":"complex64-le",'
+        f'"{escaped_key}":1,"{escaped_key}":2}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FixtureManifestError, match="duplicate JSON key") as caught:
+        load_fixture_manifest(path)
+
+    encoded = str(caught.value).encode("utf-8")
+    assert b"\\u" in encoded or b"\\n" in encoded
+    assert b"\n" not in encoded
+
+
 @pytest.mark.parametrize(
     "text",
     ["{", "[] trailing", '{"capture": NaN}'],
@@ -232,6 +280,19 @@ def test_unknown_fields_are_rejected(tmp_path: Path):
 
     with pytest.raises(FixtureManifestError, match="unknown field.*unreviewed"):
         load_fixture_manifest(write_manifest(tmp_path, {"capture": entry}))
+
+
+@pytest.mark.parametrize("field", ["\ud800", "bad\nfield"])
+def test_unknown_field_errors_are_ascii_safe(tmp_path: Path, field: str):
+    entry = common_entry()
+    entry[field] = "value"
+
+    with pytest.raises(FixtureManifestError, match="unknown field") as caught:
+        load_fixture_manifest(write_manifest(tmp_path, {"capture": entry}))
+
+    encoded = str(caught.value).encode("utf-8")
+    assert b"\\u" in encoded or b"\\n" in encoded
+    assert b"\n" not in encoded
 
 
 @pytest.mark.parametrize(
@@ -408,6 +469,70 @@ def test_confirmed_fixtures_revalidates_and_snapshots_entries():
 
     assert required["capture"] == original
     assert required["capture"] is not original
+
+
+def test_confirmed_fixtures_uses_one_items_snapshot_not_lying_len_or_keys():
+    original = FixtureSpec(**confirmed_entry())
+    manifest = AdversarialMapping([("CON", original)])
+
+    with pytest.raises(FixtureManifestError, match="reserved device"):
+        confirmed_fixtures(manifest)
+
+    assert manifest.items_calls == 1
+    assert manifest.len_calls == 0
+    assert manifest.keys_calls == 0
+
+
+def test_confirmed_fixtures_rejects_257_items_despite_lying_len():
+    candidate = FixtureSpec(**common_entry())
+    manifest = AdversarialMapping(
+        [(f"capture_{index}", candidate) for index in range(MAX_FIXTURE_COUNT + 1)]
+    )
+
+    with pytest.raises(FixtureManifestError, match="fixture count.*limit"):
+        confirmed_fixtures(manifest)
+
+    assert manifest.items_calls == 1
+    assert manifest.len_calls == 0
+    assert manifest.keys_calls == 0
+
+
+def test_confirmed_fixtures_bounds_an_infinite_items_iterator():
+    candidate = FixtureSpec(**common_entry())
+
+    def guarded_infinite_items():
+        for index in range(MAX_FIXTURE_COUNT + 2):
+            if index > MAX_FIXTURE_COUNT:
+                raise AssertionError("items iterator was consumed past the bound")
+            yield (f"capture_{index}", candidate)
+
+    manifest = AdversarialMapping(guarded_infinite_items)
+
+    with pytest.raises(FixtureManifestError, match="fixture count.*limit"):
+        confirmed_fixtures(manifest)
+
+    assert manifest.items_calls == 1
+
+
+def test_confirmed_fixtures_rejects_non_tuple_items():
+    candidate = FixtureSpec(**common_entry())
+    manifest = AdversarialMapping([["capture", candidate]])
+
+    with pytest.raises(FixtureManifestError, match="2-tuple"):
+        confirmed_fixtures(manifest)
+
+
+def test_confirmed_fixtures_normalizes_mapping_protocol_failures():
+    def broken_items():
+        raise RuntimeError("bad\ud800\nprotocol")
+
+    manifest = AdversarialMapping(broken_items)
+
+    with pytest.raises(FixtureManifestError, match="mapping items") as caught:
+        confirmed_fixtures(manifest)
+
+    encoded = str(caught.value).encode("utf-8")
+    assert b"\n" not in encoded
 
 
 def test_confirmed_fixtures_rejects_non_fixture_spec_values():
