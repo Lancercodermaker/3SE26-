@@ -15,6 +15,7 @@ _COMMON_FIELDS = frozenset(
 )
 _VERIFIED_FIELDS = frozenset({"sha256", "expected_cmd_id", "expected_ascii"})
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_JAM_CODE_PATTERN = re.compile(r"[A-Za-z0-9]{6}\Z")
 _FIXTURE_NAME_PATTERN = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9_-]|\.(?=[A-Za-z0-9])){0,254}\Z"
 )
@@ -197,7 +198,14 @@ def _validate_entry(name: str, raw: object) -> FixtureSpec:
         )
 
     expected_ascii = raw["expected_ascii"]
-    if (
+    if expected_cmd_id == 0x0A06 and (
+        type(expected_ascii) is not str
+        or _JAM_CODE_PATTERN.fullmatch(expected_ascii) is None
+    ):
+        raise FixtureManifestError(
+            f"fixture {name!r} expected_ascii for 0x0A06 must match [A-Za-z0-9]{{6}}"
+        )
+    if expected_cmd_id != 0x0A06 and (
         type(expected_ascii) is not str
         or not expected_ascii
         or len(expected_ascii) > 256

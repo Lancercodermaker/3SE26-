@@ -244,6 +244,39 @@ def test_confirmed_values_use_canonical_types_and_ranges(
         load_fixture_manifest(write_manifest(tmp_path, {"capture": entry}))
 
 
+@pytest.mark.parametrize(
+    "bad_key",
+    ["abc", "abcdefg", "ABC!23", "AB 123", "密钥AB12"],
+)
+def test_confirmed_0a06_requires_exact_six_ascii_alphanumeric_key(
+    tmp_path: Path, bad_key: str
+):
+    entry = confirmed_entry()
+    entry["expected_ascii"] = bad_key
+
+    with pytest.raises(FixtureManifestError, match=r"0x0A06.*\[A-Za-z0-9\]\{6\}"):
+        load_fixture_manifest(write_manifest(tmp_path, {"capture": entry}))
+
+
+def test_confirmed_0a06_accepts_exact_six_ascii_alphanumeric_key(tmp_path: Path):
+    entry = confirmed_entry()
+    entry["expected_ascii"] = "aB09Zx"
+
+    manifest = load_fixture_manifest(write_manifest(tmp_path, {"capture": entry}))
+
+    assert manifest["capture"].expected_ascii == "aB09Zx"
+
+
+def test_other_commands_keep_general_printable_ascii_contract(tmp_path: Path):
+    entry = confirmed_entry()
+    entry["expected_cmd_id"] = 0x0102
+    entry["expected_ascii"] = "free-form !"
+
+    manifest = load_fixture_manifest(write_manifest(tmp_path, {"capture": entry}))
+
+    assert manifest["capture"].expected_ascii == "free-form !"
+
+
 @pytest.mark.parametrize("forbidden", ["sha256", "expected_cmd_id", "expected_ascii"])
 def test_candidate_entries_must_not_claim_unverified_results(
     tmp_path: Path, forbidden: str
