@@ -15,6 +15,7 @@ sdr_receiver_py_wrapper_competition:
     profile_path: ""
     match_slot: bo3_game1
     front_end_id: front_end_A
+    sdr_uri: ip:192.168.2.1
     decoder_primary: improved_v67
     decoder_shadow: ""
     acquisition_queue_size: 8

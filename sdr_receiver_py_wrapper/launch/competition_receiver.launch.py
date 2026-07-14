@@ -24,6 +24,7 @@ def generate_launch_description():
             DeclareLaunchArgument("profile_path", default_value=""),
             DeclareLaunchArgument("match_slot", default_value="bo3_game1"),
             DeclareLaunchArgument("front_end_id", default_value="front_end_A"),
+            DeclareLaunchArgument("sdr_uri", default_value="ip:192.168.2.1"),
             DeclareLaunchArgument("decoder_primary", default_value="improved_v67"),
             DeclareLaunchArgument("decoder_shadow", default_value=""),
             DeclareLaunchArgument("acquisition_queue_size", default_value="8"),
@@ -105,6 +106,7 @@ def generate_launch_description():
                         "profile_path": LaunchConfiguration("profile_path"),
                         "match_slot": LaunchConfiguration("match_slot"),
                         "front_end_id": LaunchConfiguration("front_end_id"),
+                        "sdr_uri": LaunchConfiguration("sdr_uri"),
                         "decoder_primary": LaunchConfiguration("decoder_primary"),
                         "decoder_shadow": LaunchConfiguration("decoder_shadow"),
                         "acquisition_queue_size": ParameterValue(

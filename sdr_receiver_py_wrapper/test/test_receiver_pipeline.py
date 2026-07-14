@@ -139,6 +139,15 @@ class RecordingDecoder:
         return DecoderStats(chunks_processed=len(self.calls))
 
 
+class ResetTrackingDecoder(RecordingDecoder):
+    def __init__(self, decoder_id, **kwargs):
+        super().__init__(decoder_id, **kwargs)
+        self.reset_calls = []
+
+    def reset(self, reason, context):
+        self.reset_calls.append((reason, context))
+
+
 class FakeOutput:
     def __init__(self, publisher_decoder_id="primary", *, fail_once=False):
         self.publisher_decoder_id = publisher_decoder_id
@@ -237,6 +246,30 @@ class FakeBackend:
         self.closed = True
 
 
+class SettingCountingBackend(FakeBackend):
+    SETTING_NAMES = {
+        "sample_rate",
+        "rx_lo",
+        "rx_rf_bandwidth",
+        "gain_control_mode_chan0",
+        "rx_hardwaregain_chan0",
+    }
+
+    def __init__(self, samples):
+        object.__setattr__(self, "setting_writes", {})
+        object.__setattr__(self, "fail_next_rx_lo", False)
+        super().__init__(samples)
+
+    def __setattr__(self, name, value):
+        if name in self.SETTING_NAMES:
+            writes = self.setting_writes
+            writes[name] = writes.get(name, 0) + 1
+            if name == "rx_lo" and self.fail_next_rx_lo:
+                object.__setattr__(self, "fail_next_rx_lo", False)
+                raise RuntimeError("rx_lo write failed")
+        object.__setattr__(self, name, value)
+
+
 def radio_settings(*, gain=20):
     return {
         "sample_rate_hz": 2_000_000,
@@ -321,8 +354,17 @@ def test_common_runtime_worker_stops_and_exposes_failure(receiver_node_module):
             raise RuntimeError("backend exploded")
 
     backend = FailingBackend(np.ones(2, dtype=np.complex64))
+    connection_attempts = 0
+
+    def backend_factory():
+        nonlocal connection_attempts
+        connection_attempts += 1
+        if connection_attempts > 1:
+            raise RuntimeError("replacement unavailable")
+        return backend
+
     runtime = receiver_node_module.CommonReceiverRuntime(
-        backend_factory=lambda: backend,
+        backend_factory=backend_factory,
         config=receiver_node_module.ReceiverFoundationConfig(),
         primary=RecordingDecoder("improved_v67"),
         output=FakeOutput("improved_v67"),
@@ -338,7 +380,7 @@ def test_common_runtime_worker_stops_and_exposes_failure(receiver_node_module):
     runtime.close()
 
     assert isinstance(runtime.worker_error, RuntimeError)
-    assert "acquisition read failed" in str(runtime.worker_error)
+    assert "failed to reconnect receiver" in str(runtime.worker_error)
     assert runtime.thread is not None and not runtime.thread.is_alive()
     assert backend.closed is True
 
@@ -546,6 +588,119 @@ def test_common_runtime_concurrent_close_is_idempotent_without_deadlock(
     assert recorder.closed_reasons == ["common receiver stopped"]
 
 
+def test_common_runtime_cleanup_deadline_preserves_retryable_stopping_state(
+    receiver_node_module,
+):
+    entered_close = threading.Event()
+    release_close = threading.Event()
+
+    class BlockingRecorder(ClosableMemoryRecorder):
+        def close(self, *, stopped_reason="closed"):
+            entered_close.set()
+            if not release_close.wait(timeout=2.0):
+                raise RuntimeError("recorder release timed out")
+            super().close(stopped_reason=stopped_reason)
+
+    backend = FakeBackend(np.ones(2, dtype=np.complex64))
+    recorder = BlockingRecorder()
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=recorder,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    with pytest.raises(TimeoutError, match="cleanup did not finish"):
+        runtime.close(timeout_sec=0.01)
+
+    assert entered_close.wait(timeout=1.0)
+    assert runtime._closed is False
+    assert runtime.status()["lifecycle"] == "STOPPING"
+    assert backend.close_calls == 1
+    release_close.set()
+    runtime.close(timeout_sec=1.0)
+
+    assert runtime.status()["lifecycle"] == "CLOSED"
+    assert backend.close_calls == 1
+    assert recorder.closed_reasons == ["common receiver stopped"]
+
+
+def test_common_runtime_cleanup_error_is_visible_and_failed_resource_retries(
+    receiver_node_module,
+):
+    class FailOnceRecorder(ClosableMemoryRecorder):
+        def __init__(self):
+            super().__init__()
+            self.close_attempts = 0
+
+        def close(self, *, stopped_reason="closed"):
+            self.close_attempts += 1
+            if self.close_attempts == 1:
+                raise RuntimeError("recorder close failed")
+            super().close(stopped_reason=stopped_reason)
+
+    backend = FakeBackend(np.ones(2, dtype=np.complex64))
+    recorder = FailOnceRecorder()
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=recorder,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    with pytest.raises(RuntimeError, match="recorder close failed"):
+        runtime.close(timeout_sec=1.0)
+
+    assert runtime.status()["cleanup_error"] == "recorder: recorder close failed"
+    assert runtime._closed is False
+    runtime.close(timeout_sec=1.0)
+
+    assert runtime._closed is True
+    assert backend.close_calls == 1
+    assert recorder.close_attempts == 2
+
+
+def test_common_runtime_status_is_rich_truthful_and_json_safe(
+    receiver_node_module,
+    tmp_path,
+):
+    recorder = StructuredRecorder(tmp_path, "status", queue_size=2)
+    backend = FakeBackend(np.ones(2, dtype=np.complex64))
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=recorder,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    status = runtime.status()
+    assert status["lifecycle"] == "OPEN"
+    assert status["worker_error"] is None
+    assert status["cleanup_error"] is None
+    assert status["queue"] == {"depth": 0, "capacity": 8}
+    assert status["device"]["connects"] == 1
+    assert status["acquisition"] == {
+        "queue_drops": 0,
+        "read_errors": 0,
+        "reconnects": 0,
+    }
+    assert status["recorder"]["enabled"] is True
+    assert status["recorder"]["stats"]["chunks_written"] == 0
+    assert status["recorder"]["paths"]["iq_path"].endswith("status.c64")
+    json.dumps(status, allow_nan=False)
+
+    runtime.close()
+
+
 def test_common_runtime_worker_failure_auto_closes_once_after_both_exit(
     receiver_node_module,
 ):
@@ -740,6 +895,224 @@ def test_common_runtime_uses_atomic_context_and_radio_snapshot(receiver_node_mod
     assert backend.rx_hardwaregain_chan0 == 30
 
 
+def test_common_runtime_only_configures_when_radio_settings_change(
+    receiver_node_module,
+):
+    backend = SettingCountingBackend(np.ones(2, dtype=np.complex64))
+    gain = 20
+
+    def settings():
+        return radio_settings(gain=gain)
+
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=settings,
+    )
+
+    runtime.process_once()
+    runtime.process_once()
+    assert set(backend.setting_writes.values()) == {1}
+
+    gain = 21
+    runtime.process_once()
+    runtime.close()
+
+    assert set(backend.setting_writes.values()) == {2}
+
+
+def test_common_runtime_failed_config_does_not_advance_cache_and_retries(
+    receiver_node_module,
+):
+    backend = SettingCountingBackend(np.ones(2, dtype=np.complex64))
+    gain = 20
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=lambda: radio_settings(gain=gain),
+    )
+    original = dict(runtime._applied_radio_settings)
+    gain = 22
+    backend.fail_next_rx_lo = True
+
+    with pytest.raises(RuntimeError, match="failed to configure receiver"):
+        runtime.acquire_once()
+
+    assert runtime._applied_radio_settings == original
+    chunk = runtime.acquire_once()
+    runtime.close()
+
+    assert chunk is not None
+    assert runtime._applied_radio_settings["rx_gain_db"] == 22
+    assert backend.setting_writes["rx_lo"] == 3
+
+
+def test_common_runtime_recovers_reconnect_and_resets_before_next_decode(
+    receiver_node_module,
+):
+    class FirstReadFails(FakeBackend):
+        def rx(self):
+            raise OSError("link lost")
+
+    failing = FirstReadFails(np.ones(2, dtype=np.complex64))
+    healthy = FakeBackend(np.ones(2, dtype=np.complex64))
+    backends = iter([failing, healthy])
+    decoder = ResetTrackingDecoder("improved_v67")
+    recorder = MemoryRecorder()
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: next(backends),
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=decoder,
+        output=FakeOutput("improved_v67"),
+        recorder=recorder,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    assert runtime.acquire_once() is None
+    result = runtime.process_once()
+    runtime.close()
+
+    assert result.chunk.chunk_id == 0
+    reasons = [reason for reason, _context in decoder.reset_calls]
+    assert reasons == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+    assert decoder.reset_calls[-1][1] == make_context()
+    discontinuity = next(
+        payload for kind, payload in recorder.events if kind == "discontinuity"
+    )
+    assert discontinuity["reason"] == "device_reconnect"
+    assert runtime.worker_error is None
+    assert runtime.acquisition.stats.reconnects == 1
+
+
+def test_common_runtime_resets_both_decoders_for_context_target_and_gap(
+    receiver_node_module,
+):
+    base = make_context()
+    target_changed = replace(base, target="JAM_L2_KEY", target_version=5)
+    context_changed = replace(
+        target_changed,
+        team="RED",
+        context_version=13,
+    )
+    contexts = iter(
+        [
+            base,
+            base,
+            target_changed,
+            context_changed,
+            context_changed,
+            context_changed,
+        ]
+    )
+    primary = ResetTrackingDecoder("improved_v67")
+    shadow = ResetTrackingDecoder("shadow")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow",
+            acquisition_queue_size=1,
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=lambda: next(contexts),
+        radio_settings_provider=radio_settings,
+    )
+
+    runtime.process_once()
+    runtime.process_once()
+    runtime.process_once()
+    assert runtime.acquire_once() is not None
+    assert runtime.acquire_once() is None
+    runtime.process_next(timeout_sec=0.0)
+    assert runtime.acquire_once() is not None
+    runtime.process_next(timeout_sec=0.0)
+    runtime.close()
+
+    expected = [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.TARGET_CHANGE,
+        receiver_node_module.ResetReason.CONTEXT_CHANGE,
+        receiver_node_module.ResetReason.MANUAL,
+    ]
+    assert [reason for reason, _ in primary.reset_calls] == expected
+    assert [reason for reason, _ in shadow.reset_calls] == expected
+
+
+def test_common_runtime_primary_reset_failure_is_fatal_before_shadow_or_decode(
+    receiver_node_module,
+):
+    class ResetFails(ResetTrackingDecoder):
+        def reset(self, reason, context):
+            super().reset(reason, context)
+            raise RuntimeError("primary reset failed")
+
+    primary = ResetFails("improved_v67")
+    shadow = ResetTrackingDecoder("shadow")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    with pytest.raises(RuntimeError, match="primary reset failed"):
+        runtime.process_once()
+    runtime.close()
+
+    assert primary.calls == []
+    assert shadow.reset_calls == []
+    assert shadow.calls == []
+
+
+def test_common_runtime_shadow_reset_failure_isolated_and_observable(
+    receiver_node_module,
+):
+    class ShadowResetFails(ResetTrackingDecoder):
+        def reset(self, reason, context):
+            raise RuntimeError("shadow reset failed")
+
+    primary = ResetTrackingDecoder("improved_v67")
+    shadow = ShadowResetFails("shadow")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    result = runtime.process_once()
+    runtime.close()
+
+    assert len(result.pipeline_result.primary_commands) == 1
+    assert result.pipeline_result.diagnostic_errors[0].stage == "shadow_decoder_reset"
+
+
 def test_common_runtime_invalid_pipeline_does_not_connect_device(receiver_node_module):
     factory_calls = []
     recorder = ClosableMemoryRecorder()
@@ -853,10 +1226,13 @@ def test_node_backend_factory_selects_hardware_without_connecting_early(
     factory_calls = []
     node = object.__new__(receiver_node_module.SdrReceiverPyWrapperNode)
     node.iq_source_path = ""
+    node.foundation_config = receiver_node_module.ReceiverFoundationConfig(
+        sdr_uri="ip:10.0.0.7"
+    )
     node.adapter = SimpleNamespace(
         module=SimpleNamespace(
             adi=SimpleNamespace(
-                Pluto=lambda: factory_calls.append("Pluto") or backend
+                Pluto=lambda uri: factory_calls.append(uri) or backend
             )
         ),
         get_core_config_snapshot=lambda: {"rx_buffer_size": 64},
@@ -865,7 +1241,7 @@ def test_node_backend_factory_selects_hardware_without_connecting_early(
     factory = node._common_backend_factory()
     assert factory_calls == []
     assert factory() is backend
-    assert factory_calls == ["Pluto"]
+    assert factory_calls == ["ip:10.0.0.7"]
     assert backend.rx_buffer_size == 64
 
 
@@ -883,6 +1259,9 @@ def test_node_backend_factory_selects_iq_file_source(
     }
     node = object.__new__(receiver_node_module.SdrReceiverPyWrapperNode)
     node.iq_source_path = str(path)
+    node.foundation_config = receiver_node_module.ReceiverFoundationConfig(
+        sdr_uri="ip:must-not-be-used"
+    )
     node.get_parameter = lambda name: SimpleNamespace(value=values[name])
     node.adapter = SimpleNamespace(
         get_core_config_snapshot=lambda: {"rx_buffer_size": 2},
@@ -1572,6 +1951,7 @@ def test_pipeline_rejects_wrong_input_contracts(receiver_node_module):
 
 
 EXPECTED_DEFAULTS = {
+    "sdr_uri": "ip:192.168.2.1",
     "decoder_primary": "improved_v67",
     "decoder_shadow": "",
     "acquisition_queue_size": 8,
@@ -1678,6 +2058,8 @@ def test_node_reads_common_parameters_into_live_foundation_config(
 @pytest.mark.parametrize(
     "changes",
     [
+        {"sdr_uri": ""},
+        {"sdr_uri": 7},
         {"decoder_primary": ""},
         {"decoder_shadow": 3},
         {"acquisition_queue_size": 0},
@@ -1835,3 +2217,133 @@ def test_common_controller_rejects_target_before_mutation_reservation_or_audit(
     assert pending_transition_attempts == []
     assert audit == []
     assert published == []
+
+
+def test_post_ros_commit_failure_quarantines_publication_without_rollback(
+    receiver_node_module,
+):
+    class CommitFailingValidator(CommandValidator):
+        def commit_publish_authorization(self, _command, _result):
+            return False
+
+    node = object.__new__(receiver_node_module.SdrReceiverPyWrapperNode)
+    node.primary_decoder_id = "improved_v67"
+    node.command_validator = CommitFailingValidator()
+    node.controller = receiver_node_module.CompetitionController(
+        key_publish_min_interval_sec=0.0
+    )
+    node.controller.update_context(
+        receiver_node_module.RadarContext(
+            self_id=9,
+            self_color=2,
+            radar_info_raw=0,
+            jam_level=3,
+            key_mutable=True,
+        )
+    )
+    node._controller_lock = threading.RLock()
+    node._pending_rf_transition = None
+    node.publication_indeterminate = None
+    node.publish_ros_outputs = True
+    node.run_mode = "competition"
+    node.latest_context = None
+    node.adapter = SimpleNamespace(get_stats_snapshot=lambda: {})
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: "stamp")
+    )
+    node.get_logger = lambda: SimpleNamespace(
+        debug=lambda _message: None,
+        warn=lambda _message: None,
+        info=lambda _message: None,
+    )
+    node._retry_pending_rf_transition_locked = lambda: True
+    transitions = []
+    node._set_receiver_target_or_profile = (
+        lambda target, **_kwargs: transitions.append(target)
+    )
+    published = []
+    node.jam_code_pub = SimpleNamespace(publish=published.append)
+    command = replace(
+        make_command("improved_v67", make_chunk(), make_context()),
+        target="JAM_L3_KEY",
+        evidence={"level": 3},
+    )
+
+    with pytest.raises(
+        receiver_node_module.PublicationIndeterminateError,
+        match="could not be committed",
+    ):
+        receiver_node_module.NodeCommandOutput(node).publish(command)
+
+    assert len(published) == 1
+    assert node.controller.status_snapshot()["published_key_counts"] == {"3": 1}
+    assert node.controller.desired_target == "INFO"
+    assert transitions == ["INFO"]
+    assert node.command_validator._pending_authorizations == {}
+
+    result = receiver_node_module.NodeCommandOutput(node).publish(command)
+    assert result.accepted is False
+    assert "indeterminate" in result.reason
+    assert len(published) == 1
+
+    result = node._handle_decoded_command(command)
+    assert result.accepted is False
+    assert "indeterminate" in result.reason
+    assert len(published) == 1
+
+
+def test_destroy_node_timeout_preserves_runtime_and_skips_unsafe_teardown(
+    receiver_node_module,
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        receiver_node_module.Node,
+        "destroy_node",
+        lambda _self: calls.append("super") or True,
+        raising=False,
+    )
+    node = object.__new__(receiver_node_module.SdrReceiverPyWrapperNode)
+    node.common_runtime = SimpleNamespace(
+        close=lambda: (_ for _ in ()).throw(TimeoutError("still running"))
+    )
+    node.run_mode = "competition"
+    node.adapter = SimpleNamespace(
+        stop=lambda: calls.append("stop"),
+        restore_patches=lambda: calls.append("restore"),
+    )
+    node.iq_recorder = SimpleNamespace(close=lambda: calls.append("recorder"))
+
+    with pytest.raises(TimeoutError, match="still running"):
+        node.destroy_node()
+
+    assert calls == []
+
+
+def test_main_shuts_rclpy_down_when_node_construction_fails(
+    receiver_node_module,
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        receiver_node_module.rclpy,
+        "init",
+        lambda **_kwargs: calls.append("init"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        receiver_node_module.rclpy,
+        "shutdown",
+        lambda: calls.append("shutdown"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        receiver_node_module,
+        "SdrReceiverPyWrapperNode",
+        lambda: (_ for _ in ()).throw(RuntimeError("construction failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        receiver_node_module.main()
+
+    assert calls == ["init", "shutdown"]

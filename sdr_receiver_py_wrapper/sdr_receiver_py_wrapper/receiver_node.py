@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import numbers
@@ -37,7 +37,7 @@ from .profile_import import AdaptiveProfileLoadError, load_adaptive_profile
 from .acquisition import AcquisitionEngine
 from .device_session import DeviceSession
 from .iq_file_source import IqFilePluto
-from .models import DecodedCommand, DecodeContext, IqChunk
+from .models import DecodedCommand, DecodeContext, IqChunk, ResetReason
 from . import rf_safety
 from .structured_recorder import StructuredRecorder, _json_snapshot
 from .v67_decoder import V67Decoder
@@ -49,6 +49,10 @@ PRIMARY_DECODER_ID = "improved_v67"
 
 class ReceiverPipelineError(RuntimeError):
     """The common receiver pipeline could not preserve its processing contract."""
+
+
+class PublicationIndeterminateError(RuntimeError):
+    """ROS accepted a command whose validator commit could not be proven."""
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,7 @@ class ReceiverPipelineResult:
 class ReceiverFoundationConfig:
     """Validated construction inputs shared by acquisition, RF, and recording."""
 
+    sdr_uri: str = "ip:192.168.2.1"
     decoder_primary: str = PRIMARY_DECODER_ID
     decoder_shadow: str = ""
     acquisition_queue_size: int = 8
@@ -79,6 +84,8 @@ class ReceiverFoundationConfig:
     initial_rx_gain: int = 20
 
     def __post_init__(self) -> None:
+        if not isinstance(self.sdr_uri, str) or not self.sdr_uri.strip():
+            raise ValueError("sdr_uri must be a non-empty string")
         if not isinstance(self.decoder_primary, str) or not self.decoder_primary:
             raise ValueError("decoder_primary must be a non-empty string")
         if not isinstance(self.decoder_shadow, str):
@@ -165,6 +172,12 @@ class CommonReceiverRuntime:
         self.last_rf_state: Optional[rf_safety.RfState] = None
         self._closed = False
         self._resources_closed = False
+        self._device_close_done = False
+        self._recorder_close_done = recorder is None
+        self._cleanup_thread: Optional[threading.Thread] = None
+        self._cleanup_done = threading.Event()
+        self.cleanup_error: Optional[str] = None
+        self._lifecycle = "OPEN"
         self._lifecycle_lock = threading.RLock()
         self._io_lock = threading.Lock()
         self._resource_lock = threading.Lock()
@@ -173,6 +186,10 @@ class CommonReceiverRuntime:
         self._starting_workers = False
         self._run_active = threading.Event()
         self._shutdown_reason: Optional[str] = None
+        self._applied_radio_settings: Optional[dict] = None
+        self._pending_device_reconnect = False
+        self._last_decode_context: Optional[DecodeContext] = None
+        self._expected_next_sample: Optional[int] = None
         self._context_condition = threading.Condition()
         self._chunk_contexts: dict[int, DecodeContext] = {}
         self._error_lock = threading.Lock()
@@ -228,10 +245,27 @@ class CommonReceiverRuntime:
                 raise TypeError("context_provider must return a DecodeContext")
             self._sync_device_settings(settings)
             self._set_acquisition_versions(context)
-            read_errors_before = self.acquisition.stats.read_errors
+            stats_before = self.acquisition.stats
             produced = self.acquisition.read_once()
+            stats_after = self.acquisition.stats
             if produced is None:
-                if self.acquisition.stats.read_errors > read_errors_before:
+                if stats_after.reconnects > stats_before.reconnects:
+                    self._pending_device_reconnect = True
+                    if self.recorder is not None:
+                        accepted = self.recorder.write_event(
+                            "discontinuity",
+                            {
+                                "reason": "device_reconnect",
+                                "reconnects": stats_after.reconnects,
+                                "read_errors": stats_after.read_errors,
+                            },
+                        )
+                        if accepted is not True:
+                            raise ReceiverPipelineError(
+                                "failed to record reconnect discontinuity"
+                            )
+                    return None
+                if stats_after.read_errors > stats_before.read_errors:
                     raise RuntimeError("acquisition read failed")
                 return None
             with self._context_condition:
@@ -259,6 +293,11 @@ class CommonReceiverRuntime:
         metrics, state = self.config.measure_and_classify(queued.samples)
         chunk = replace(queued, rf_metrics=metrics)
         self.last_rf_state = state
+        reset_diagnostics = []
+        for reason in self._reset_reasons(chunk, context):
+            reset_diagnostics.extend(
+                self.pipeline.reset_decoders(reason, context, chunk)
+            )
         if self.recorder is not None:
             accepted = self.recorder.write_event(
                 "rf_state",
@@ -282,11 +321,50 @@ class CommonReceiverRuntime:
             if accepted is not True:
                 raise ReceiverPipelineError("failed to record RF state event")
         result = self.pipeline.process(chunk, context)
+        self._last_decode_context = context
+        self._expected_next_sample = (
+            chunk.first_sample_index + int(chunk.samples.size)
+        )
+        self._pending_device_reconnect = False
+        if reset_diagnostics:
+            result = replace(
+                result,
+                diagnostic_errors=(
+                    *reset_diagnostics,
+                    *result.diagnostic_errors,
+                ),
+            )
         return CommonRuntimeResult(
             chunk=chunk,
             rf_state=state,
             pipeline_result=result,
         )
+
+    def _reset_reasons(self, chunk, context) -> tuple[ResetReason, ...]:
+        reasons = []
+        previous = self._last_decode_context
+        if previous is None:
+            reasons.append(ResetReason.STARTUP)
+        if self._pending_device_reconnect:
+            reasons.append(ResetReason.DEVICE_RECONNECT)
+        if previous is not None:
+            if (
+                context.context_version != previous.context_version
+                or context.team != previous.team
+                or context.profile != previous.profile
+            ):
+                reasons.append(ResetReason.CONTEXT_CHANGE)
+            elif (
+                context.target_version != previous.target_version
+                or context.target != previous.target
+            ):
+                reasons.append(ResetReason.TARGET_CHANGE)
+        if (
+            self._expected_next_sample is not None
+            and chunk.first_sample_index != self._expected_next_sample
+        ):
+            reasons.append(ResetReason.MANUAL)
+        return tuple(reasons)
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -295,6 +373,7 @@ class CommonReceiverRuntime:
             if self._run_active.is_set():
                 return
             self.stop_event.clear()
+            self._lifecycle = "STARTING"
             self.worker_error = None
             self._shutdown_reason = None
             self.acquisition_thread = threading.Thread(
@@ -341,8 +420,14 @@ class CommonReceiverRuntime:
                         "common receiver start rollback timed out"
                     ) from exc
                 self._run_active.clear()
-                self._close_resources_once("common receiver start failed")
-                self._closed = True
+                cleanup_done = self._start_cleanup(
+                    "common receiver start failed"
+                )
+                cleanup_done.wait(timeout=3.0)
+                with self._resource_lock:
+                    resources_closed = self._resources_closed
+                self._closed = resources_closed
+                self._lifecycle = "CLOSED" if resources_closed else "STOPPING"
                 raise
             finally:
                 should_cleanup = False
@@ -357,13 +442,16 @@ class CommonReceiverRuntime:
                             self._shutdown_reason
                             or "common receiver stopped"
                         )
-                    self._close_resources_once(reason)
+                    self._start_cleanup(reason)
+            if not self.stop_event.is_set():
+                self._lifecycle = "RUNNING"
 
     def close(self, *, timeout_sec: float = 3.0) -> None:
         with self._lifecycle_lock:
             if self._closed:
                 return
             self.stop_event.set()
+            self._lifecycle = "STOPPING"
             with self._error_lock:
                 if self._shutdown_reason is None:
                     self._shutdown_reason = "common receiver stopped"
@@ -387,11 +475,37 @@ class CommonReceiverRuntime:
                     + ", ".join(alive)
                 )
             self._run_active.clear()
-            self._close_resources_once(reason)
+            cleanup_done = self._start_cleanup(reason)
+            if not cleanup_done.wait(
+                timeout=max(0.0, deadline - time.monotonic())
+            ):
+                raise TimeoutError("common receiver cleanup did not finish")
+            with self._resource_lock:
+                cleanup_error = self.cleanup_error
+                resources_closed = self._resources_closed
+            if cleanup_error is not None:
+                raise RuntimeError(cleanup_error)
+            if not resources_closed:
+                raise RuntimeError("common receiver cleanup is incomplete")
             self._closed = True
+            self._lifecycle = "CLOSED"
 
     def status(self) -> dict:
+        recorder_status = {"enabled": self.recorder is not None}
+        if self.recorder is not None:
+            stats = getattr(self.recorder, "stats", None)
+            if stats is not None:
+                recorder_status["stats"] = _json_snapshot(
+                    asdict(stats) if hasattr(stats, "__dataclass_fields__") else stats
+                )
+            recorder_status["paths"] = {
+                name: (None if getattr(self.recorder, name, None) is None else str(
+                    getattr(self.recorder, name)
+                ))
+                for name in ("iq_path", "chunks_path", "events_path", "summary_path")
+            }
         return {
+            "lifecycle": self._lifecycle,
             "running": any(
                 thread is not None and thread.is_alive()
                 for thread in (self.acquisition_thread, self.processing_thread)
@@ -399,6 +513,14 @@ class CommonReceiverRuntime:
             "worker_error": (
                 None if self.worker_error is None else str(self.worker_error)
             ),
+            "cleanup_error": self.cleanup_error,
+            "queue": {
+                "depth": self.acquisition._queue.qsize(),
+                "capacity": self.acquisition._queue.maxsize,
+            },
+            "device": asdict(self.device.stats),
+            "acquisition": asdict(self.acquisition.stats),
+            "recorder": recorder_status,
             "rf_state": (
                 None if self.last_rf_state is None else self.last_rf_state.value
             ),
@@ -441,24 +563,75 @@ class CommonReceiverRuntime:
         if should_cleanup:
             with self._error_lock:
                 reason = self._shutdown_reason or "common receiver stopped"
-            self._close_resources_once(reason)
+            self._lifecycle = "STOPPING"
+            self._start_cleanup(reason)
 
     def _close_resources_once(self, reason: str) -> None:
+        self._run_cleanup_attempt(reason)
+
+    def _start_cleanup(self, reason: str) -> threading.Event:
         with self._resource_lock:
             if self._resources_closed:
-                return
-            self._resources_closed = True
-            if self.device is not None:
-                try:
-                    self.device.close()
-                except BaseException:
-                    pass
-            close_recorder = getattr(self.recorder, "close", None)
-            if callable(close_recorder):
-                try:
-                    close_recorder(stopped_reason=reason)
-                except BaseException:
-                    pass
+                self._cleanup_done.set()
+                return self._cleanup_done
+            if self._cleanup_thread is not None and not self._cleanup_done.is_set():
+                return self._cleanup_done
+            self.cleanup_error = None
+            self._cleanup_done = threading.Event()
+            self._cleanup_thread = threading.Thread(
+                target=self._run_cleanup_attempt,
+                args=(reason,),
+                name="sdr-common-cleanup",
+                daemon=True,
+            )
+            cleanup_thread = self._cleanup_thread
+            cleanup_done = self._cleanup_done
+        cleanup_thread.start()
+        return cleanup_done
+
+    def _run_cleanup_attempt(self, reason: str) -> None:
+        errors = []
+        with self._resource_lock:
+            close_device = not self._device_close_done and self.device is not None
+        if close_device:
+            try:
+                self.device.close()
+            except BaseException as exc:
+                errors.append(f"device: {exc}")
+            else:
+                with self._resource_lock:
+                    self._device_close_done = True
+        else:
+            with self._resource_lock:
+                if self.device is None:
+                    self._device_close_done = True
+
+        with self._resource_lock:
+            close_recorder = (
+                None
+                if self._recorder_close_done
+                else getattr(self.recorder, "close", None)
+            )
+        if callable(close_recorder):
+            try:
+                close_recorder(stopped_reason=reason)
+            except BaseException as exc:
+                errors.append(f"recorder: {exc}")
+            else:
+                with self._resource_lock:
+                    self._recorder_close_done = True
+        elif close_recorder is not None:
+            errors.append("recorder: close is not callable")
+        else:
+            with self._resource_lock:
+                self._recorder_close_done = True
+
+        with self._resource_lock:
+            self.cleanup_error = "; ".join(errors) or None
+            self._resources_closed = (
+                self._device_close_done and self._recorder_close_done
+            )
+            self._cleanup_done.set()
 
     def _context_for_chunk(self, chunk_id, timeout_sec):
         deadline = time.monotonic() + max(0.05, float(timeout_sec))
@@ -496,12 +669,15 @@ class CommonReceiverRuntime:
         }
         if set(settings) != required:
             raise ValueError("radio settings provider returned invalid keys")
+        if settings == self._applied_radio_settings:
+            return
         self.device.configure(
             sample_rate=settings["sample_rate_hz"],
             lo_hz=settings["lo_hz"],
             rf_bandwidth=settings["rf_bandwidth_hz"],
             gain=settings["rx_gain_db"],
         )
+        self._applied_radio_settings = settings
 
 
 def _create_decoder_plugin(decoder_id: str, core):
@@ -605,6 +781,61 @@ class ReceiverPipeline:
             )
         ):
             raise TypeError(f"{role} decoder is not protocol compatible")
+
+    def reset_decoders(self, reason, context, chunk):
+        payload = {
+            "reason": reason.value,
+            "chunk_id": chunk.chunk_id,
+            "context_version": context.context_version,
+            "target_version": context.target_version,
+            "target": context.target,
+            "team": context.team,
+            "profile": context.profile,
+        }
+        try:
+            self.primary.reset(reason, context)
+        except Exception as exc:
+            self._record_diagnostic(
+                "decoder_reset_error",
+                {**payload, "role": "primary", "error": str(exc)},
+            )
+            raise
+        self._record_event(
+            "decoder_reset",
+            {**payload, "role": "primary"},
+        )
+
+        diagnostics = []
+        if self.shadow is not None:
+            try:
+                self.shadow.reset(reason, context)
+                diagnostic_error = self._record_diagnostic(
+                    "decoder_reset",
+                    {**payload, "role": "shadow"},
+                )
+            except Exception as exc:
+                diagnostic_error = self._record_diagnostic(
+                    "decoder_reset_error",
+                    {**payload, "role": "shadow", "error": str(exc)},
+                )
+                reason_text = f"shadow reset failed: {exc}"
+                if diagnostic_error is not None:
+                    reason_text += f"; {diagnostic_error}"
+                diagnostics.append(
+                    PipelineDiagnosticError(
+                        stage="shadow_decoder_reset",
+                        reason=reason_text,
+                    )
+                )
+            else:
+                if diagnostic_error is not None:
+                    diagnostics.append(
+                        PipelineDiagnosticError(
+                            stage="shadow_decoder_reset_diagnostic",
+                            reason=f"shadow {diagnostic_error}",
+                        )
+                    )
+        return tuple(diagnostics)
 
     def process(
         self,
@@ -1269,6 +1500,7 @@ class SdrReceiverPyWrapperNode(Node):
 
         self._controller_lock = threading.RLock()
         self._pending_rf_transition: Optional[_PendingRfTransition] = None
+        self.publication_indeterminate: Optional[str] = None
         self.controller = CompetitionController(
             max_jam_break_level=int(self.get_parameter("max_jam_break_level").value),
             key_publish_min_interval_sec=float(
@@ -1341,18 +1573,45 @@ class SdrReceiverPyWrapperNode(Node):
             )
 
     def destroy_node(self) -> bool:
+        errors = []
+        common_runtime = getattr(self, "common_runtime", None)
+        if common_runtime is not None:
+            try:
+                common_runtime.close()
+            except TimeoutError:
+                # The core/device may still be in use.  Preserve the node and
+                # patches so a later destroy attempt can finish safely.
+                raise
+            except BaseException as exc:
+                errors.append(("common runtime", exc))
+        adapter = getattr(self, "adapter", None)
+        if adapter is not None and getattr(self, "run_mode", "debug") == "debug":
+            try:
+                adapter.stop()
+            except BaseException as exc:
+                errors.append(("adapter stop", exc))
+        if adapter is not None:
+            try:
+                adapter.restore_patches()
+            except BaseException as exc:
+                errors.append(("adapter restore", exc))
+        iq_recorder = getattr(self, "iq_recorder", None)
+        if iq_recorder is not None:
+            try:
+                iq_recorder.close()
+            except BaseException as exc:
+                errors.append(("IQ recorder", exc))
         result = False
         try:
-            common_runtime = getattr(self, "common_runtime", None)
-            if common_runtime is not None:
-                common_runtime.close()
-            if getattr(self, "run_mode", "debug") == "debug":
-                self.adapter.stop()
-            self.adapter.restore_patches()
-            if self.iq_recorder is not None:
-                self.iq_recorder.close()
-        finally:
             result = super().destroy_node()
+        except BaseException as exc:
+            errors.append(("ROS node", exc))
+        if errors:
+            if len(errors) == 1:
+                raise errors[0][1]
+            raise RuntimeError(
+                "; ".join(f"{phase}: {exc}" for phase, exc in errors)
+            )
         return result
 
     def _declare_parameters(self) -> None:
@@ -1386,6 +1645,7 @@ class SdrReceiverPyWrapperNode(Node):
         self.declare_parameter("profile_path", "")
         self.declare_parameter("match_slot", "bo3_game1")
         self.declare_parameter("front_end_id", "front_end_A")
+        self.declare_parameter("sdr_uri", "ip:192.168.2.1")
         self.declare_parameter("decoder_primary", "improved_v67")
         self.declare_parameter("decoder_shadow", "")
         self.declare_parameter("acquisition_queue_size", 8)
@@ -1409,6 +1669,7 @@ class SdrReceiverPyWrapperNode(Node):
 
     def _load_receiver_foundation_config(self) -> ReceiverFoundationConfig:
         return ReceiverFoundationConfig(
+            sdr_uri=self.get_parameter("sdr_uri").value,
             decoder_primary=self.get_parameter("decoder_primary").value,
             decoder_shadow=self.get_parameter("decoder_shadow").value,
             acquisition_queue_size=self.get_parameter("acquisition_queue_size").value,
@@ -1515,7 +1776,7 @@ class SdrReceiverPyWrapperNode(Node):
             raise RuntimeError("receiver core has no callable adi.Pluto backend")
 
         def create_hardware_backend():
-            backend = pluto_factory()
+            backend = pluto_factory(self.foundation_config.sdr_uri)
             if rx_buffer_size > 0:
                 backend.rx_buffer_size = rx_buffer_size
             return backend
@@ -1908,6 +2169,18 @@ class SdrReceiverPyWrapperNode(Node):
     ) -> ValidationResult:
         """Apply the controller transaction before the sole ROS command gate."""
 
+        indeterminate = getattr(self, "publication_indeterminate", None)
+        if indeterminate is not None:
+            result = ValidationResult(
+                False,
+                "publication state is indeterminate; command output is quarantined: "
+                + indeterminate,
+            )
+            if before_publish is not None:
+                before_publish(result)
+            self.get_logger().debug(result.reason)
+            return result
+
         if command.decoder_id != self.primary_decoder_id:
             result = ValidationResult(
                 False,
@@ -1978,6 +2251,7 @@ class SdrReceiverPyWrapperNode(Node):
             self._retry_pending_rf_transition_locked()
             controller_snapshot = self._snapshot_jam_key_controller_state()
             publication_committed = False
+            publication_error = None
             try:
                 decision = self.controller.handle_jam_key(
                     level=prevalidation.level,
@@ -2032,6 +2306,12 @@ class SdrReceiverPyWrapperNode(Node):
                     )
                     if before_publish is not None:
                         before_publish(result)
+            except PublicationIndeterminateError as exc:
+                # ROS publication cannot be rolled back.  Keep the controller
+                # mutation, complete its RF transition, then fail-stop output.
+                publication_committed = True
+                publication_error = exc
+                result = prevalidation
             except Exception:
                 if not publication_committed:
                     self._restore_jam_key_controller_state(controller_snapshot)
@@ -2056,6 +2336,8 @@ class SdrReceiverPyWrapperNode(Node):
                 self._pending_rf_transition = None
             elif decision.reason:
                 self.get_logger().debug(decision.reason)
+            if publication_error is not None:
+                raise publication_error
             return result
 
     def _get_controller_lock(self):
@@ -2150,6 +2432,18 @@ class SdrReceiverPyWrapperNode(Node):
     ) -> ValidationResult:
         """Gate one decoder command into the sole production Jam publisher."""
 
+        indeterminate = getattr(self, "publication_indeterminate", None)
+        if indeterminate is not None:
+            result = ValidationResult(
+                False,
+                "publication state is indeterminate; command output is quarantined: "
+                + indeterminate,
+            )
+            if before_publish is not None:
+                before_publish(result)
+            self.get_logger().debug(result.reason)
+            return result
+
         if command.decoder_id != self.primary_decoder_id:
             result = ValidationResult(
                 False,
@@ -2189,6 +2483,18 @@ class SdrReceiverPyWrapperNode(Node):
         before_publish=None,
     ) -> ValidationResult:
         """Publish a command whose retry policy is owned by the controller."""
+
+        indeterminate = getattr(self, "publication_indeterminate", None)
+        if indeterminate is not None:
+            result = ValidationResult(
+                False,
+                "publication state is indeterminate; command output is quarantined: "
+                + indeterminate,
+            )
+            if before_publish is not None:
+                before_publish(result)
+            self.get_logger().debug(result.reason)
+            return result
 
         if command.decoder_id != self.primary_decoder_id:
             result = ValidationResult(
@@ -2299,6 +2605,12 @@ class SdrReceiverPyWrapperNode(Node):
         command: DecodedCommand,
         result: ValidationResult,
     ) -> None:
+        indeterminate = getattr(self, "publication_indeterminate", None)
+        if indeterminate is not None:
+            self.command_validator.abort_publish_authorization(command, result)
+            raise PublicationIndeterminateError(
+                "command output is quarantined: " + indeterminate
+            )
         if command.decoder_id != self.primary_decoder_id:
             self.command_validator.abort_publish_authorization(
                 command,
@@ -2333,7 +2645,10 @@ class SdrReceiverPyWrapperNode(Node):
             self.command_validator.abort_publish_authorization(command, result)
             raise
         if not self.command_validator.commit_publish_authorization(command, result):
-            raise RuntimeError("Jam publisher transaction could not be committed")
+            self.command_validator.abort_publish_authorization(command, result)
+            message = "Jam publisher transaction could not be committed"
+            self.publication_indeterminate = message
+            raise PublicationIndeterminateError(message)
         try:
             self.get_logger().info(
                 f"published jam code level={msg.level} team={msg.team} "
@@ -2355,6 +2670,16 @@ class SdrReceiverPyWrapperNode(Node):
             rx_team = self._current_team()
             competition_status = self.controller.status_snapshot()
 
+        common_status = self._common_runtime_status()
+        iq_recording = (
+            common_status.get("recorder", {"enabled": False})
+            if self.run_mode == "competition"
+            else (
+                {"enabled": False}
+                if self.iq_recorder is None
+                else self.iq_recorder.status()
+            )
+        )
         status = {
             "run_mode": self.run_mode,
             "own_team": own_team,
@@ -2383,11 +2708,12 @@ class SdrReceiverPyWrapperNode(Node):
                 "loaded": bool(self.profile_config),
                 "config": self.profile_config,
             },
-            "iq_recording": {"enabled": False}
-            if self.iq_recorder is None
-            else self.iq_recorder.status(),
+            "iq_recording": iq_recording,
             "competition": competition_status,
-            "common_runtime": self._common_runtime_status(),
+            "publication_indeterminate": getattr(
+                self, "publication_indeterminate", None
+            ),
+            "common_runtime": common_status,
             "core": adapter_status,
             "receiver_thread_exception": None
             if self.adapter.receiver_exception is None
@@ -2438,12 +2764,16 @@ class SdrReceiverPyWrapperNode(Node):
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    node = SdrReceiverPyWrapperNode()
+    node = None
     try:
+        node = SdrReceiverPyWrapperNode()
         rclpy.spin(node)
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if node is not None:
+                node.destroy_node()
+        finally:
+            rclpy.shutdown()
 
 
 def _json_safe(value):
