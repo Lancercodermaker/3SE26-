@@ -34,10 +34,59 @@ _PROFILE_FREQUENCIES = {
     ("BLUE", "L2"): 434_620_000,
     ("BLUE", "L3"): 434_320_000,
 }
+_MISSING = object()
 
 
 class UpstreamDecoderUnavailableError(RuntimeError):
     """Raised when decode is requested without a supplied pure backend."""
+
+
+def _validated_frame_fields(frame) -> tuple[int, bytes, int]:
+    cmd_id = frame.cmd_id
+    if type(cmd_id) is not int:
+        raise TypeError("frame cmd_id must be an exact int")
+    if not 0 <= cmd_id <= 0xFFFF:
+        raise ValueError("frame cmd_id must be in range 0..65535")
+
+    seq = frame.seq
+    if type(seq) is not int:
+        raise TypeError("frame seq must be an exact int")
+    if not 0 <= seq <= 0xFF:
+        raise ValueError("frame seq must be in range 0..255")
+
+    data = frame.data
+    if type(data) in (bytes, bytearray):
+        payload = bytes(data)
+    elif type(data) is memoryview:
+        if (
+            data.ndim != 1
+            or data.itemsize != 1
+            or data.format not in ("B", "b", "c")
+            or not data.c_contiguous
+        ):
+            raise ValueError(
+                "frame data memoryview must be one-dimensional bytes"
+            )
+        payload = data.tobytes()
+    else:
+        raise TypeError(
+            "frame data must be bytes, bytearray, or memoryview"
+        )
+    return cmd_id, payload, seq
+
+
+def _normalized_text(
+    value,
+    field_name: str,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    if type(value) is not str:
+        raise TypeError(f"reset context {field_name} must be an exact str")
+    normalized = value.strip().upper()
+    if not normalized and not allow_empty:
+        raise ValueError(f"reset context {field_name} must not be empty")
+    return normalized
 
 
 class UpstreamDecoder:
@@ -73,9 +122,8 @@ class UpstreamDecoder:
             normalized_context = (
                 context.team.strip().upper(),
                 context.target.strip().upper(),
-                context.profile.strip().upper(),
             )
-            active_context = (profile.team, profile.target, profile.name)
+            active_context = (profile.team, profile.target)
             if normalized_context != active_context:
                 raise ValueError(
                     "decode context does not match active profile"
@@ -102,27 +150,29 @@ class UpstreamDecoder:
                 sample_rate_hz=chunk.sample_rate_hz,
                 profile=profile,
             )
-            commands = [
-                DecodedCommand(
-                    cmd_id=frame.cmd_id,
-                    payload=bytes(frame.data),
-                    decoder_id=self.decoder_id,
-                    profile=profile.name,
-                    crc8_ok=True,
-                    crc16_ok=True,
-                    crc_mode="kermit-x3014",
-                    first_sample_index=chunk.first_sample_index,
-                    last_sample_index=(
-                        chunk.first_sample_index + len(chunk.samples) - 1
-                    ),
-                    receive_wall_time=chunk.rx_wall_time,
-                    target=profile.target,
-                    team=profile.team,
-                    context_version=context.context_version,
-                    evidence={"upstream_seq": frame.seq},
+            commands = []
+            for frame in frames:
+                cmd_id, payload, seq = _validated_frame_fields(frame)
+                commands.append(
+                    DecodedCommand(
+                        cmd_id=cmd_id,
+                        payload=payload,
+                        decoder_id=self.decoder_id,
+                        profile=profile.name,
+                        crc8_ok=True,
+                        crc16_ok=True,
+                        crc_mode="kermit-x3014",
+                        first_sample_index=chunk.first_sample_index,
+                        last_sample_index=(
+                            chunk.first_sample_index + len(chunk.samples) - 1
+                        ),
+                        receive_wall_time=chunk.rx_wall_time,
+                        target=profile.target,
+                        team=profile.team,
+                        context_version=context.context_version,
+                        evidence={"upstream_seq": seq},
+                    )
                 )
-                for frame in frames
-            ]
         except Exception:
             with self._stats_lock:
                 self._decode_errors += 1
@@ -134,31 +184,40 @@ class UpstreamDecoder:
         return commands
 
     def reset(self, reason: ResetReason, context: DecodeContext) -> None:
-        team = context.team.strip().upper()
-        target = context.target.strip().upper()
         try:
-            center_freq = _PROFILE_FREQUENCIES[(team, target)]
-        except KeyError:
+            if not isinstance(reason, ResetReason):
+                raise TypeError("reset reason must be a ResetReason")
+            if not isinstance(context, DecodeContext):
+                raise TypeError("reset context must be a DecodeContext")
+            team = _normalized_text(context.team, "team", allow_empty=True)
+            target = _normalized_text(
+                context.target,
+                "target",
+                allow_empty=True,
+            )
+            _normalized_text(context.profile, "profile")
+            try:
+                center_freq = _PROFILE_FREQUENCIES[(team, target)]
+            except KeyError:
+                raise ValueError(
+                    "unsupported upstream profile: "
+                    f"team={team!r}, target={target!r}"
+                ) from None
+            profile = ActiveProfile(
+                name=f"{team}-{target}",
+                team=team,
+                target=target,
+                center_freq=center_freq,
+            )
+            reset_backend = getattr(self._backend, "reset", _MISSING)
+            if reset_backend is not _MISSING:
+                if not callable(reset_backend):
+                    raise TypeError("backend reset hook must be callable")
+                reset_backend(reason=reason, profile=profile)
+        except Exception:
             with self._stats_lock:
                 self._decode_errors += 1
-            raise ValueError(
-                "unsupported upstream profile: "
-                f"team={team!r}, target={target!r}"
-            ) from None
-        profile = ActiveProfile(
-            name=f"{team}-{target}",
-            team=team,
-            target=target,
-            center_freq=center_freq,
-        )
-        reset_backend = getattr(self._backend, "reset", None)
-        if callable(reset_backend):
-            try:
-                reset_backend(reason=reason, profile=profile)
-            except Exception:
-                with self._stats_lock:
-                    self._decode_errors += 1
-                raise
+            raise
         with self._stats_lock:
             self._active_profile = profile
             self._resets += 1

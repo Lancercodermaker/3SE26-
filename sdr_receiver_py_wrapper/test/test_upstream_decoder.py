@@ -185,6 +185,92 @@ def test_backend_reset_failure_preserves_previous_profile_transactionally():
     assert decoder.stats().decode_errors == 1
 
 
+@pytest.mark.parametrize(
+    ("reason", "context", "message"),
+    [
+        ("manual", make_context(), "reason"),
+        (ResetReason.MANUAL, None, "context"),
+        (
+            ResetReason.MANUAL,
+            DecodeContext(None, "L1", "competition", 3, 4),
+            "team",
+        ),
+        (
+            ResetReason.MANUAL,
+            DecodeContext("BLUE", 1, "competition", 3, 4),
+            "target",
+        ),
+        (
+            ResetReason.MANUAL,
+            DecodeContext("BLUE", "L1", None, 3, 4),
+            "profile",
+        ),
+        (
+            ResetReason.MANUAL,
+            DecodeContext("BLUE", "L1", "   ", 3, 4),
+            "profile",
+        ),
+    ],
+)
+def test_reset_input_failure_is_counted_and_preserves_profile(
+    reason,
+    context,
+    message,
+):
+    decoder = UpstreamDecoder()
+    decoder.reset(ResetReason.STARTUP, make_context())
+    previous = decoder.active_profile
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        decoder.reset(reason, context)
+
+    assert decoder.active_profile is previous
+    assert decoder.stats().resets == 1
+    assert decoder.stats().decode_errors == 1
+
+
+@pytest.mark.parametrize("failure_mode", ["noncallable", "getter"])
+def test_reset_hook_resolution_failure_is_transactional(failure_mode):
+    class Backend:
+        mode = "ok"
+
+        @property
+        def reset(self):
+            if self.mode == "getter":
+                raise RuntimeError("reset hook getter failed")
+            if self.mode == "noncallable":
+                return 3
+            return lambda **_keywords: None
+
+    backend = Backend()
+    decoder = UpstreamDecoder(backend=backend)
+    decoder.reset(ResetReason.STARTUP, make_context())
+    previous = decoder.active_profile
+    backend.mode = failure_mode
+
+    with pytest.raises((TypeError, RuntimeError), match="reset"):
+        decoder.reset(ResetReason.TARGET_CHANGE, make_context("RED", "L2"))
+
+    assert decoder.active_profile is previous
+    assert decoder.stats().resets == 1
+    assert decoder.stats().decode_errors == 1
+
+
+def test_reset_normalizes_team_target_and_runtime_profile_text():
+    decoder = UpstreamDecoder()
+    context = DecodeContext(
+        team=" blue ",
+        target=" l1 ",
+        profile=" competition ",
+        target_version=3,
+        context_version=4,
+    )
+
+    decoder.reset(ResetReason.STARTUP, context)
+
+    assert decoder.active_profile.name == "BLUE-L1"
+
+
 def test_decode_before_reset_fails_without_calling_backend():
     backend = RecordingBackend()
     decoder = UpstreamDecoder(backend=backend)
@@ -292,6 +378,78 @@ def test_multiple_parsed_frames_are_converted_with_complete_metadata():
     assert stats.decode_errors == 0
 
 
+@pytest.mark.parametrize(
+    ("frame", "message"),
+    [
+        (ParsedFrame(cmd_id=None, data=b"x", seq=1), "cmd_id"),
+        (ParsedFrame(cmd_id=True, data=b"x", seq=1), "cmd_id"),
+        (ParsedFrame(cmd_id=-1, data=b"x", seq=1), "cmd_id"),
+        (ParsedFrame(cmd_id=0x1_0000, data=b"x", seq=1), "cmd_id"),
+        (ParsedFrame(cmd_id=1, data=b"x", seq=None), "seq"),
+        (ParsedFrame(cmd_id=1, data=b"x", seq=True), "seq"),
+        (ParsedFrame(cmd_id=1, data=b"x", seq=-1), "seq"),
+        (ParsedFrame(cmd_id=1, data=b"x", seq=256), "seq"),
+        (ParsedFrame(cmd_id=1, data=None, seq=1), "data"),
+        (ParsedFrame(cmd_id=1, data=3, seq=1), "data"),
+        (ParsedFrame(cmd_id=1, data="x", seq=1), "data"),
+        (ParsedFrame(cmd_id=1, data=[1], seq=1), "data"),
+        (
+            ParsedFrame(
+                cmd_id=1,
+                data=memoryview(np.array([True], dtype=np.bool_)),
+                seq=1,
+            ),
+            "data",
+        ),
+    ],
+)
+def test_invalid_frame_fields_reject_the_entire_chunk(frame, message):
+    backend = RecordingBackend(
+        [ParsedFrame(cmd_id=1, data=b"valid-first", seq=1), frame]
+    )
+    decoder = UpstreamDecoder(backend=backend)
+    context = make_context(profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        decoder.decode(make_chunk(), context)
+
+    stats = decoder.stats()
+    assert stats.decode_errors == 1
+    assert stats.chunks_processed == 0
+    assert stats.samples_processed == 0
+    assert stats.commands_emitted == 0
+
+
+@pytest.mark.parametrize("failure_kind", ["missing", "getter"])
+def test_frame_attribute_failures_are_counted_transactionally(failure_kind):
+    if failure_kind == "missing":
+        class BadFrame:
+            cmd_id = 1
+            seq = 1
+    else:
+        class BadFrame:
+            cmd_id = 1
+            seq = 1
+
+            @property
+            def data(self):
+                raise RuntimeError("frame data getter failed")
+
+    decoder = UpstreamDecoder(backend=RecordingBackend([BadFrame()]))
+    context = make_context(profile="debug")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    with pytest.raises((AttributeError, RuntimeError)):
+        decoder.decode(make_chunk(), context)
+
+    stats = decoder.stats()
+    assert stats.decode_errors == 1
+    assert stats.chunks_processed == 0
+    assert stats.samples_processed == 0
+    assert stats.commands_emitted == 0
+
+
 def test_empty_backend_result_is_a_successful_chunk():
     decoder = UpstreamDecoder(backend=RecordingBackend())
     context = make_context()
@@ -330,7 +488,6 @@ def test_backend_decode_error_is_counted_and_propagated():
     [
         make_context("RED", "L1"),
         make_context("BLUE", "L2"),
-        make_context("BLUE", "L1", profile="stale-profile"),
     ],
 )
 def test_decode_rejects_context_that_does_not_match_active_profile(context):
@@ -343,6 +500,22 @@ def test_decode_rejects_context_that_does_not_match_active_profile(context):
 
     assert backend.decode_calls == []
     assert decoder.stats().decode_errors == 1
+
+
+@pytest.mark.parametrize("runtime_profile", ["competition", "debug"])
+def test_runtime_profile_is_distinct_from_internal_rf_profile(runtime_profile):
+    backend = RecordingBackend(
+        [ParsedFrame(cmd_id=1, data=b"ok", seq=1)]
+    )
+    decoder = UpstreamDecoder(backend=backend)
+    context = make_context("BLUE", "L1", profile=runtime_profile)
+    decoder.reset(ResetReason.STARTUP, context)
+
+    commands = decoder.decode(make_chunk(), context)
+
+    assert decoder.active_profile.name == "BLUE-L1"
+    assert commands[0].profile == "BLUE-L1"
+    assert context.profile == runtime_profile
 
 
 def test_plain_callable_can_be_injected_as_the_pure_decode_backend():
