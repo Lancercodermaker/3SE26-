@@ -307,10 +307,17 @@ class CommonReceiverRuntime:
         self.last_rf_state = state
         reset_diagnostics = []
         for reason in self._reset_reasons(chunk, context):
-            reset_diagnostics.extend(
-                self.pipeline.reset_decoders(reason, context, chunk)
+            reason_diagnostics = self.pipeline.reset_decoders(
+                reason, context, chunk
             )
-            if reason is ResetReason.DEVICE_RECONNECT:
+            reset_diagnostics.extend(reason_diagnostics)
+            if (
+                reason is ResetReason.DEVICE_RECONNECT
+                and not any(
+                    diagnostic.stage == "shadow_decoder_reset"
+                    for diagnostic in reason_diagnostics
+                )
+            ):
                 self._pending_device_reconnect = False
         if self.recorder is not None:
             accepted = self.recorder.write_event(

@@ -1216,6 +1216,57 @@ def test_common_runtime_device_reset_failure_preserves_pending_reconnect(
     assert runtime._pending_device_reconnect is True
 
 
+def test_common_runtime_shadow_device_reset_failure_retries_pending_reconnect(
+    receiver_node_module,
+):
+    class ShadowDeviceResetFailsOnce(ResetTrackingDecoder):
+        def __init__(self, decoder_id):
+            super().__init__(decoder_id)
+            self.failed = False
+
+        def reset(self, reason, context):
+            super().reset(reason, context)
+            if (
+                reason is receiver_node_module.ResetReason.DEVICE_RECONNECT
+                and not self.failed
+            ):
+                self.failed = True
+                raise RuntimeError("shadow device reset failed")
+
+    primary = ResetTrackingDecoder("improved_v67")
+    shadow = ShadowDeviceResetFailsOnce("shadow")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+    runtime._pending_device_reconnect = True
+
+    first = runtime.process_once()
+
+    assert first.pipeline_result.diagnostic_errors[0].stage == "shadow_decoder_reset"
+    assert runtime._pending_device_reconnect is True
+
+    runtime.process_once()
+    runtime.close()
+
+    expected = [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+    assert [reason for reason, _ in primary.reset_calls] == expected
+    assert [reason for reason, _ in shadow.reset_calls] == expected
+    assert runtime._pending_device_reconnect is False
+
+
 def test_common_runtime_resets_both_decoders_for_context_target_and_gap(
     receiver_node_module,
 ):
