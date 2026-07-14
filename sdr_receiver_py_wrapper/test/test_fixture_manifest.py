@@ -10,6 +10,8 @@ import pytest
 from sdr_receiver_py_wrapper.fixture_manifest import (
     FixtureManifestError,
     FixtureSpec,
+    MAX_FIXTURE_COUNT,
+    MAX_MANIFEST_BYTES,
     confirmed_fixtures,
     load_fixture_manifest,
 )
@@ -113,6 +115,39 @@ def test_manifest_must_not_be_empty(tmp_path: Path):
         load_fixture_manifest(write_manifest(tmp_path, {}))
 
 
+def test_manifest_read_is_bounded_before_utf8_or_json_decode(tmp_path: Path):
+    path = tmp_path / "manifest.json"
+    path.write_bytes(b" " * (MAX_MANIFEST_BYTES + 1))
+
+    with pytest.raises(FixtureManifestError, match="exceeds.*byte limit") as caught:
+        load_fixture_manifest(path)
+
+    assert caught.value.__cause__ is None
+
+
+def test_deep_json_recursion_is_a_stable_manifest_error(tmp_path: Path):
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        '{"capture":' + "[" * 1_000 + "0" + "]" * 1_000 + "}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FixtureManifestError, match="invalid JSON") as caught:
+        load_fixture_manifest(path)
+
+    assert caught.value.__cause__ is None
+
+
+def test_fixture_count_is_bounded_before_entries_are_constructed(tmp_path: Path):
+    payload = {
+        f"capture_{index}": common_entry()
+        for index in range(MAX_FIXTURE_COUNT + 1)
+    }
+
+    with pytest.raises(FixtureManifestError, match="fixture count.*limit"):
+        load_fixture_manifest(write_manifest(tmp_path, payload))
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -131,6 +166,34 @@ def test_manifest_must_not_be_empty(tmp_path: Path):
 def test_fixture_names_must_be_safe_file_names(tmp_path: Path, name: str):
     with pytest.raises(FixtureManifestError, match="fixture name"):
         load_fixture_manifest(write_manifest(tmp_path, {name: common_entry()}))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CON",
+        "con.json",
+        "PRN",
+        "aux.capture",
+        "NUL",
+        "com1",
+        "COM9.bin",
+        "lpt1",
+        "LPT9.capture",
+    ],
+)
+def test_fixture_names_reject_windows_reserved_devices_on_every_os(
+    tmp_path: Path, name: str
+):
+    with pytest.raises(FixtureManifestError, match="reserved device"):
+        load_fixture_manifest(write_manifest(tmp_path, {name: common_entry()}))
+
+
+def test_fixture_names_must_be_unique_under_casefold(tmp_path: Path):
+    payload = {"Capture": common_entry(), "capture": common_entry(target="L2")}
+
+    with pytest.raises(FixtureManifestError, match="case-insensitive collision"):
+        load_fixture_manifest(write_manifest(tmp_path, payload))
 
 
 def test_duplicate_json_keys_are_rejected(tmp_path: Path):
@@ -275,6 +338,97 @@ def test_other_commands_keep_general_printable_ascii_contract(tmp_path: Path):
     manifest = load_fixture_manifest(write_manifest(tmp_path, {"capture": entry}))
 
     assert manifest["capture"].expected_ascii == "free-form !"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"format": "complex64-be"},
+        {"sample_rate_hz": True},
+        {"sample_rate_hz": 0},
+        {"team": "blue"},
+        {"target": "INFO"},
+        {"verification": "verified"},
+    ],
+)
+def test_fixture_spec_direct_construction_enforces_common_invariants(
+    overrides: dict[str, object],
+):
+    values = common_entry()
+    values.update(overrides)
+
+    with pytest.raises(FixtureManifestError):
+        FixtureSpec(**values)
+
+
+def test_fixture_spec_direct_confirmed_requires_complete_valid_oracle():
+    incomplete = common_entry(verification="confirmed")
+    with pytest.raises(FixtureManifestError, match="confirmed"):
+        FixtureSpec(**incomplete)
+
+    invalid = confirmed_entry()
+    invalid["expected_ascii"] = "!!!!!"
+    with pytest.raises(FixtureManifestError, match="0x0A06"):
+        FixtureSpec(**invalid)
+
+    assert FixtureSpec(**confirmed_entry()).expected_ascii == "fcYqTC"
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("sha256", "not-a-sha256"),
+        ("expected_cmd_id", True),
+        ("expected_cmd_id", 0x10000),
+    ],
+)
+def test_fixture_spec_direct_confirmed_rejects_invalid_oracle_types_and_ranges(
+    field: str, bad_value: object
+):
+    values = confirmed_entry()
+    values[field] = bad_value
+
+    with pytest.raises(FixtureManifestError, match=field):
+        FixtureSpec(**values)
+
+
+@pytest.mark.parametrize("oracle", ["sha256", "expected_cmd_id", "expected_ascii"])
+def test_fixture_spec_direct_candidate_forbids_oracle(oracle: str):
+    values = common_entry()
+    values[oracle] = confirmed_entry()[oracle]
+
+    with pytest.raises(FixtureManifestError, match="candidate"):
+        FixtureSpec(**values)
+
+
+def test_confirmed_fixtures_revalidates_and_snapshots_entries():
+    original = FixtureSpec(**confirmed_entry())
+
+    required = confirmed_fixtures({"capture": original})
+
+    assert required["capture"] == original
+    assert required["capture"] is not original
+
+
+def test_confirmed_fixtures_rejects_non_fixture_spec_values():
+    with pytest.raises(FixtureManifestError, match="FixtureSpec"):
+        confirmed_fixtures({"capture": object()})
+
+
+def test_confirmed_fixtures_rejects_frozen_dataclass_bypass():
+    forged = FixtureSpec(**confirmed_entry())
+    object.__setattr__(forged, "expected_ascii", "!!!!!")
+
+    with pytest.raises(FixtureManifestError, match="0x0A06"):
+        confirmed_fixtures({"capture": forged})
+
+
+def test_confirmed_fixtures_rejects_partially_forged_object_new_instance():
+    forged = object.__new__(FixtureSpec)
+    object.__setattr__(forged, "format", "complex64-le")
+
+    with pytest.raises(FixtureManifestError, match="FixtureSpec"):
+        confirmed_fixtures({"capture": forged})
 
 
 @pytest.mark.parametrize("forbidden", ["sha256", "expected_cmd_id", "expected_ascii"])
