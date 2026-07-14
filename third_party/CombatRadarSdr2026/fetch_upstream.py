@@ -7,6 +7,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,9 @@ import stat
 import subprocess
 import sys
 import uuid
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 if __package__:
@@ -1201,7 +1205,7 @@ def _cleanup_staging_anchor(staging: _StagingAnchor) -> None:
     parent.remove_entry_no_follow(original_name)
 
 
-def fetch(destination: Path) -> None:
+def fetch(destination: Path) -> Path:
     destination, parent_identity = _validate_destination(destination)
     if shutil.which("git") is None:
         raise RuntimeError("git is required for the explicit upstream fetch")
@@ -1305,11 +1309,21 @@ def fetch(destination: Path) -> None:
             f"{label}: {type(error).__name__}: {error}"
             for label, error in cleanup_errors
         )
+        if published and primary_error is None:
+            try:
+                LOGGER.warning(
+                    "published successfully; cleanup warning: %s",
+                    "; ".join(failures),
+                )
+            except BaseException:
+                pass
+            return destination
         aggregate = RuntimeError("; ".join(failures))
         cause = primary_error or cleanup_errors[0][1]
         raise aggregate from cause
     if primary_error is not None:
         raise primary_error.with_traceback(primary_traceback)
+    return destination
 
 
 def main() -> int:
@@ -1344,7 +1358,7 @@ def main() -> int:
         parser.error("fetch requires --acknowledge-no-license")
 
     try:
-        fetch(arguments.destination)
+        published_destination = fetch(arguments.destination)
     except (
         OSError,
         RuntimeError,
@@ -1352,6 +1366,7 @@ def main() -> int:
         subprocess.CalledProcessError,
     ) as error:
         parser.exit(1, f"fetch failed: {error}\n")
+    print(published_destination)
     return 0
 
 

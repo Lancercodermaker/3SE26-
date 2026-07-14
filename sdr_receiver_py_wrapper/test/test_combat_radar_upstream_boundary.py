@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -148,6 +149,8 @@ def test_upstream_metadata_and_notice_share_pinned_blob_map():
     assert UPSTREAM_COMMIT in upstream_notice
     assert "server_" + "comm.py" in upstream_notice
     assert "written permission" in upstream_notice.lower()
+    assert "published successfully; cleanup warning" in upstream_notice
+    assert "before publication" in upstream_notice
     for path, blob in UPSTREAM_BLOBS.items():
         assert f"| `{path}` | `{blob}` |" in upstream_notice
 
@@ -1386,7 +1389,7 @@ def test_fetch_reports_primary_and_both_cleanup_failures(
 
 
 def test_fetch_reports_cleanup_failure_after_successful_publish(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, caplog, capfd
 ):
     destination = tmp_path / "checkout"
     fetch_module = _load_fetch_module()
@@ -1402,13 +1405,14 @@ def test_fetch_reports_cleanup_failure_after_successful_publish(
         fetch_module._ParentAnchor, "unlink", remove_lock_then_fail
     )
 
-    with pytest.raises(RuntimeError) as raised:
-        fetch_module.fetch(destination)
+    with caplog.at_level(logging.WARNING):
+        published = fetch_module.fetch(destination)
 
-    message = str(raised.value)
+    message = caplog.text + capfd.readouterr().err
+    assert published == destination
+    assert "published successfully; cleanup warning" in message
     assert "lock cleanup" in message
     assert "injected lock cleanup failure" in message
-    assert raised.value.__cause__ is cleanup_failure
     assert (destination / "marker").read_text(encoding="utf-8") == "complete"
     assert not (tmp_path / ".checkout.fetch.lock").exists()
     assert not list(tmp_path.glob(".checkout.staging-*"))
@@ -1449,7 +1453,7 @@ def test_fetch_reports_primary_and_parent_anchor_close_failure(
 
 
 def test_fetch_reports_parent_anchor_close_failure_after_publish(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, caplog, capfd
 ):
     destination = tmp_path / "checkout"
     fetch_module = _load_fetch_module()
@@ -1463,16 +1467,147 @@ def test_fetch_reports_parent_anchor_close_failure_after_publish(
 
     monkeypatch.setattr(fetch_module._ParentAnchor, "close", close_then_fail)
 
-    with pytest.raises(RuntimeError) as raised:
-        fetch_module.fetch(destination)
+    with caplog.at_level(logging.WARNING):
+        published = fetch_module.fetch(destination)
 
-    message = str(raised.value)
+    message = caplog.text + capfd.readouterr().err
+    assert published == destination
+    assert "published successfully; cleanup warning" in message
     assert "parent anchor close" in message
     assert "injected parent anchor close failure" in message
-    assert raised.value.__cause__ is close_failure
     assert (destination / "marker").read_text(encoding="utf-8") == "complete"
     assert not (tmp_path / ".checkout.fetch.lock").exists()
     assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_fetch_warns_about_every_cleanup_failure_after_publish(
+    tmp_path: Path, monkeypatch, caplog, capfd
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_fdopen = fetch_module.os.fdopen
+    real_staging_close = fetch_module._StagingAnchor.close
+    real_unlink = fetch_module._ParentAnchor.unlink
+    real_parent_close = fetch_module._ParentAnchor.close
+
+    class CloseFailureStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def write(self, value):
+            return self.stream.write(value)
+
+        def flush(self):
+            return self.stream.flush()
+
+        def close(self):
+            self.stream.close()
+            raise OSError("injected lock stream close failure")
+
+    def failing_fdopen(*arguments, **keywords):
+        return CloseFailureStream(real_fdopen(*arguments, **keywords))
+
+    def close_staging_then_fail(anchor) -> None:
+        real_staging_close(anchor)
+        raise OSError("injected staging anchor close failure")
+
+    def remove_lock_then_fail(anchor, name: str) -> None:
+        real_unlink(anchor, name)
+        raise OSError("injected lock cleanup failure")
+
+    def close_parent_then_fail(anchor) -> None:
+        real_parent_close(anchor)
+        raise OSError("injected parent anchor close failure")
+
+    monkeypatch.setattr(fetch_module.os, "fdopen", failing_fdopen)
+    monkeypatch.setattr(
+        fetch_module._StagingAnchor, "close", close_staging_then_fail
+    )
+    monkeypatch.setattr(
+        fetch_module._ParentAnchor, "unlink", remove_lock_then_fail
+    )
+    monkeypatch.setattr(
+        fetch_module._ParentAnchor, "close", close_parent_then_fail
+    )
+
+    with caplog.at_level(logging.WARNING):
+        published = fetch_module.fetch(destination)
+
+    message = caplog.text + capfd.readouterr().err
+    assert published == destination
+    assert "published successfully; cleanup warning" in message
+    assert "injected staging anchor close failure" in message
+    assert "injected lock stream close failure" in message
+    assert "injected lock cleanup failure" in message
+    assert "injected parent anchor close failure" in message
+    assert (destination / "marker").read_text(encoding="utf-8") == "complete"
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+
+
+def test_logging_failure_does_not_reverse_successful_publish(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_unlink = fetch_module._ParentAnchor.unlink
+
+    def remove_lock_then_fail(anchor, name: str) -> None:
+        real_unlink(anchor, name)
+        raise OSError("injected lock cleanup failure")
+
+    def fail_logging(*_arguments, **_keywords) -> None:
+        raise RuntimeError("injected logging failure")
+
+    monkeypatch.setattr(
+        fetch_module._ParentAnchor, "unlink", remove_lock_then_fail
+    )
+    monkeypatch.setattr(logging.Logger, "warning", fail_logging)
+
+    published = fetch_module.fetch(destination)
+
+    assert published == destination
+    assert (destination / "marker").read_text(encoding="utf-8") == "complete"
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+
+
+def test_cli_reports_success_when_published_cleanup_warns(
+    tmp_path: Path, monkeypatch, caplog, capsys
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_unlink = fetch_module._ParentAnchor.unlink
+
+    def remove_lock_then_fail(anchor, name: str) -> None:
+        real_unlink(anchor, name)
+        raise OSError("injected CLI lock cleanup failure")
+
+    monkeypatch.setattr(
+        fetch_module._ParentAnchor, "unlink", remove_lock_then_fail
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(BOUNDARY / "fetch_upstream.py"),
+            "--acknowledge-no-license",
+            str(destination),
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = fetch_module.main()
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert str(destination) in captured.out
+    assert "fetch failed" not in captured.err
+    message = caplog.text + captured.err
+    assert "published successfully; cleanup warning" in message
+    assert "injected CLI lock cleanup failure" in message
+    assert (destination / "marker").read_text(encoding="utf-8") == "complete"
 
 
 def test_fetch_reports_primary_and_staging_anchor_close_failure(
