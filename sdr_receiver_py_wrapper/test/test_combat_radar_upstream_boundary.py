@@ -450,3 +450,159 @@ def test_fetch_rejects_parent_traversal_without_side_effects(
     assert not resolved_target.exists()
     assert not (resolved_target.parent / ".checkout.fetch.lock").exists()
     assert not list(resolved_target.parent.glob(".checkout.staging-*"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_fetch_rejects_windows_junction_parent_without_writing_through_it(
+    tmp_path: Path, monkeypatch
+):
+    actual_parent = tmp_path / "actual-parent"
+    actual_parent.mkdir()
+    junction_parent = tmp_path / "junction-parent"
+    completed = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(junction_parent),
+            str(actual_parent),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert not junction_parent.is_symlink()
+
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    with pytest.raises(ValueError, match="reparse"):
+        fetch_module.fetch(junction_parent / "checkout")
+
+    assert list(actual_parent.iterdir()) == []
+    assert not (actual_parent / ".checkout.fetch.lock").exists()
+    assert not list(actual_parent.glob(".checkout.staging-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent identity regression")
+def test_parent_swap_at_anchor_open_rejects_replacement_parent(
+    tmp_path: Path, monkeypatch
+):
+    requested_parent = tmp_path / "requested-parent"
+    requested_parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    destination = requested_parent / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_open_anchor = fetch_module._open_parent_anchor
+
+    def swap_then_open(parent: Path, *arguments):
+        parent.rename(moved_parent)
+        parent.mkdir()
+        return real_open_anchor(parent, *arguments)
+
+    monkeypatch.setattr(fetch_module, "_open_parent_anchor", swap_then_open)
+
+    with pytest.raises(RuntimeError, match="identity"):
+        fetch_module.fetch(destination)
+
+    assert list(requested_parent.iterdir()) == []
+    assert list(moved_parent.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent identity regression")
+def test_parent_swap_after_validation_never_writes_replacement_parent(
+    tmp_path: Path, monkeypatch
+):
+    requested_parent = tmp_path / "requested-parent"
+    requested_parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    replacement_parent = tmp_path / "replacement-parent"
+    replacement_parent.mkdir()
+    destination = requested_parent / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+
+    def swap_parent(staging: Path) -> None:
+        (staging / "marker").write_text("complete", encoding="utf-8")
+        requested_parent.rename(moved_parent)
+        requested_parent.symlink_to(
+            replacement_parent, target_is_directory=True
+        )
+
+    monkeypatch.setattr(fetch_module, "_materialize_checkout", swap_parent)
+    monkeypatch.setattr(
+        fetch_module, "_verify_checkout", lambda _staging: None
+    )
+
+    with pytest.raises(RuntimeError, match="identity"):
+        fetch_module.fetch(destination)
+
+    assert requested_parent.is_symlink()
+    assert list(replacement_parent.iterdir()) == []
+    assert list(moved_parent.iterdir()) == []
+    assert not (moved_parent / ".checkout.fetch.lock").exists()
+    assert not list(moved_parent.glob(".checkout.staging-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX renameat2 regression")
+def test_atomic_publish_never_replaces_racing_empty_destination(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    assert hasattr(fetch_module, "_publish_no_replace")
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_publish = fetch_module._publish_no_replace
+    inserted_inode = []
+
+    def insert_then_publish(anchor, staging: Path, target: Path) -> None:
+        target.mkdir()
+        inserted_inode.append(target.stat().st_ino)
+        real_publish(anchor, staging, target)
+
+    monkeypatch.setattr(
+        fetch_module, "_publish_no_replace", insert_then_publish
+    )
+
+    with pytest.raises(FileExistsError):
+        fetch_module.fetch(destination)
+
+    assert destination.is_dir()
+    assert destination.stat().st_ino == inserted_inode[0]
+    assert list(destination.iterdir()) == []
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_parent_anchor_closes_after_materialization_failure(
+    tmp_path: Path, monkeypatch
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    destination = parent / "checkout"
+    fetch_module = _load_fetch_module()
+    assert hasattr(fetch_module, "_open_parent_anchor")
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+
+    def fail_materialization(_staging: Path) -> None:
+        raise RuntimeError("injected materialization failure")
+
+    monkeypatch.setattr(
+        fetch_module, "_materialize_checkout", fail_materialization
+    )
+    descriptors_before = None
+    proc_fds = Path("/proc/self/fd")
+    if proc_fds.is_dir():
+        descriptors_before = set(os.listdir(proc_fds))
+
+    with pytest.raises(RuntimeError, match="injected materialization failure"):
+        fetch_module.fetch(destination)
+
+    if descriptors_before is not None:
+        assert set(os.listdir(proc_fds)) == descriptors_before
+    renamed_parent = tmp_path / "renamed-parent"
+    parent.rename(renamed_parent)
+    assert list(renamed_parent.iterdir()) == []

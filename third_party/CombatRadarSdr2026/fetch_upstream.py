@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
+import uuid
 
 
 if __package__:
@@ -190,7 +192,23 @@ def _path_entry_exists(path: Path) -> bool:
     return os.path.lexists(os.fspath(path))
 
 
-def _validate_destination(destination: Path) -> Path:
+def _path_is_reparse_point(path: Path) -> bool:
+    try:
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_flag)
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    information = os.stat(path, follow_symlinks=False)
+    return information.st_dev, information.st_ino
+
+
+def _validate_destination(
+    destination: Path,
+) -> tuple[Path, tuple[int, int]]:
     requested = Path(destination).expanduser()
     if ".." in requested.parts:
         raise ValueError("destination must not contain parent traversal")
@@ -206,6 +224,10 @@ def _validate_destination(destination: Path) -> Path:
             raise ValueError(
                 f"destination parent contains a symlink: {component}"
             )
+        if _path_is_reparse_point(component):
+            raise ValueError(
+                f"destination parent contains a reparse point: {component}"
+            )
         if component.parent == component:
             break
         component = component.parent
@@ -214,7 +236,281 @@ def _validate_destination(destination: Path) -> Path:
         raise FileNotFoundError(
             f"destination parent does not exist: {destination.parent}"
         )
-    return destination
+    return destination, _path_identity(destination.parent)
+
+
+def _windows_open_directory(path: Path) -> int:
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x0080,  # FILE_READ_ATTRIBUTES
+        0x0001 | 0x0002,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle
+
+
+def _windows_close_handle(handle: int) -> None:
+    from ctypes import wintypes
+
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    if not close_handle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_handle_identity(handle: int) -> tuple[int, int, int]:
+    from ctypes import wintypes
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    get_information = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).GetFileInformationByHandle
+    get_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FileInformation),
+    ]
+    get_information.restype = wintypes.BOOL
+    information = FileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (
+        information.volume_serial_number,
+        information.file_index_high,
+        information.file_index_low,
+    )
+
+
+class _ParentAnchor:
+    def __init__(
+        self,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, ...],
+        stable_root: Path | None = None,
+    ) -> None:
+        self.path = path
+        self.descriptor = descriptor
+        self.identity = identity
+        self.stable_root = stable_root
+        self.closed = False
+
+    def __enter__(self) -> _ParentAnchor:
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if os.name == "nt":
+            _windows_close_handle(self.descriptor)
+        else:
+            os.close(self.descriptor)
+
+    def child_path(self, name: str) -> Path:
+        if os.name == "nt":
+            return self.path / name
+        if self.stable_root is None:
+            raise RuntimeError("parent anchor has no stable filesystem path")
+        return self.stable_root / name
+
+    def entry_exists(self, name: str) -> bool:
+        if os.name == "nt":
+            return _path_entry_exists(self.child_path(name))
+        try:
+            os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def create_lock(self, name: str) -> int:
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if os.name == "nt":
+            return os.open(self.child_path(name), flags, 0o600)
+        return os.open(name, flags, 0o600, dir_fd=self.descriptor)
+
+    def unlink(self, name: str) -> None:
+        if os.name == "nt":
+            os.unlink(self.child_path(name))
+        else:
+            os.unlink(name, dir_fd=self.descriptor)
+
+    def create_staging(self, prefix: str) -> tuple[str, Path]:
+        for _attempt in range(100):
+            name = f"{prefix}{uuid.uuid4().hex}"
+            try:
+                if os.name == "nt":
+                    os.mkdir(self.child_path(name), 0o700)
+                else:
+                    os.mkdir(name, 0o700, dir_fd=self.descriptor)
+            except FileExistsError:
+                continue
+            return name, self.child_path(name)
+        raise RuntimeError("could not allocate a unique staging directory")
+
+    def verify_identity(self) -> None:
+        if self.closed:
+            raise RuntimeError("parent anchor is closed")
+        if _path_is_reparse_point(self.path) or self.path.is_symlink():
+            raise RuntimeError("destination parent identity changed")
+        if os.name == "nt":
+            current_handle = _windows_open_directory(self.path)
+            try:
+                current_identity = _windows_handle_identity(current_handle)
+            finally:
+                _windows_close_handle(current_handle)
+        else:
+            try:
+                current = os.stat(self.path, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "destination parent identity changed"
+                ) from error
+            current_identity = (current.st_dev, current.st_ino)
+        if current_identity != self.identity:
+            raise RuntimeError("destination parent identity changed")
+
+
+def _open_parent_anchor(
+    parent: Path, expected_identity: tuple[int, int]
+) -> _ParentAnchor:
+    if os.name == "nt":
+        descriptor = _windows_open_directory(parent)
+        try:
+            if _path_identity(parent) != expected_identity:
+                raise RuntimeError("destination parent identity changed")
+            anchor = _ParentAnchor(
+                parent, descriptor, _windows_handle_identity(descriptor)
+            )
+            anchor.verify_identity()
+        except BaseException:
+            _windows_close_handle(descriptor)
+            raise
+        return anchor
+
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required_flags):
+        raise RuntimeError("safe parent anchoring is unsupported")
+    descriptor = os.open(
+        parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        information = os.fstat(descriptor)
+        if (information.st_dev, information.st_ino) != expected_identity:
+            raise RuntimeError("destination parent identity changed")
+        stable_root = Path(f"/proc/{os.getpid()}/fd/{descriptor}")
+        if not stable_root.is_dir():
+            raise RuntimeError("safe parent anchoring is unsupported")
+        anchor = _ParentAnchor(
+            parent,
+            descriptor,
+            (information.st_dev, information.st_ino),
+            stable_root,
+        )
+        anchor.verify_identity()
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return anchor
+
+
+def _rename_no_replace_posix(
+    anchor: _ParentAnchor, source_name: str, destination_name: str
+) -> None:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("atomic no-replace publication is unsupported")
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace publication is unsupported")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        anchor.descriptor,
+        os.fsencode(source_name),
+        anchor.descriptor,
+        os.fsencode(destination_name),
+        1,  # RENAME_NOREPLACE
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+    if error_number in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+        raise RuntimeError(
+            "atomic no-replace publication is unsupported"
+        )
+    raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
+def _rename_no_replace_windows(source: Path, destination: Path) -> None:
+    from ctypes import wintypes
+
+    move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+    move_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    move_file.restype = wintypes.BOOL
+    if move_file(str(source), str(destination), 0):
+        return
+    error_number = ctypes.get_last_error()
+    if error_number in (80, 183):  # FILE_EXISTS, ALREADY_EXISTS
+        raise FileExistsError(error_number, "destination exists", destination)
+    raise ctypes.WinError(error_number)
+
+
+def _publish_no_replace(
+    anchor: _ParentAnchor, staging: Path, destination: Path
+) -> None:
+    anchor.verify_identity()
+    if os.name == "nt":
+        _rename_no_replace_windows(staging, destination)
+    else:
+        _rename_no_replace_posix(anchor, staging.name, destination.name)
 
 
 def _remove_staging(staging: Path) -> None:
@@ -226,48 +522,50 @@ def _remove_staging(staging: Path) -> None:
 
 
 def fetch(destination: Path) -> None:
-    destination = _validate_destination(destination)
+    destination, parent_identity = _validate_destination(destination)
     if shutil.which("git") is None:
         raise RuntimeError("git is required for the explicit upstream fetch")
 
-    lock_path = destination.parent / f".{destination.name}.fetch.lock"
-    staging: Path | None = None
-    lock_owned = False
-    try:
+    lock_name = f".{destination.name}.fetch.lock"
+    with _open_parent_anchor(destination.parent, parent_identity) as anchor:
+        staging_name: str | None = None
+        staging: Path | None = None
+        lock_owned = False
         try:
-            lock_descriptor = os.open(
-                lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-        except FileExistsError as error:
-            raise FileExistsError(
-                f"concurrent fetch lock exists: {lock_path}"
-            ) from error
-        lock_owned = True
-        with os.fdopen(lock_descriptor, "w", encoding="utf-8") as lock_file:
-            lock_file.write(f"pid={os.getpid()}\n")
+            try:
+                lock_descriptor = anchor.create_lock(lock_name)
+            except FileExistsError as error:
+                raise FileExistsError(
+                    "concurrent fetch lock exists: "
+                    f"{anchor.child_path(lock_name)}"
+                ) from error
+            lock_owned = True
+            with os.fdopen(
+                lock_descriptor, "w", encoding="utf-8"
+            ) as lock_file:
+                lock_file.write(f"pid={os.getpid()}\n")
 
-        if _path_entry_exists(destination):
-            raise FileExistsError(
-                f"destination appeared during fetch: {destination}"
+            if anchor.entry_exists(destination.name):
+                raise FileExistsError(
+                    f"destination appeared during fetch: {destination}"
+                )
+            staging_name, staging = anchor.create_staging(
+                f".{destination.name}.staging-"
             )
-        staging = Path(
-            tempfile.mkdtemp(
-                prefix=f".{destination.name}.staging-", dir=destination.parent
-            )
-        )
-        _materialize_checkout(staging)
-        _verify_checkout(staging)
-        if _path_entry_exists(destination):
-            raise FileExistsError(
-                f"destination appeared during fetch: {destination}"
-            )
-        os.rename(staging, destination)
-        staging = None
-    finally:
-        if staging is not None and staging.exists():
-            _remove_staging(staging)
-        if lock_owned:
-            lock_path.unlink()
+            _materialize_checkout(staging)
+            _verify_checkout(staging)
+            if anchor.entry_exists(destination.name):
+                raise FileExistsError(
+                    f"destination appeared during fetch: {destination}"
+                )
+            _publish_no_replace(anchor, staging, destination)
+            staging_name = None
+            staging = None
+        finally:
+            if staging_name is not None and anchor.entry_exists(staging_name):
+                _remove_staging(anchor.child_path(staging_name))
+            if lock_owned:
+                anchor.unlink(lock_name)
 
 
 def main() -> int:
