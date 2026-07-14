@@ -164,6 +164,15 @@ class CommonReceiverRuntime:
         self.worker_error: Optional[BaseException] = None
         self.last_rf_state: Optional[rf_safety.RfState] = None
         self._closed = False
+        self._resources_closed = False
+        self._lifecycle_lock = threading.RLock()
+        self._io_lock = threading.Lock()
+        self._resource_lock = threading.Lock()
+        self._worker_state_lock = threading.Lock()
+        self._active_workers: set[str] = set()
+        self._starting_workers = False
+        self._run_active = threading.Event()
+        self._shutdown_reason: Optional[str] = None
         self._context_condition = threading.Condition()
         self._chunk_contexts: dict[int, DecodeContext] = {}
         self._error_lock = threading.Lock()
@@ -189,54 +198,53 @@ class CommonReceiverRuntime:
                 _context, settings = self.snapshot_provider()
                 self._sync_device_settings(settings)
         except BaseException:
-            if self.device is not None:
-                try:
-                    self.device.close()
-                except BaseException:
-                    pass
-            close_recorder = getattr(self.recorder, "close", None)
-            if callable(close_recorder):
-                try:
-                    close_recorder(stopped_reason="common receiver setup failed")
-                except BaseException:
-                    pass
+            self._close_resources_once("common receiver setup failed")
             raise
 
     def process_once(self) -> CommonRuntimeResult:
-        if self._closed:
-            raise RuntimeError("common receiver runtime is closed")
-        produced = self.acquire_once()
-        if produced is None:
-            raise RuntimeError("acquisition queue rejected IQ chunk")
-        result = self.process_next(timeout_sec=0.0)
-        if result is None or result.chunk.chunk_id != produced.chunk_id:
-            raise RuntimeError("acquisition queue order is inconsistent")
-        return result
+        with self._lifecycle_lock:
+            self._require_manual_queue_operation()
+            produced = self._acquire_once()
+            if produced is None:
+                raise RuntimeError("acquisition queue rejected IQ chunk")
+            result = self._process_next(timeout_sec=0.0)
+            if result is None or result.chunk.chunk_id != produced.chunk_id:
+                raise RuntimeError("acquisition queue order is inconsistent")
+            return result
 
     def acquire_once(self):
-        if self.snapshot_provider is None:
-            context = self.context_provider()
-            settings = None
-        else:
-            context, settings = self.snapshot_provider()
-        if not isinstance(context, DecodeContext):
-            raise TypeError("context_provider must return a DecodeContext")
-        self._sync_device_settings(settings)
-        with self.acquisition._state_lock:
-            self.acquisition._target_version = context.target_version
-            self.acquisition._context_version = context.context_version
-        read_errors_before = self.acquisition.stats.read_errors
-        produced = self.acquisition.read_once()
-        if produced is None:
-            if self.acquisition.stats.read_errors > read_errors_before:
-                raise RuntimeError("acquisition read failed")
-            return None
-        with self._context_condition:
-            self._chunk_contexts[produced.chunk_id] = context
-            self._context_condition.notify_all()
-        return produced
+        with self._lifecycle_lock:
+            self._require_manual_queue_operation()
+            return self._acquire_once()
+
+    def _acquire_once(self):
+        with self._io_lock:
+            if self.snapshot_provider is None:
+                context = self.context_provider()
+                settings = None
+            else:
+                context, settings = self.snapshot_provider()
+            if not isinstance(context, DecodeContext):
+                raise TypeError("context_provider must return a DecodeContext")
+            self._sync_device_settings(settings)
+            self._set_acquisition_versions(context)
+            read_errors_before = self.acquisition.stats.read_errors
+            produced = self.acquisition.read_once()
+            if produced is None:
+                if self.acquisition.stats.read_errors > read_errors_before:
+                    raise RuntimeError("acquisition read failed")
+                return None
+            with self._context_condition:
+                self._chunk_contexts[produced.chunk_id] = context
+                self._context_condition.notify_all()
+            return produced
 
     def process_next(self, *, timeout_sec=0.05) -> Optional[CommonRuntimeResult]:
+        with self._lifecycle_lock:
+            self._require_manual_queue_operation()
+            return self._process_next(timeout_sec=timeout_sec)
+
+    def _process_next(self, *, timeout_sec=0.05) -> Optional[CommonRuntimeResult]:
         try:
             queued = self.acquisition._queue.get(timeout=timeout_sec)
         except Empty:
@@ -281,38 +289,106 @@ class CommonReceiverRuntime:
         )
 
     def start(self) -> None:
-        if self.processing_thread is not None and self.processing_thread.is_alive():
-            return
-        self.stop_event.clear()
-        self.worker_error = None
-        self.acquisition_thread = threading.Thread(
-            target=self._run_acquisition,
-            name="sdr-common-acquisition",
-            daemon=True,
-        )
-        self.processing_thread = threading.Thread(
-            target=self._run_processing,
-            name="sdr-common-processing",
-            daemon=True,
-        )
-        self.thread = self.processing_thread
-        self.acquisition_thread.start()
-        self.processing_thread.start()
+        with self._lifecycle_lock:
+            if self._closed or self._resources_closed:
+                raise RuntimeError("common receiver runtime is closed")
+            if self._run_active.is_set():
+                return
+            self.stop_event.clear()
+            self.worker_error = None
+            self._shutdown_reason = None
+            self.acquisition_thread = threading.Thread(
+                target=self._run_acquisition,
+                name="sdr-common-acquisition",
+                daemon=True,
+            )
+            self.processing_thread = threading.Thread(
+                target=self._run_processing,
+                name="sdr-common-processing",
+                daemon=True,
+            )
+            self.thread = self.processing_thread
+            workers = (self.acquisition_thread, self.processing_thread)
+            started = []
+            with self._worker_state_lock:
+                self._starting_workers = True
+                self._active_workers.clear()
+            self._run_active.set()
+            try:
+                for worker in workers:
+                    with self._worker_state_lock:
+                        self._active_workers.add(worker.name)
+                    try:
+                        worker.start()
+                    except BaseException:
+                        with self._worker_state_lock:
+                            self._active_workers.discard(worker.name)
+                        raise
+                    started.append(worker)
+            except BaseException as exc:
+                with self._error_lock:
+                    if self._shutdown_reason is None:
+                        self._shutdown_reason = "common receiver start failed"
+                self.stop_event.set()
+                with self._context_condition:
+                    self._context_condition.notify_all()
+                with self._worker_state_lock:
+                    self._starting_workers = False
+                for worker in started:
+                    worker.join(timeout=3.0)
+                if any(worker.is_alive() for worker in started):
+                    raise RuntimeError(
+                        "common receiver start rollback timed out"
+                    ) from exc
+                self._run_active.clear()
+                self._close_resources_once("common receiver start failed")
+                self._closed = True
+                raise
+            finally:
+                should_cleanup = False
+                with self._worker_state_lock:
+                    self._starting_workers = False
+                    if not self._active_workers:
+                        self._run_active.clear()
+                        should_cleanup = self.stop_event.is_set()
+                if should_cleanup:
+                    with self._error_lock:
+                        reason = (
+                            self._shutdown_reason
+                            or "common receiver stopped"
+                        )
+                    self._close_resources_once(reason)
 
     def close(self, *, timeout_sec: float = 3.0) -> None:
-        if self._closed:
-            return
-        self.stop_event.set()
-        with self._context_condition:
-            self._context_condition.notify_all()
-        for thread in (self.acquisition_thread, self.processing_thread):
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=timeout_sec)
-        self.device.close()
-        close_recorder = getattr(self.recorder, "close", None)
-        if callable(close_recorder):
-            close_recorder(stopped_reason="common receiver stopped")
-        self._closed = True
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self.stop_event.set()
+            with self._error_lock:
+                if self._shutdown_reason is None:
+                    self._shutdown_reason = "common receiver stopped"
+                reason = self._shutdown_reason
+            with self._context_condition:
+                self._context_condition.notify_all()
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            current = threading.current_thread()
+            workers = tuple(
+                worker
+                for worker in (self.acquisition_thread, self.processing_thread)
+                if worker is not None and worker is not current
+            )
+            for worker in workers:
+                if worker.is_alive():
+                    worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            alive = [worker.name for worker in workers if worker.is_alive()]
+            if alive:
+                raise TimeoutError(
+                    "common receiver worker threads did not stop: "
+                    + ", ".join(alive)
+                )
+            self._run_active.clear()
+            self._close_resources_once(reason)
+            self._closed = True
 
     def status(self) -> dict:
         return {
@@ -331,24 +407,58 @@ class CommonReceiverRuntime:
     def _run_acquisition(self) -> None:
         try:
             while not self.stop_event.is_set():
-                self.acquire_once()
+                self._acquire_once()
         except BaseException as exc:
             self._fail_worker(exc)
+        finally:
+            self._worker_exited()
 
     def _run_processing(self) -> None:
         try:
             while not self.stop_event.is_set():
-                self.process_next()
+                self._process_next()
         except BaseException as exc:
             self._fail_worker(exc)
+        finally:
+            self._worker_exited()
 
     def _fail_worker(self, exc) -> None:
         with self._error_lock:
             if self.worker_error is None:
                 self.worker_error = exc
+                self._shutdown_reason = "common receiver worker failed"
         self.stop_event.set()
         with self._context_condition:
             self._context_condition.notify_all()
+
+    def _worker_exited(self) -> None:
+        should_cleanup = False
+        with self._worker_state_lock:
+            self._active_workers.discard(threading.current_thread().name)
+            if not self._starting_workers and not self._active_workers:
+                self._run_active.clear()
+                should_cleanup = self.stop_event.is_set()
+        if should_cleanup:
+            with self._error_lock:
+                reason = self._shutdown_reason or "common receiver stopped"
+            self._close_resources_once(reason)
+
+    def _close_resources_once(self, reason: str) -> None:
+        with self._resource_lock:
+            if self._resources_closed:
+                return
+            self._resources_closed = True
+            if self.device is not None:
+                try:
+                    self.device.close()
+                except BaseException:
+                    pass
+            close_recorder = getattr(self.recorder, "close", None)
+            if callable(close_recorder):
+                try:
+                    close_recorder(stopped_reason=reason)
+                except BaseException:
+                    pass
 
     def _context_for_chunk(self, chunk_id, timeout_sec):
         deadline = time.monotonic() + max(0.05, float(timeout_sec))
@@ -359,6 +469,20 @@ class CommonReceiverRuntime:
                     raise RuntimeError("IQ chunk has no matching DecodeContext")
                 self._context_condition.wait(timeout=remaining)
             return self._chunk_contexts.pop(chunk_id)
+
+    def _require_manual_queue_operation(self) -> None:
+        if self._run_active.is_set():
+            raise RuntimeError(
+                "manual queue operation is unavailable while runtime workers "
+                "are active"
+            )
+        if self._closed or self._resources_closed:
+            raise RuntimeError("common receiver runtime is closed")
+
+    def _set_acquisition_versions(self, context: DecodeContext) -> None:
+        with self.acquisition._state_lock:
+            self.acquisition._target_version = context.target_version
+            self.acquisition._context_version = context.context_version
 
     def _sync_device_settings(self, settings=None) -> None:
         if settings is None:
@@ -388,6 +512,38 @@ def _create_decoder_plugin(decoder_id: str, core):
 def _require_decoder_available(decoder_id: str) -> None:
     if decoder_id != PRIMARY_DECODER_ID:
         raise ValueError(f"unavailable decoder: {decoder_id!r}")
+
+
+def _validate_decoder_registry(config: ReceiverFoundationConfig) -> None:
+    if not isinstance(config, ReceiverFoundationConfig):
+        raise TypeError("config must be a ReceiverFoundationConfig")
+    try:
+        _require_decoder_available(config.decoder_primary)
+    except ValueError as exc:
+        raise ValueError(
+            f"decoder_primary is unavailable: {config.decoder_primary!r}"
+        ) from exc
+    if config.decoder_shadow:
+        try:
+            _require_decoder_available(config.decoder_shadow)
+        except ValueError as exc:
+            raise ValueError(
+                f"decoder_shadow is unavailable: {config.decoder_shadow!r}"
+            ) from exc
+
+
+def _normalize_competition_target(target: object) -> Optional[str]:
+    value = str(target or "").strip().upper()
+    aliases = {
+        "L1": "L1",
+        "L2": "L2",
+        "L3": "L3",
+        "JAM_L1_KEY": "L1",
+        "JAM_L2_KEY": "L2",
+        "JAM_L3_KEY": "L3",
+        "INFO": "INFO",
+    }
+    return aliases.get(value)
 
 
 class NodeCommandOutput:
@@ -497,8 +653,21 @@ class ReceiverPipeline:
                 self._error_payload("primary", self.primary.decoder_id, chunk, exc),
             )
 
-        for command in primary_commands:
-            self._record_command(command, "primary", chunk, context)
+        primary_event_ids = tuple(
+            self._command_event_id(chunk, "primary", ordinal)
+            for ordinal in range(len(primary_commands))
+        )
+        for command, command_event_id in zip(
+            primary_commands,
+            primary_event_ids,
+        ):
+            self._record_command(
+                command,
+                "primary",
+                chunk,
+                context,
+                command_event_id,
+            )
 
         shadow_commands: tuple[DecodedCommand, ...] = ()
         shadow_error = None
@@ -524,19 +693,42 @@ class ReceiverPipeline:
                         )
                     )
 
+        shadow_event_ids = tuple(
+            self._command_event_id(chunk, "shadow", ordinal)
+            for ordinal in range(len(shadow_commands))
+        )
+
         if primary_failure is not None:
-            for command in shadow_commands:
+            for command, command_event_id in zip(
+                shadow_commands,
+                shadow_event_ids,
+            ):
                 self._record_diagnostic(
                     "command",
-                    self._command_payload(command, "shadow", chunk, context),
+                    self._command_payload(
+                        command,
+                        "shadow",
+                        chunk,
+                        context,
+                        command_event_id,
+                    ),
                 )
             error, traceback = primary_failure
             raise error.with_traceback(traceback)
 
-        for command in shadow_commands:
+        for command, command_event_id in zip(
+            shadow_commands,
+            shadow_event_ids,
+        ):
             diagnostic_error = self._record_diagnostic(
                 "command",
-                self._command_payload(command, "shadow", chunk, context),
+                self._command_payload(
+                    command,
+                    "shadow",
+                    chunk,
+                    context,
+                    command_event_id,
+                ),
             )
             if diagnostic_error is not None:
                 diagnostic_errors.append(
@@ -547,18 +739,31 @@ class ReceiverPipeline:
                 )
 
         validation_results = []
-        for command in primary_commands:
+        for command, command_event_id in zip(
+            primary_commands,
+            primary_event_ids,
+        ):
+            validation_recorded = False
+
+            def record_validation(
+                validation,
+                item=command,
+                event_id=command_event_id,
+            ):
+                nonlocal validation_recorded
+                self._record_validation(
+                    item,
+                    validation,
+                    chunk,
+                    context,
+                    event_id,
+                )
+                validation_recorded = True
+
             try:
                 result = self.output.publish(
                     command,
-                    before_commit=lambda validation, item=command: (
-                        self._record_validation(
-                            item,
-                            validation,
-                            chunk,
-                            context,
-                        )
-                    ),
+                    before_commit=record_validation,
                 )
             except Exception as exc:
                 self._record_diagnostic(
@@ -572,6 +777,12 @@ class ReceiverPipeline:
                 raise
             if not isinstance(result, ValidationResult):
                 raise TypeError("output publish must return a ValidationResult")
+            if not validation_recorded:
+                if result.accepted:
+                    raise ReceiverPipelineError(
+                        "accepted output skipped validation prepare callback"
+                    )
+                record_validation(result)
             validation_results.append(result)
 
         return ReceiverPipelineResult(
@@ -623,16 +834,40 @@ class ReceiverPipeline:
             "role": role,
         }
 
-    def _record_command(self, command, role, chunk, context) -> None:
+    @staticmethod
+    def _command_event_id(chunk, role, ordinal) -> str:
+        return f"{chunk.chunk_id}:{role}:{ordinal}"
+
+    def _record_command(
+        self,
+        command,
+        role,
+        chunk,
+        context,
+        command_event_id,
+    ) -> None:
         self._record_event(
             "command",
-            self._command_payload(command, role, chunk, context),
+            self._command_payload(
+                command,
+                role,
+                chunk,
+                context,
+                command_event_id,
+            ),
         )
 
     @staticmethod
-    def _command_payload(command, role, chunk, context):
+    def _command_payload(
+        command,
+        role,
+        chunk,
+        context,
+        command_event_id,
+    ):
         chunk_last_sample = chunk.first_sample_index + int(chunk.samples.size) - 1
         return {
+            "command_event_id": command_event_id,
             "role": role,
             "chunk_id": chunk.chunk_id,
             "chunk_first_sample_index": chunk.first_sample_index,
@@ -654,11 +889,19 @@ class ReceiverPipeline:
             "evidence": command.evidence,
         }
 
-    def _record_validation(self, command, validation, chunk, context) -> None:
+    def _record_validation(
+        self,
+        command,
+        validation,
+        chunk,
+        context,
+        command_event_id,
+    ) -> None:
         chunk_last_sample = chunk.first_sample_index + int(chunk.samples.size) - 1
         self._record_event(
             "validation",
             {
+                "command_event_id": command_event_id,
                 "chunk_id": chunk.chunk_id,
                 "chunk_first_sample_index": chunk.first_sample_index,
                 "chunk_last_sample_index": chunk_last_sample,
@@ -670,6 +913,10 @@ class ReceiverPipeline:
                 "decoder_id": command.decoder_id,
                 "cmd_id": command.cmd_id,
                 "payload": command.payload,
+                "crc8_ok": command.crc8_ok,
+                "crc16_ok": command.crc16_ok,
+                "crc_mode": command.crc_mode,
+                "receive_wall_time": command.receive_wall_time,
                 "command_first_sample_index": command.first_sample_index,
                 "command_last_sample_index": command.last_sample_index,
                 "accepted": validation.accepted,
@@ -973,6 +1220,7 @@ class SdrReceiverPyWrapperNode(Node):
         if self.run_mode not in ("debug", "competition"):
             raise ValueError("run_mode must be 'debug' or 'competition'")
         self.foundation_config = self._load_receiver_foundation_config()
+        _validate_decoder_registry(self.foundation_config)
 
         self.publish_ros_outputs = bool(self.get_parameter("publish_ros_outputs").value)
         self.debug_accept_ros_control = bool(self.get_parameter("debug_accept_ros_control").value)
@@ -1672,7 +1920,6 @@ class SdrReceiverPyWrapperNode(Node):
             return result
 
         with self._get_controller_lock():
-            self._retry_pending_rf_transition_locked()
             prevalidation = self.command_validator.prevalidate(command)
             if not prevalidation.accepted:
                 if before_publish is not None:
@@ -1680,6 +1927,55 @@ class SdrReceiverPyWrapperNode(Node):
                 self.get_logger().debug(prevalidation.reason)
                 return prevalidation
 
+            approved_target = f"L{prevalidation.level}"
+            command_target = _normalize_competition_target(command.target)
+            active_level = getattr(
+                self.controller,
+                "active_level",
+                prevalidation.level,
+            )
+            desired_target = getattr(
+                self.controller,
+                "desired_target",
+                approved_target,
+            )
+            controller_target = _normalize_competition_target(
+                desired_target
+            )
+            pending_transition = getattr(
+                self,
+                "_pending_rf_transition",
+                None,
+            )
+            pending_target = _normalize_competition_target(
+                getattr(pending_transition, "target", None)
+            )
+            desired_target_authorized = (
+                controller_target == approved_target
+                or (
+                    pending_transition is not None
+                    and pending_target == controller_target
+                )
+            )
+            if (
+                active_level != prevalidation.level
+                or command_target != approved_target
+                or not desired_target_authorized
+            ):
+                result = ValidationResult(
+                    False,
+                    "decoded command target is not authorized by the active "
+                    f"controller target: command={command.target!r}, "
+                    f"active_level={active_level}, "
+                    f"desired_target={desired_target!r}, "
+                    f"evidence_level={prevalidation.level}",
+                    ascii_code=prevalidation.ascii_code,
+                    level=prevalidation.level,
+                )
+                self.get_logger().debug(result.reason)
+                return result
+
+            self._retry_pending_rf_transition_locked()
             controller_snapshot = self._snapshot_jam_key_controller_state()
             publication_committed = False
             try:
