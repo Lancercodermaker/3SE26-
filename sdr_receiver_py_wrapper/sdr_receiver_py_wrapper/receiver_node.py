@@ -47,11 +47,16 @@ from .v67_decoder import V67Decoder
 DEFAULT_ORIGINAL_SCRIPT = "auto"
 PRIMARY_DECODER_ID = "improved_v67"
 CONSTRUCTOR_CLEANUP_WAIT_SEC = 0.25
+RECONNECT_MARKER_CAPACITY = 1024
 _LOGGER = logging.getLogger(__name__)
 
 
 class ReceiverPipelineError(RuntimeError):
     """The common receiver pipeline could not preserve its processing contract."""
+
+
+class ReconnectMarkerCapacityError(ReceiverPipelineError):
+    """Reconnect history reached its fail-stop capacity."""
 
 
 class PublicationIndeterminateError(RuntimeError):
@@ -273,16 +278,20 @@ class CommonReceiverRuntime:
                 if stats_after.reconnects > stats_before.reconnects:
                     with self.acquisition._state_lock:
                         first_chunk_id = self.acquisition._next_chunk_id
-                    markers = [
-                        self._record_reconnect_marker(
-                            generation,
-                            first_chunk_id,
-                        )
-                        for generation in range(
-                            stats_before.reconnects + 1,
-                            stats_after.reconnects + 1,
-                        )
-                    ]
+                    try:
+                        markers = [
+                            self._record_reconnect_marker(
+                                generation,
+                                first_chunk_id,
+                            )
+                            for generation in range(
+                                stats_before.reconnects + 1,
+                                stats_after.reconnects + 1,
+                            )
+                        ]
+                    except ReconnectMarkerCapacityError as exc:
+                        self._fail_worker(exc)
+                        raise
                     if self.recorder is not None:
                         accepted = self.recorder.write_event(
                             "discontinuity",
@@ -456,6 +465,11 @@ class CommonReceiverRuntime:
         first_chunk_id: int,
     ) -> _ReconnectMarker:
         with self._reconnect_marker_lock:
+            if len(self._reconnect_markers) >= RECONNECT_MARKER_CAPACITY:
+                raise ReconnectMarkerCapacityError(
+                    "reconnect marker capacity exceeded: "
+                    f"capacity={RECONNECT_MARKER_CAPACITY}"
+                )
             marker = _ReconnectMarker(
                 marker_id=self._next_reconnect_marker_id,
                 device_generation=int(device_generation),
@@ -676,6 +690,8 @@ class CommonReceiverRuntime:
                 self.worker_error = exc
                 self._shutdown_reason = "common receiver worker failed"
         self.stop_event.set()
+        if self._lifecycle != "CLOSED":
+            self._lifecycle = "STOPPING"
         with self._context_condition:
             self._context_condition.notify_all()
 

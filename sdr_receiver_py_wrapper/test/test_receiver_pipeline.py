@@ -1243,6 +1243,175 @@ def test_common_runtime_multiple_reconnect_generations_are_not_collapsed(
     assert runtime._pending_device_reconnect is False
 
 
+def test_common_runtime_reconnect_marker_capacity_fail_stops_manual_runtime(
+    receiver_node_module,
+    monkeypatch,
+):
+    monkeypatch.setattr(receiver_node_module, "RECONNECT_MARKER_CAPACITY", 2)
+
+    class ReadFailsBackend(FakeBackend):
+        def rx(self):
+            raise OSError("persistent link loss")
+
+    factory_calls = []
+
+    def backend_factory():
+        factory_calls.append("connect")
+        return ReadFailsBackend(np.ones(2, dtype=np.complex64))
+
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=backend_factory,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=ResetTrackingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=None,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    assert runtime.acquire_once() is None
+    assert runtime.acquire_once() is None
+    assert [
+        marker.device_generation for marker in runtime._reconnect_markers
+    ] == [1, 2]
+
+    with pytest.raises(
+        receiver_node_module.ReconnectMarkerCapacityError,
+        match="reconnect marker capacity exceeded",
+    ) as raised:
+        runtime.acquire_once()
+
+    assert [
+        marker.device_generation for marker in runtime._reconnect_markers
+    ] == [1, 2]
+    assert runtime.worker_error is raised.value
+    assert runtime.stop_event.is_set()
+    assert runtime.status()["lifecycle"] == "STOPPING"
+    assert "reconnect marker capacity exceeded" in runtime.status()["worker_error"]
+    assert len(factory_calls) == 4
+    for operation in (
+        runtime.start,
+        runtime.acquire_once,
+        runtime.process_once,
+        lambda: runtime.process_next(timeout_sec=0.0),
+    ):
+        with pytest.raises(RuntimeError, match="stopping"):
+            operation()
+
+    runtime.close()
+
+    assert runtime.status()["lifecycle"] == "CLOSED"
+    assert "reconnect marker capacity exceeded" in runtime.status()["worker_error"]
+
+
+def test_common_runtime_marker_capacity_stops_worker_reconnect_loop(
+    receiver_node_module,
+    monkeypatch,
+):
+    monkeypatch.setattr(receiver_node_module, "RECONNECT_MARKER_CAPACITY", 2)
+    release_read = threading.Event()
+    rx_calls = 0
+
+    class ReadFailsBackend(FakeBackend):
+        def rx(self):
+            nonlocal rx_calls
+            rx_calls += 1
+            if rx_calls > 6:
+                release_read.wait(timeout=1.0)
+            raise OSError("persistent worker link loss")
+
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: ReadFailsBackend(
+            np.ones(2, dtype=np.complex64)
+        ),
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=ResetTrackingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=None,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    runtime.start()
+    stopped = runtime.stop_event.wait(timeout=0.5)
+    if not stopped:
+        runtime.stop_event.set()
+    release_read.set()
+    runtime.close(timeout_sec=1.0)
+
+    assert stopped is True
+    assert isinstance(
+        runtime.worker_error,
+        receiver_node_module.ReconnectMarkerCapacityError,
+    )
+    assert rx_calls == 3
+    assert runtime.acquisition.stats.reconnects == 3
+    assert len(runtime._reconnect_markers) == 2
+
+
+def test_common_runtime_close_does_not_deadlock_with_capacity_failure(
+    receiver_node_module,
+    monkeypatch,
+):
+    monkeypatch.setattr(receiver_node_module, "RECONNECT_MARKER_CAPACITY", 0)
+    read_started = threading.Event()
+    release_read = threading.Event()
+    factory_calls = 0
+
+    class BlockingReadFailureBackend(FakeBackend):
+        def rx(self):
+            read_started.set()
+            release_read.wait(timeout=1.0)
+            raise OSError("link lost during close")
+
+    def backend_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        backend_type = (
+            BlockingReadFailureBackend if factory_calls == 1 else FakeBackend
+        )
+        return backend_type(np.ones(2, dtype=np.complex64))
+
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=backend_factory,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=ResetTrackingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=None,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+    close_errors = []
+
+    def close_runtime():
+        try:
+            runtime.close(timeout_sec=0.5)
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    runtime.start()
+    assert read_started.wait(timeout=0.5)
+    close_thread = threading.Thread(target=close_runtime)
+    close_thread.start()
+    deadline = time.monotonic() + 0.5
+    while (
+        runtime._lifecycle != "STOPPING"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert runtime._lifecycle == "STOPPING"
+    release_read.set()
+    close_thread.join(timeout=1.0)
+
+    assert not close_thread.is_alive()
+    assert close_errors == []
+    assert runtime.status()["lifecycle"] == "CLOSED"
+    assert isinstance(
+        runtime.worker_error,
+        receiver_node_module.ReconnectMarkerCapacityError,
+    )
+
+
 def test_common_runtime_shadow_failure_blocks_later_reconnect_markers(
     receiver_node_module,
 ):
