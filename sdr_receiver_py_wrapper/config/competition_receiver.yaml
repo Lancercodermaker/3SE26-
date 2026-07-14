@@ -15,6 +15,12 @@ sdr_receiver_py_wrapper_competition:
     profile_path: ""
     match_slot: bo3_game1
     front_end_id: front_end_A
+    decoder_primary: improved_v67
+    decoder_shadow: ""
+    acquisition_queue_size: 8
+    record_queue_size: 32
+    adc_code_scale: 2048.0
+    rf_clipping_ratio: 0.001
     enable_micro_tune: false
     micro_tune_max_hz: 0.0
     micro_tune_step_hz: 0.0
@@ -26,6 +32,7 @@ sdr_receiver_py_wrapper_competition:
     iq_source_center_hz: 0.0
     iq_source_start_offset_sec: 0.0
     iq_source_sample_rate: 0
+    initial_rx_gain: 20
     initial_rf_bw_hz: 0
     initial_info_filter: ""
     record_iq: true

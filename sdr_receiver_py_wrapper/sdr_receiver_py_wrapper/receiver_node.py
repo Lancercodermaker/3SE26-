@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import json
+import math
+import numbers
 import os
 from pathlib import Path
 import sys
@@ -31,12 +33,330 @@ from .context_arbiter import (
 from .original_receiver_adapter import ReceiverCoreAdapter
 from .patches import JamKeyEvent, PatchCallbacks, RawFrameEvent, TargetChangeEvent
 from .profile_import import AdaptiveProfileLoadError, load_adaptive_profile
-from .models import DecodedCommand, IqChunk
+from .acquisition import AcquisitionEngine
+from .models import DecodedCommand, DecodeContext, IqChunk
+from . import rf_safety
 from .structured_recorder import StructuredRecorder, _json_snapshot
 
 
 DEFAULT_ORIGINAL_SCRIPT = "auto"
 PRIMARY_DECODER_ID = "improved_v67"
+
+
+class ReceiverPipelineError(RuntimeError):
+    """The common receiver pipeline could not preserve its processing contract."""
+
+
+@dataclass(frozen=True)
+class ReceiverPipelineResult:
+    primary_commands: tuple[DecodedCommand, ...]
+    shadow_commands: tuple[DecodedCommand, ...]
+    validation_results: tuple[ValidationResult, ...]
+    shadow_error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ReceiverFoundationConfig:
+    """Validated construction inputs shared by acquisition, RF, and recording."""
+
+    decoder_primary: str = PRIMARY_DECODER_ID
+    decoder_shadow: str = ""
+    acquisition_queue_size: int = 8
+    record_queue_size: int = 32
+    adc_code_scale: float = 2048.0
+    rf_clipping_ratio: float = 0.001
+    initial_rx_gain: int = 20
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decoder_primary, str) or not self.decoder_primary:
+            raise ValueError("decoder_primary must be a non-empty string")
+        if not isinstance(self.decoder_shadow, str):
+            raise TypeError("decoder_shadow must be a string")
+        for name in ("acquisition_queue_size", "record_queue_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.adc_code_scale, bool)
+            or not isinstance(self.adc_code_scale, numbers.Real)
+            or not math.isfinite(float(self.adc_code_scale))
+            or self.adc_code_scale <= 0
+        ):
+            raise ValueError("adc_code_scale must be a finite positive number")
+        if (
+            isinstance(self.rf_clipping_ratio, bool)
+            or not isinstance(self.rf_clipping_ratio, numbers.Real)
+            or not math.isfinite(float(self.rf_clipping_ratio))
+            or not 0 < self.rf_clipping_ratio <= 1
+        ):
+            raise ValueError("rf_clipping_ratio must be in (0, 1]")
+        if (
+            isinstance(self.initial_rx_gain, bool)
+            or not isinstance(self.initial_rx_gain, numbers.Integral)
+            or not -1 <= self.initial_rx_gain <= 73
+        ):
+            raise ValueError("initial_rx_gain must be -1 or between 0 and 73")
+
+    def create_acquisition(self, device, **versions) -> AcquisitionEngine:
+        return AcquisitionEngine(
+            device,
+            queue_size=self.acquisition_queue_size,
+            **versions,
+        )
+
+    def create_recorder(self, record_dir, prefix, **kwargs) -> StructuredRecorder:
+        return StructuredRecorder(
+            record_dir,
+            prefix,
+            queue_size=self.record_queue_size,
+            **kwargs,
+        )
+
+    def measure_and_classify(self, samples: np.ndarray):
+        metrics = rf_safety.measure_rf(samples, code_scale=self.adc_code_scale)
+        state = rf_safety.classify_rf(
+            metrics,
+            clipping_threshold=self.rf_clipping_ratio,
+        )
+        return metrics, state
+
+
+class NodeCommandOutput:
+    """Adapt the pipeline output contract to the existing sole JamCode gate."""
+
+    def __init__(self, node) -> None:
+        self._node = node
+        self.publisher_decoder_id = node.primary_decoder_id
+
+    def publish(self, command: DecodedCommand) -> ValidationResult:
+        return self._node._handle_decoded_command(command)
+
+
+class ReceiverPipeline:
+    """Give primary and shadow decoders the same immutable input evidence."""
+
+    def __init__(
+        self,
+        *,
+        primary,
+        output,
+        shadow=None,
+        recorder=None,
+        config: ReceiverFoundationConfig | None = None,
+    ) -> None:
+        self._check_decoder(primary, "primary")
+        if shadow is not None:
+            self._check_decoder(shadow, "shadow")
+        if not callable(getattr(output, "publish", None)) or not isinstance(
+            getattr(output, "publisher_decoder_id", None), str
+        ):
+            raise TypeError("output must expose publisher_decoder_id and publish(command)")
+        if output.publisher_decoder_id != primary.decoder_id:
+            raise ValueError("output publisher_decoder_id must match the primary decoder")
+        if recorder is not None and (
+            not callable(getattr(recorder, "write_chunk", None))
+            or not callable(getattr(recorder, "write_event", None))
+        ):
+            raise TypeError("recorder must expose write_chunk and write_event")
+        if config is not None and not isinstance(config, ReceiverFoundationConfig):
+            raise TypeError("config must be a ReceiverFoundationConfig")
+        self.primary = primary
+        self.shadow = shadow
+        self.output = output
+        self.recorder = recorder
+        self.config = config or ReceiverFoundationConfig()
+
+    @staticmethod
+    def _check_decoder(decoder, role: str) -> None:
+        if (
+            not isinstance(getattr(decoder, "decoder_id", None), str)
+            or not decoder.decoder_id
+            or not all(
+                callable(getattr(decoder, method, None))
+                for method in ("decode", "reset", "stats")
+            )
+        ):
+            raise TypeError(f"{role} decoder is not protocol compatible")
+
+    def process(
+        self,
+        chunk: IqChunk,
+        context: DecodeContext,
+    ) -> ReceiverPipelineResult:
+        if not isinstance(chunk, IqChunk):
+            raise TypeError("chunk must be an IqChunk")
+        if not isinstance(context, DecodeContext):
+            raise TypeError("context must be a DecodeContext")
+        if chunk.context_version != context.context_version:
+            raise ValueError("chunk and DecodeContext context_version must match")
+        if chunk.target_version != context.target_version:
+            raise ValueError("chunk and DecodeContext target_version must match")
+        if self.recorder is not None:
+            accepted = self.recorder.write_chunk(
+                chunk,
+                metadata={
+                    "target": context.target,
+                    "adc_code_scale": self.config.adc_code_scale,
+                },
+            )
+            if accepted is not True:
+                raise ReceiverPipelineError("failed to record IQ chunk")
+
+        primary_commands: tuple[DecodedCommand, ...] = ()
+        primary_failure = None
+        try:
+            primary_commands = self._decode(
+                self.primary,
+                chunk,
+                context,
+            )
+        except Exception as exc:
+            primary_failure = (exc, exc.__traceback__)
+            self._record_diagnostic(
+                "decoder_error",
+                self._error_payload("primary", self.primary.decoder_id, chunk, exc),
+            )
+
+        for command in primary_commands:
+            self._record_command(command, "primary")
+
+        shadow_commands: tuple[DecodedCommand, ...] = ()
+        shadow_error = None
+        if self.shadow is not None:
+            try:
+                shadow_commands = self._decode(
+                    self.shadow,
+                    chunk,
+                    context,
+                )
+            except Exception as exc:
+                shadow_error = str(exc)
+                self._record_diagnostic(
+                    "decoder_error",
+                    self._error_payload("shadow", self.shadow.decoder_id, chunk, exc),
+                )
+
+        if primary_failure is not None:
+            for command in shadow_commands:
+                self._record_diagnostic(
+                    "command",
+                    self._command_payload(command, "shadow"),
+                )
+            error, traceback = primary_failure
+            raise error.with_traceback(traceback)
+
+        for command in shadow_commands:
+            self._record_command(command, "shadow")
+
+        validation_results = []
+        for command in primary_commands:
+            try:
+                result = self.output.publish(command)
+            except Exception as exc:
+                self._record_diagnostic(
+                    "output_error",
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "decoder_id": command.decoder_id,
+                        "error": str(exc),
+                    },
+                )
+                raise
+            if not isinstance(result, ValidationResult):
+                raise TypeError("output publish must return a ValidationResult")
+            validation_results.append(result)
+            self._record_validation(command, result)
+
+        return ReceiverPipelineResult(
+            primary_commands=primary_commands,
+            shadow_commands=shadow_commands,
+            validation_results=tuple(validation_results),
+            shadow_error=shadow_error,
+        )
+
+    @staticmethod
+    def _decode(decoder, chunk, context) -> tuple[DecodedCommand, ...]:
+        commands = decoder.decode(chunk, context)
+        if not isinstance(commands, list):
+            raise TypeError("decoder decode must return a list")
+        if not all(isinstance(command, DecodedCommand) for command in commands):
+            raise TypeError("decoder results must be DecodedCommand instances")
+        if not all(command.decoder_id == decoder.decoder_id for command in commands):
+            raise ValueError("decoded command decoder_id must match its decoder")
+        for command in commands:
+            ReceiverPipeline._validate_command_correlation(
+                command,
+                chunk,
+                context,
+            )
+        return tuple(commands)
+
+    @staticmethod
+    def _validate_command_correlation(command, chunk, context) -> None:
+        if command.context_version != context.context_version:
+            raise ValueError("decoded command context_version does not match context")
+        chunk_last_sample = chunk.first_sample_index + int(chunk.samples.size) - 1
+        if (
+            command.first_sample_index > command.last_sample_index
+            or command.last_sample_index < chunk.first_sample_index
+            or command.last_sample_index > chunk_last_sample
+        ):
+            raise ValueError("decoded command sample range is not correlated to chunk")
+
+    @staticmethod
+    def _error_payload(role, decoder_id, chunk, exc):
+        return {
+            "chunk_id": chunk.chunk_id,
+            "decoder_id": decoder_id,
+            "error": str(exc),
+            "role": role,
+        }
+
+    def _record_command(self, command, role) -> None:
+        self._record_event(
+            "command",
+            self._command_payload(command, role),
+        )
+
+    @staticmethod
+    def _command_payload(command, role):
+        return {
+            "role": role,
+            "decoder_id": command.decoder_id,
+            "cmd_id": command.cmd_id,
+            "payload": command.payload,
+            "first_sample_index": command.first_sample_index,
+            "last_sample_index": command.last_sample_index,
+            "context_version": command.context_version,
+            "evidence": command.evidence,
+        }
+
+    def _record_validation(self, command, validation) -> None:
+        self._record_event(
+            "validation",
+            {
+                "decoder_id": command.decoder_id,
+                "cmd_id": command.cmd_id,
+                "payload": command.payload,
+                "accepted": validation.accepted,
+                "reason": validation.reason,
+                "ascii_code": validation.ascii_code,
+                "level": validation.level,
+            },
+        )
+
+    def _record_event(self, kind, payload) -> None:
+        if self.recorder is not None and self.recorder.write_event(kind, payload) is not True:
+            raise ReceiverPipelineError(f"failed to record {kind} event")
+
+    def _record_diagnostic(self, kind, payload) -> None:
+        if self.recorder is None:
+            return
+        try:
+            self.recorder.write_event(kind, payload)
+        except Exception:
+            # Preserve the primary stage failure; diagnostics are best effort here.
+            pass
 
 
 @dataclass(frozen=True)
@@ -60,6 +380,8 @@ class IqRecorder:
         metadata_provider,
         prefix_provider=None,
         chunk_metadata_provider=None,
+        record_queue_size: int = 32,
+        adc_code_scale: float = 2048.0,
     ) -> None:
         self.record_dir = Path(os.path.expandvars(str(record_dir))).expanduser()
         self.prefix = self._sanitize_prefix(prefix or "sdr_iq")
@@ -68,6 +390,8 @@ class IqRecorder:
         self.max_bytes = int(max_bytes)
         self.every_n = max(1, int(every_n))
         self.metadata_provider = metadata_provider
+        self.record_queue_size = int(record_queue_size)
+        self.adc_code_scale = float(adc_code_scale)
         self.chunk_metadata_provider = (
             chunk_metadata_provider if chunk_metadata_provider is not None else lambda: {}
         )
@@ -237,10 +561,12 @@ class IqRecorder:
         self._recorder = StructuredRecorder(
             self.record_dir,
             recording_prefix,
+            queue_size=self.record_queue_size,
             summary_metadata={
                 "every_n": self.every_n,
                 "max_sec": self.max_sec,
                 "max_bytes": self.max_bytes,
+                "adc_code_scale": self.adc_code_scale,
             },
             summary_metadata_provider=self.metadata_provider,
         )
@@ -309,6 +635,7 @@ class SdrReceiverPyWrapperNode(Node):
         self.run_mode = str(self.get_parameter("run_mode").value).lower()
         if self.run_mode not in ("debug", "competition"):
             raise ValueError("run_mode must be 'debug' or 'competition'")
+        self.foundation_config = self._load_receiver_foundation_config()
 
         self.publish_ros_outputs = bool(self.get_parameter("publish_ros_outputs").value)
         self.debug_accept_ros_control = bool(self.get_parameter("debug_accept_ros_control").value)
@@ -358,7 +685,7 @@ class SdrReceiverPyWrapperNode(Node):
             ),
             key_retry_limit=int(self.get_parameter("key_retry_limit").value),
         )
-        self.primary_decoder_id = PRIMARY_DECODER_ID
+        self.primary_decoder_id = self.foundation_config.decoder_primary
         self.command_validator = CommandValidator()
 
         qos = QoSProfile(
@@ -465,9 +792,15 @@ class SdrReceiverPyWrapperNode(Node):
         self.declare_parameter("profile_path", "")
         self.declare_parameter("match_slot", "bo3_game1")
         self.declare_parameter("front_end_id", "front_end_A")
+        self.declare_parameter("decoder_primary", "improved_v67")
+        self.declare_parameter("decoder_shadow", "")
+        self.declare_parameter("acquisition_queue_size", 8)
+        self.declare_parameter("record_queue_size", 32)
+        self.declare_parameter("adc_code_scale", 2048.0)
+        self.declare_parameter("rf_clipping_ratio", 0.001)
         self.declare_parameter("initial_team", "")
         self.declare_parameter("initial_target", "")
-        self.declare_parameter("initial_rx_gain", -1)
+        self.declare_parameter("initial_rx_gain", 20)
         self.declare_parameter("initial_rf_bw_hz", 0)
         self.declare_parameter("initial_freq_offset_hz", 0)
         self.declare_parameter("initial_info_filter", "")
@@ -479,6 +812,34 @@ class SdrReceiverPyWrapperNode(Node):
         self.declare_parameter("iq_record_max_sec", 0.0)
         self.declare_parameter("iq_record_max_bytes", 0)
         self.declare_parameter("iq_record_every_n", 1)
+
+    def _load_receiver_foundation_config(self) -> ReceiverFoundationConfig:
+        return ReceiverFoundationConfig(
+            decoder_primary=self.get_parameter("decoder_primary").value,
+            decoder_shadow=self.get_parameter("decoder_shadow").value,
+            acquisition_queue_size=self.get_parameter("acquisition_queue_size").value,
+            record_queue_size=self.get_parameter("record_queue_size").value,
+            adc_code_scale=self.get_parameter("adc_code_scale").value,
+            rf_clipping_ratio=self.get_parameter("rf_clipping_ratio").value,
+            initial_rx_gain=self.get_parameter("initial_rx_gain").value,
+        )
+
+    def create_receiver_pipeline(self, *, primary, shadow=None, recorder=None):
+        """Compose injected plugins without changing the legacy hardware loop."""
+
+        if getattr(primary, "decoder_id", None) != self.foundation_config.decoder_primary:
+            raise ValueError("primary decoder does not match decoder_primary")
+        expected_shadow = self.foundation_config.decoder_shadow
+        actual_shadow = "" if shadow is None else getattr(shadow, "decoder_id", None)
+        if actual_shadow != expected_shadow:
+            raise ValueError("shadow decoder does not match decoder_shadow")
+        return ReceiverPipeline(
+            primary=primary,
+            shadow=shadow,
+            output=NodeCommandOutput(self),
+            recorder=recorder,
+            config=self.foundation_config,
+        )
 
     def _setup_fallback_subscriptions(self, qos: QoSProfile) -> None:
         match_info_type = self._resolve_match_info_type()
@@ -528,6 +889,8 @@ class SdrReceiverPyWrapperNode(Node):
             metadata_provider=self._iq_record_metadata,
             prefix_provider=self._iq_record_prefix,
             chunk_metadata_provider=self._iq_chunk_metadata,
+            record_queue_size=self.foundation_config.record_queue_size,
+            adc_code_scale=self.foundation_config.adc_code_scale,
         )
 
     def _iq_chunk_metadata(self) -> dict:
@@ -543,6 +906,8 @@ class SdrReceiverPyWrapperNode(Node):
             "rf_bandwidth_hz": radio.get("rf_bandwidth_hz", 0),
             "rx_gain_db": radio.get("rx_gain", 0),
             "target": radio.get("target") or "UNKNOWN",
+            "adc_code_scale": self.foundation_config.adc_code_scale,
+            "rf_clipping_ratio": self.foundation_config.rf_clipping_ratio,
             "context_version": int(
                 getattr(self.context_arbiter, "context_version", 0)
             ),
