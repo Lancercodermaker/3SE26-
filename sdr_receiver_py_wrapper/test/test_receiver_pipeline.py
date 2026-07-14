@@ -1286,6 +1286,7 @@ def test_common_runtime_setup_failure_closes_created_device_before_async_recorde
 def test_common_runtime_constructor_cleanup_error_is_logged_not_raised(
     receiver_node_module,
     caplog,
+    capfd,
 ):
     class RaisingRecorder(MemoryRecorder):
         def close(self, *, stopped_reason="closed"):
@@ -1307,7 +1308,8 @@ def test_common_runtime_constructor_cleanup_error_is_logged_not_raised(
             )
 
     assert isinstance(raised.value.__cause__, OSError)
-    assert "recorder: recorder cleanup exploded" in caplog.text
+    emitted = caplog.text + capfd.readouterr().err
+    assert "recorder: recorder cleanup exploded" in emitted
 
 
 def test_common_runtime_configuration_failure_closes_device(receiver_node_module):
