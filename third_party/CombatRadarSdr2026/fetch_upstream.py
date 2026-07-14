@@ -186,16 +186,34 @@ def _verify_checkout(checkout: Path) -> None:
         )
 
 
+def _path_entry_exists(path: Path) -> bool:
+    return os.path.lexists(os.fspath(path))
+
+
 def _validate_destination(destination: Path) -> Path:
-    destination = destination.resolve()
+    requested = Path(destination).expanduser()
+    if ".." in requested.parts:
+        raise ValueError("destination must not contain parent traversal")
+    destination = Path(os.path.abspath(os.fspath(requested)))
     if not destination.name:
         raise ValueError("destination must not be a filesystem root")
+    if _path_entry_exists(destination):
+        raise FileExistsError(f"destination already exists: {destination}")
+
+    component = destination.parent
+    while True:
+        if component.is_symlink():
+            raise ValueError(
+                f"destination parent contains a symlink: {component}"
+            )
+        if component.parent == component:
+            break
+        component = component.parent
+
     if not destination.parent.is_dir():
         raise FileNotFoundError(
             f"destination parent does not exist: {destination.parent}"
         )
-    if destination.exists() or destination.is_symlink():
-        raise FileExistsError(f"destination already exists: {destination}")
     return destination
 
 
@@ -228,7 +246,7 @@ def fetch(destination: Path) -> None:
         with os.fdopen(lock_descriptor, "w", encoding="utf-8") as lock_file:
             lock_file.write(f"pid={os.getpid()}\n")
 
-        if destination.exists() or destination.is_symlink():
+        if _path_entry_exists(destination):
             raise FileExistsError(
                 f"destination appeared during fetch: {destination}"
             )
@@ -239,7 +257,7 @@ def fetch(destination: Path) -> None:
         )
         _materialize_checkout(staging)
         _verify_checkout(staging)
-        if destination.exists() or destination.is_symlink():
+        if _path_entry_exists(destination):
             raise FileExistsError(
                 f"destination appeared during fetch: {destination}"
             )

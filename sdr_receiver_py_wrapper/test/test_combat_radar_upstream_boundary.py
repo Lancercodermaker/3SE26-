@@ -360,3 +360,93 @@ def test_fetch_preserves_existing_destination_and_rejects_concurrent_lock(
     assert lock_path.read_text(encoding="utf-8") == "concurrent"
     assert not other_destination.exists()
     assert not list(tmp_path.glob(".other.staging-*"))
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+
+def _stub_fetch_io(fetch_module, monkeypatch) -> None:
+    def materialize(staging: Path) -> None:
+        (staging / "marker").write_text("complete", encoding="utf-8")
+
+    monkeypatch.setattr(fetch_module, "_materialize_checkout", materialize)
+    monkeypatch.setattr(
+        fetch_module, "_verify_checkout", lambda _staging: None
+    )
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+
+
+def test_fetch_rejects_dangling_destination_symlink_without_side_effects(
+    tmp_path: Path, monkeypatch
+):
+    target = tmp_path / "unspecified-target"
+    link = tmp_path / "requested-link"
+    _symlink_or_skip(link, target)
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+
+    with pytest.raises(FileExistsError, match="exists|symlink"):
+        fetch_module.fetch(link)
+
+    assert link.is_symlink()
+    assert not target.exists()
+    assert not (tmp_path / ".requested-link.fetch.lock").exists()
+    assert not list(tmp_path.glob(".requested-link.staging-*"))
+    assert not (tmp_path / ".unspecified-target.fetch.lock").exists()
+    assert not list(tmp_path.glob(".unspecified-target.staging-*"))
+
+
+def test_fetch_rejects_symlinked_parent_without_writing_through_it(
+    tmp_path: Path, monkeypatch
+):
+    actual_parent = tmp_path / "actual-parent"
+    actual_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    _symlink_or_skip(linked_parent, actual_parent)
+    destination = linked_parent / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+
+    with pytest.raises(ValueError, match="symlink"):
+        fetch_module.fetch(destination)
+
+    assert linked_parent.is_symlink()
+    assert list(actual_parent.iterdir()) == []
+    assert not (actual_parent / ".checkout.fetch.lock").exists()
+    assert not list(actual_parent.glob(".checkout.staging-*"))
+
+
+def test_fetch_accepts_plain_unicode_destination(tmp_path: Path, monkeypatch):
+    parent = tmp_path / "接收目录"
+    parent.mkdir()
+    destination = parent / "上游解调器"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+
+    fetch_module.fetch(destination)
+
+    assert (destination / "marker").read_text(encoding="utf-8") == "complete"
+    assert not (parent / ".上游解调器.fetch.lock").exists()
+    assert not list(parent.glob(".上游解调器.staging-*"))
+
+
+def test_fetch_rejects_parent_traversal_without_side_effects(
+    tmp_path: Path, monkeypatch
+):
+    nested_parent = tmp_path / "parent" / "nested"
+    nested_parent.mkdir(parents=True)
+    destination = nested_parent / ".." / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+
+    with pytest.raises(ValueError, match="traversal"):
+        fetch_module.fetch(destination)
+
+    resolved_target = tmp_path / "parent" / "checkout"
+    assert not resolved_target.exists()
+    assert not (resolved_target.parent / ".checkout.fetch.lock").exists()
+    assert not list(resolved_target.parent.glob(".checkout.staging-*"))

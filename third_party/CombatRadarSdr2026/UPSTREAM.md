@@ -61,8 +61,11 @@ Only a fully verified checkout is atomically renamed to the requested path. On
 failure, the helper removes only its own staging directory and lock: a requested
 target remains absent, or a pre-existing target remains untouched, so a later
 retry is safe. The destination parent must already exist and filesystem roots are
-rejected. The resulting checkout is not imported by this project and must not be
-committed or redistributed without written permission.
+rejected. Existing destination entries (including dangling symbolic links),
+parent traversal, and symbolic links in the destination's parent path are
+rejected before lock or staging creation. The resulting checkout is not imported
+by this project and must not be committed or redistributed without written
+permission.
 
 ## Local modifications and adapter boundary
 
