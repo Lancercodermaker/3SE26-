@@ -1141,6 +1141,210 @@ def test_common_runtime_recovers_reconnect_and_resets_before_next_decode(
     assert runtime.acquisition.stats.reconnects == 1
 
 
+def test_common_runtime_old_queued_chunk_cannot_consume_reconnect_marker(
+    receiver_node_module,
+):
+    class ScriptedBackend(FakeBackend):
+        def __init__(self, responses):
+            super().__init__(np.ones(2, dtype=np.complex64))
+            self.responses = list(responses)
+
+        def rx(self):
+            response = self.responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+    samples = np.ones(2, dtype=np.complex64)
+    old_backend = ScriptedBackend([samples, OSError("link lost")])
+    new_backend = ScriptedBackend([samples])
+    backends = iter([old_backend, new_backend])
+    decoder = ResetTrackingDecoder("improved_v67")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: next(backends),
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=decoder,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    old_chunk = runtime.acquire_once()
+    assert old_chunk.chunk_id == 0
+    assert runtime.acquire_once() is None
+
+    old_result = runtime.process_next(timeout_sec=0.0)
+    assert old_result.chunk.chunk_id == 0
+    assert [reason for reason, _ in decoder.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP
+    ]
+    assert runtime._pending_device_reconnect is True
+
+    post_chunk = runtime.acquire_once()
+    post_result = runtime.process_next(timeout_sec=0.0)
+    runtime.close()
+
+    assert post_chunk.chunk_id == post_result.chunk.chunk_id == 1
+    assert [reason for reason, _ in decoder.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+    assert runtime._pending_device_reconnect is False
+
+
+def test_common_runtime_multiple_reconnect_generations_are_not_collapsed(
+    receiver_node_module,
+):
+    class ScriptedBackend(FakeBackend):
+        def __init__(self, responses):
+            super().__init__(np.ones(2, dtype=np.complex64))
+            self.responses = list(responses)
+
+        def rx(self):
+            response = self.responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+    samples = np.ones(2, dtype=np.complex64)
+    initial = ScriptedBackend([samples, OSError("generation one lost")])
+    replacement = ScriptedBackend([OSError("generation two lost")])
+    healthy = ScriptedBackend([samples])
+    backends = iter([initial, replacement, healthy])
+    decoder = ResetTrackingDecoder("improved_v67")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: next(backends),
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=decoder,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    assert runtime.acquire_once().chunk_id == 0
+    assert runtime.acquire_once() is None
+    assert runtime.acquire_once() is None
+    assert runtime.process_next(timeout_sec=0.0).chunk.chunk_id == 0
+    assert [reason for reason, _ in decoder.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP
+    ]
+
+    assert runtime.acquire_once().chunk_id == 1
+    assert runtime.process_next(timeout_sec=0.0).chunk.chunk_id == 1
+    runtime.close()
+
+    assert [reason for reason, _ in decoder.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+    assert runtime._pending_device_reconnect is False
+
+
+def test_common_runtime_compatibility_pending_assignment_is_idempotent(
+    receiver_node_module,
+):
+    decoder = ResetTrackingDecoder("improved_v67")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=decoder,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    runtime._pending_device_reconnect = True
+    runtime._pending_device_reconnect = True
+    runtime.process_once()
+    runtime.close()
+
+    assert [reason for reason, _ in decoder.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+
+
+def test_common_runtime_dropped_first_post_reconnect_chunk_keeps_marker(
+    receiver_node_module,
+):
+    class ScriptedBackend(FakeBackend):
+        def __init__(self, responses):
+            super().__init__(np.ones(2, dtype=np.complex64))
+            self.responses = list(responses)
+
+        def rx(self):
+            response = self.responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+    samples = np.ones(2, dtype=np.complex64)
+    old_backend = ScriptedBackend([samples, OSError("link lost")])
+    new_backend = ScriptedBackend([samples, samples])
+    backends = iter([old_backend, new_backend])
+    decoder = ResetTrackingDecoder("improved_v67")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: next(backends),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            acquisition_queue_size=1
+        ),
+        primary=decoder,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    assert runtime.acquire_once().chunk_id == 0
+    assert runtime.acquire_once() is None
+    assert runtime.acquire_once() is None
+    assert runtime.acquisition.stats.queue_drops == 1
+    assert runtime.process_next(timeout_sec=0.0).chunk.chunk_id == 0
+
+    assert runtime.acquire_once().chunk_id == 2
+    assert runtime.process_next(timeout_sec=0.0).chunk.chunk_id == 2
+    runtime.close()
+
+    assert [reason for reason, _ in decoder.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.MANUAL,
+    ]
+    assert runtime._pending_device_reconnect is False
+
+
+def test_common_runtime_shadow_reset_diagnostic_failure_clears_marker(
+    receiver_node_module,
+):
+    recorder = ShadowFailingRecorder(fail_kind="decoder_reset")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=ResetTrackingDecoder("improved_v67"),
+        shadow=ResetTrackingDecoder("shadow"),
+        output=FakeOutput("improved_v67"),
+        recorder=recorder,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+    runtime._pending_device_reconnect = True
+
+    result = runtime.process_once()
+    runtime.close()
+
+    assert any(
+        diagnostic.stage == "shadow_decoder_reset_diagnostic"
+        for diagnostic in result.pipeline_result.diagnostic_errors
+    )
+    assert runtime._pending_device_reconnect is False
+
+
 def test_common_runtime_startup_reset_failure_preserves_pending_reconnect(
     receiver_node_module,
 ):

@@ -149,6 +149,13 @@ class CommonRuntimeResult:
     pipeline_result: ReceiverPipelineResult
 
 
+@dataclass(frozen=True)
+class _ReconnectMarker:
+    marker_id: int
+    device_generation: int
+    first_chunk_id: int
+
+
 class CommonReceiverRuntime:
     """Own the competition device and drive one common receive pipeline."""
 
@@ -191,7 +198,9 @@ class CommonReceiverRuntime:
         self._run_active = threading.Event()
         self._shutdown_reason: Optional[str] = None
         self._applied_radio_settings: Optional[dict] = None
-        self._pending_device_reconnect = False
+        self._reconnect_marker_lock = threading.Lock()
+        self._reconnect_markers: list[_ReconnectMarker] = []
+        self._next_reconnect_marker_id = 0
         self._last_decode_context: Optional[DecodeContext] = None
         self._expected_next_sample: Optional[int] = None
         self._context_condition = threading.Condition()
@@ -262,7 +271,18 @@ class CommonReceiverRuntime:
             stats_after = self.acquisition.stats
             if produced is None:
                 if stats_after.reconnects > stats_before.reconnects:
-                    self._pending_device_reconnect = True
+                    with self.acquisition._state_lock:
+                        first_chunk_id = self.acquisition._next_chunk_id
+                    markers = [
+                        self._record_reconnect_marker(
+                            generation,
+                            first_chunk_id,
+                        )
+                        for generation in range(
+                            stats_before.reconnects + 1,
+                            stats_after.reconnects + 1,
+                        )
+                    ]
                     if self.recorder is not None:
                         accepted = self.recorder.write_event(
                             "discontinuity",
@@ -270,6 +290,11 @@ class CommonReceiverRuntime:
                                 "reason": "device_reconnect",
                                 "reconnects": stats_after.reconnects,
                                 "read_errors": stats_after.read_errors,
+                                "reconnect_generations": [
+                                    marker.device_generation
+                                    for marker in markers
+                                ],
+                                "first_post_reconnect_chunk_id": first_chunk_id,
                             },
                         )
                         if accepted is not True:
@@ -306,7 +331,7 @@ class CommonReceiverRuntime:
         chunk = replace(queued, rf_metrics=metrics)
         self.last_rf_state = state
         reset_diagnostics = []
-        for reason in self._reset_reasons(chunk, context):
+        for reason, reconnect_marker in self._reset_plan(chunk, context):
             reason_diagnostics = self.pipeline.reset_decoders(
                 reason, context, chunk
             )
@@ -318,7 +343,7 @@ class CommonReceiverRuntime:
                     for diagnostic in reason_diagnostics
                 )
             ):
-                self._pending_device_reconnect = False
+                self._clear_reconnect_marker(reconnect_marker)
         if self.recorder is not None:
             accepted = self.recorder.write_event(
                 "rf_state",
@@ -360,32 +385,97 @@ class CommonReceiverRuntime:
             pipeline_result=result,
         )
 
-    def _reset_reasons(self, chunk, context) -> tuple[ResetReason, ...]:
-        reasons = []
+    def _reset_plan(self, chunk, context):
+        plan = []
         previous = self._last_decode_context
         if previous is None:
-            reasons.append(ResetReason.STARTUP)
-        if self._pending_device_reconnect:
-            reasons.append(ResetReason.DEVICE_RECONNECT)
+            plan.append((ResetReason.STARTUP, None))
+        plan.extend(
+            (ResetReason.DEVICE_RECONNECT, marker)
+            for marker in self._eligible_reconnect_markers(chunk.chunk_id)
+        )
         if previous is None:
-            return tuple(reasons)
+            return tuple(plan)
         if (
             context.target_version != previous.target_version
             or context.target != previous.target
         ):
-            reasons.append(ResetReason.TARGET_CHANGE)
+            plan.append((ResetReason.TARGET_CHANGE, None))
         if (
             context.context_version != previous.context_version
             or context.team != previous.team
             or context.profile != previous.profile
         ):
-            reasons.append(ResetReason.CONTEXT_CHANGE)
+            plan.append((ResetReason.CONTEXT_CHANGE, None))
         if (
             self._expected_next_sample is not None
             and chunk.first_sample_index != self._expected_next_sample
         ):
-            reasons.append(ResetReason.MANUAL)
-        return tuple(reasons)
+            plan.append((ResetReason.MANUAL, None))
+        return tuple(plan)
+
+    def _reset_reasons(self, chunk, context) -> tuple[ResetReason, ...]:
+        return tuple(reason for reason, _marker in self._reset_plan(chunk, context))
+
+    @property
+    def _pending_device_reconnect(self) -> bool:
+        with self._reconnect_marker_lock:
+            return bool(self._reconnect_markers)
+
+    @_pending_device_reconnect.setter
+    def _pending_device_reconnect(self, pending: bool) -> None:
+        with self._io_lock:
+            if not pending:
+                with self._reconnect_marker_lock:
+                    self._reconnect_markers.clear()
+                return
+            with self.acquisition._state_lock:
+                first_chunk_id = self.acquisition._next_chunk_id
+                device_generation = self.acquisition._reconnects
+            with self._reconnect_marker_lock:
+                if self._reconnect_markers:
+                    return
+                marker = _ReconnectMarker(
+                    marker_id=self._next_reconnect_marker_id,
+                    device_generation=int(device_generation),
+                    first_chunk_id=int(first_chunk_id),
+                )
+                self._next_reconnect_marker_id += 1
+                self._reconnect_markers.append(marker)
+
+    def _record_reconnect_marker(
+        self,
+        device_generation: int,
+        first_chunk_id: int,
+    ) -> _ReconnectMarker:
+        with self._reconnect_marker_lock:
+            marker = _ReconnectMarker(
+                marker_id=self._next_reconnect_marker_id,
+                device_generation=int(device_generation),
+                first_chunk_id=int(first_chunk_id),
+            )
+            self._next_reconnect_marker_id += 1
+            self._reconnect_markers.append(marker)
+            return marker
+
+    def _eligible_reconnect_markers(
+        self,
+        chunk_id: int,
+    ) -> tuple[_ReconnectMarker, ...]:
+        with self._reconnect_marker_lock:
+            return tuple(
+                marker
+                for marker in self._reconnect_markers
+                if marker.first_chunk_id <= chunk_id
+            )
+
+    def _clear_reconnect_marker(self, marker: _ReconnectMarker) -> None:
+        with self._reconnect_marker_lock:
+            self._reconnect_markers = [
+                pending
+                for pending in self._reconnect_markers
+                if pending.marker_id != marker.marker_id
+            ]
 
     def start(self) -> None:
         with self._lifecycle_lock:
