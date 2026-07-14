@@ -49,9 +49,20 @@ The actual opt-in command requires an acknowledgement of the license status:
 python third_party/CombatRadarSdr2026/fetch_upstream.py --acknowledge-no-license <destination>
 ```
 
-It creates a separate sparse checkout at the pinned commit containing only the
-four allowlisted files. That checkout is not imported by this project and must
-not be committed or redistributed without written permission.
+It uses a `blob:none` partial fetch and creates a separate sparse checkout at the
+pinned commit. The helper verifies each `HEAD:path` and materialized file against
+the blob table above with lazy fetching disabled. It also verifies that the local
+Git object database contains exactly the four allowlisted blobs; non-allowlisted
+upstream blobs are neither downloaded nor materialized.
+
+Fetching occurs in a uniquely named staging directory beside the destination.
+An exclusive sibling lock rejects concurrent helper runs for the same target.
+Only a fully verified checkout is atomically renamed to the requested path. On
+failure, the helper removes only its own staging directory and lock: a requested
+target remains absent, or a pre-existing target remains untouched, so a later
+retry is safe. The destination parent must already exist and filesystem roots are
+rejected. The resulting checkout is not imported by this project and must not be
+committed or redistributed without written permission.
 
 ## Local modifications and adapter boundary
 
