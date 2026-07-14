@@ -666,6 +666,150 @@ def test_common_runtime_cleanup_error_is_visible_and_failed_resource_retries(
     assert recorder.close_attempts == 2
 
 
+def test_common_runtime_failed_device_hook_retries_detached_cleanup(
+    receiver_node_module,
+    monkeypatch,
+):
+    class FailOnceCloseBackend(FakeBackend):
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("device hook failed")
+            self.closed = True
+
+    backend = FailOnceCloseBackend(np.ones(2, dtype=np.complex64))
+    factory_calls = []
+
+    def backend_factory():
+        factory_calls.append("connect")
+        return backend
+
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=backend_factory,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=ClosableMemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    with pytest.raises(RuntimeError, match="failed to close receiver"):
+        runtime.close(timeout_sec=1.0)
+
+    assert runtime.status()["lifecycle"] == "STOPPING"
+    assert runtime._closed is False
+    assert backend.close_calls == 1
+    assert runtime.device.stats.closes == 0
+    assert runtime.device._backend is None
+    assert factory_calls == ["connect"]
+
+    real_thread = receiver_node_module.threading.Thread
+    monkeypatch.setattr(
+        receiver_node_module.threading,
+        "Thread",
+        lambda *_args, **_kwargs: pytest.fail(
+            "STOPPING runtime attempted to construct a worker"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="stopping"):
+        runtime.start()
+    monkeypatch.setattr(receiver_node_module.threading, "Thread", real_thread)
+    for operation in (
+        runtime.acquire_once,
+        runtime.process_once,
+        lambda: runtime.process_next(timeout_sec=0.0),
+    ):
+        with pytest.raises(RuntimeError, match="stopping"):
+            operation()
+    assert runtime.device._backend is None
+    assert factory_calls == ["connect"]
+
+    runtime.close(timeout_sec=1.0)
+
+    assert runtime.status()["lifecycle"] == "CLOSED"
+    assert runtime._closed is True
+    assert backend.close_calls == 2
+    assert runtime.device.stats.closes == 1
+    assert runtime.device._backend is None
+    assert factory_calls == ["connect"]
+
+
+def test_common_runtime_always_failing_device_hook_remains_retryable(
+    receiver_node_module,
+):
+    class AlwaysFailCloseBackend(FakeBackend):
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError("device hook always failed")
+
+    backend = AlwaysFailCloseBackend(np.ones(2, dtype=np.complex64))
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=None,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    for expected_calls in (1, 2):
+        with pytest.raises(RuntimeError, match="device"):
+            runtime.close(timeout_sec=1.0)
+        assert backend.close_calls == expected_calls
+        assert runtime._closed is False
+        assert runtime.status()["lifecycle"] == "STOPPING"
+        assert runtime.device.stats.closes == 0
+
+
+def test_common_runtime_stop_event_closes_worker_exit_restart_window(
+    receiver_node_module,
+    monkeypatch,
+):
+    factory_calls = []
+    backend = FakeBackend(np.ones(2, dtype=np.complex64))
+
+    def backend_factory():
+        factory_calls.append("connect")
+        return backend
+
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=backend_factory,
+        config=receiver_node_module.ReceiverFoundationConfig(),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=None,
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+    runtime._lifecycle = "RUNNING"
+    runtime._run_active.clear()
+    runtime.stop_event.set()
+    real_thread = receiver_node_module.threading.Thread
+    monkeypatch.setattr(
+        receiver_node_module.threading,
+        "Thread",
+        lambda *_args, **_kwargs: pytest.fail(
+            "stopped runtime attempted to construct a worker"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="stopping"):
+        runtime.start()
+    monkeypatch.setattr(receiver_node_module.threading, "Thread", real_thread)
+    for operation in (
+        runtime.acquire_once,
+        runtime.process_once,
+        lambda: runtime.process_next(timeout_sec=0.0),
+    ):
+        with pytest.raises(RuntimeError, match="stopping"):
+            operation()
+    assert factory_calls == ["connect"]
+
+    runtime.close()
+
+
 def test_common_runtime_status_is_rich_truthful_and_json_safe(
     receiver_node_module,
     tmp_path,
@@ -983,11 +1127,8 @@ def test_common_runtime_recovers_reconnect_and_resets_before_next_decode(
 
     assert result.chunk.chunk_id == 0
     reasons = [reason for reason, _context in decoder.reset_calls]
-    assert reasons == [
-        receiver_node_module.ResetReason.STARTUP,
-        receiver_node_module.ResetReason.DEVICE_RECONNECT,
-    ]
-    assert decoder.reset_calls[-1][1] == make_context()
+    assert reasons == [receiver_node_module.ResetReason.STARTUP]
+    assert decoder.reset_calls[0][1] == make_context()
     discontinuity = next(
         payload for kind, payload in recorder.events if kind == "discontinuity"
     )
@@ -1050,6 +1191,98 @@ def test_common_runtime_resets_both_decoders_for_context_target_and_gap(
     ]
     assert [reason for reason, _ in primary.reset_calls] == expected
     assert [reason for reason, _ in shadow.reset_calls] == expected
+
+
+def test_common_runtime_combines_reconnect_target_context_and_gap_resets(
+    receiver_node_module,
+):
+    current_context = make_context()
+    primary = ResetTrackingDecoder("improved_v67")
+    shadow = ResetTrackingDecoder("shadow")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=lambda: current_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    runtime.process_once()
+    current_context = replace(
+        current_context,
+        target="JAM_L2_KEY",
+        target_version=5,
+        team="RED",
+        context_version=13,
+    )
+    runtime._pending_device_reconnect = True
+    runtime.acquisition._next_sample_index += 3
+    runtime.process_once()
+    runtime.close()
+
+    expected = [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.TARGET_CHANGE,
+        receiver_node_module.ResetReason.CONTEXT_CHANGE,
+        receiver_node_module.ResetReason.MANUAL,
+    ]
+    assert [reason for reason, _ in primary.reset_calls] == expected
+    assert [reason for reason, _ in shadow.reset_calls] == expected
+
+
+def test_common_runtime_primary_reset_failure_stops_later_combined_reasons(
+    receiver_node_module,
+):
+    class ContextResetFails(ResetTrackingDecoder):
+        def reset(self, reason, context):
+            super().reset(reason, context)
+            if reason is receiver_node_module.ResetReason.CONTEXT_CHANGE:
+                raise RuntimeError("context reset failed")
+
+    current_context = make_context()
+    primary = ContextResetFails("improved_v67")
+    shadow = ResetTrackingDecoder("shadow")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=lambda: current_context,
+        radio_settings_provider=radio_settings,
+    )
+
+    runtime.process_once()
+    current_context = replace(
+        current_context,
+        target="JAM_L2_KEY",
+        target_version=5,
+        team="RED",
+        context_version=13,
+    )
+    runtime.acquisition._next_sample_index += 3
+    with pytest.raises(RuntimeError, match="context reset failed"):
+        runtime.process_once()
+    runtime.close()
+
+    assert [reason for reason, _ in primary.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.TARGET_CHANGE,
+        receiver_node_module.ResetReason.CONTEXT_CHANGE,
+    ]
+    assert [reason for reason, _ in shadow.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.TARGET_CHANGE,
+    ]
 
 
 def test_common_runtime_primary_reset_failure_is_fatal_before_shadow_or_decode(
@@ -1310,6 +1543,34 @@ def test_common_runtime_constructor_cleanup_error_is_logged_not_raised(
     assert isinstance(raised.value.__cause__, OSError)
     emitted = caplog.text + capfd.readouterr().err
     assert "recorder: recorder cleanup exploded" in emitted
+
+
+def test_common_runtime_constructor_device_cleanup_failure_is_truthfully_logged(
+    receiver_node_module,
+    caplog,
+    capfd,
+):
+    class CleanupFailsBackend(FakeBackend):
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError("constructor device cleanup failed")
+
+    backend = CleanupFailsBackend(np.ones(2, dtype=np.complex64))
+    with caplog.at_level("ERROR", logger=receiver_node_module.__name__):
+        with pytest.raises(ValueError, match="invalid keys"):
+            receiver_node_module.CommonReceiverRuntime(
+                backend_factory=lambda: backend,
+                config=receiver_node_module.ReceiverFoundationConfig(),
+                primary=RecordingDecoder("improved_v67"),
+                output=FakeOutput("improved_v67"),
+                recorder=None,
+                context_provider=make_context,
+                radio_settings_provider=lambda: {},
+            )
+
+    emitted = caplog.text + capfd.readouterr().err
+    assert "device: failed to close receiver" in emitted
+    assert backend.close_calls == 1
 
 
 def test_common_runtime_configuration_failure_closes_device(receiver_node_module):
@@ -2476,6 +2737,45 @@ def test_destroy_node_timeout_preserves_runtime_and_skips_unsafe_teardown(
         node.destroy_node()
 
     assert calls == []
+
+
+def test_destroy_node_device_cleanup_error_defers_all_other_teardown(
+    receiver_node_module,
+    monkeypatch,
+):
+    calls = []
+
+    class RetryRuntime:
+        def __init__(self):
+            self.attempts = 0
+
+        def close(self):
+            self.attempts += 1
+            calls.append("runtime")
+            if self.attempts == 1:
+                raise RuntimeError("device cleanup failed")
+
+    monkeypatch.setattr(
+        receiver_node_module.Node,
+        "destroy_node",
+        lambda _self: calls.append("super") or True,
+        raising=False,
+    )
+    node = object.__new__(receiver_node_module.SdrReceiverPyWrapperNode)
+    node.common_runtime = RetryRuntime()
+    node.run_mode = "competition"
+    node.adapter = SimpleNamespace(
+        stop=lambda: calls.append("stop"),
+        restore_patches=lambda: calls.append("restore"),
+    )
+    node.iq_recorder = SimpleNamespace(close=lambda: calls.append("recorder"))
+
+    with pytest.raises(RuntimeError, match="device cleanup failed"):
+        node.destroy_node()
+
+    assert calls == ["runtime"]
+    assert node.destroy_node() is True
+    assert calls == ["runtime", "runtime", "restore", "recorder", "super"]
 
 
 def test_main_shuts_rclpy_down_when_node_construction_fails(

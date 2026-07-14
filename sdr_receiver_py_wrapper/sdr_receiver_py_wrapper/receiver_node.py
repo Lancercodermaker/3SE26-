@@ -176,6 +176,7 @@ class CommonReceiverRuntime:
         self._closed = False
         self._resources_closed = False
         self._device_close_done = False
+        self._pending_device_cleanup = None
         self._recorder_close_done = recorder is None
         self._cleanup_thread: Optional[threading.Thread] = None
         self._cleanup_done = threading.Event()
@@ -355,21 +356,20 @@ class CommonReceiverRuntime:
         reasons = []
         previous = self._last_decode_context
         if previous is None:
-            reasons.append(ResetReason.STARTUP)
+            return (ResetReason.STARTUP,)
         if self._pending_device_reconnect:
             reasons.append(ResetReason.DEVICE_RECONNECT)
-        if previous is not None:
-            if (
-                context.context_version != previous.context_version
-                or context.team != previous.team
-                or context.profile != previous.profile
-            ):
-                reasons.append(ResetReason.CONTEXT_CHANGE)
-            elif (
-                context.target_version != previous.target_version
-                or context.target != previous.target
-            ):
-                reasons.append(ResetReason.TARGET_CHANGE)
+        if (
+            context.target_version != previous.target_version
+            or context.target != previous.target
+        ):
+            reasons.append(ResetReason.TARGET_CHANGE)
+        if (
+            context.context_version != previous.context_version
+            or context.team != previous.team
+            or context.profile != previous.profile
+        ):
+            reasons.append(ResetReason.CONTEXT_CHANGE)
         if (
             self._expected_next_sample is not None
             and chunk.first_sample_index != self._expected_next_sample
@@ -379,6 +379,14 @@ class CommonReceiverRuntime:
 
     def start(self) -> None:
         with self._lifecycle_lock:
+            if (
+                self._lifecycle == "STOPPING"
+                or self._pending_device_cleanup is not None
+                or self.stop_event.is_set()
+            ):
+                raise RuntimeError(
+                    "common receiver runtime is stopping; retry close first"
+                )
             if self._closed or self._resources_closed:
                 raise RuntimeError("common receiver runtime is closed")
             if self._run_active.is_set():
@@ -603,7 +611,7 @@ class CommonReceiverRuntime:
             close_device = not self._device_close_done and self.device is not None
         if close_device:
             try:
-                self.device.close()
+                self._close_device_resource()
             except BaseException as exc:
                 errors.append(f"device: {exc}")
             else:
@@ -647,6 +655,33 @@ class CommonReceiverRuntime:
             with self._resource_lock:
                 self._cleanup_done.set()
 
+    def _close_device_resource(self) -> None:
+        """Close a detached backend hook exactly once, with retry on failure."""
+
+        device = self.device
+        with device._lock:
+            pending_cleanup = self._pending_device_cleanup
+            if pending_cleanup is not None:
+                try:
+                    pending_cleanup()
+                except BaseException:
+                    device._connection_errors += 1
+                    raise
+                device._closes += 1
+                self._pending_device_cleanup = None
+                return
+
+            backend = device._backend
+            cleanup = (
+                None if backend is None else device._find_cleanup(backend)
+            )
+            try:
+                device.close()
+            except BaseException:
+                if cleanup is not None:
+                    self._pending_device_cleanup = cleanup
+                raise
+
     def _context_for_chunk(self, chunk_id, timeout_sec):
         deadline = time.monotonic() + max(0.05, float(timeout_sec))
         with self._context_condition:
@@ -662,6 +697,14 @@ class CommonReceiverRuntime:
             raise RuntimeError(
                 "manual queue operation is unavailable while runtime workers "
                 "are active"
+            )
+        if (
+            self._lifecycle == "STOPPING"
+            or self._pending_device_cleanup is not None
+            or self.stop_event.is_set()
+        ):
+            raise RuntimeError(
+                "common receiver runtime is stopping; retry close first"
             )
         if self._closed or self._resources_closed:
             raise RuntimeError("common receiver runtime is closed")
@@ -1590,14 +1633,9 @@ class SdrReceiverPyWrapperNode(Node):
         errors = []
         common_runtime = getattr(self, "common_runtime", None)
         if common_runtime is not None:
-            try:
-                common_runtime.close()
-            except TimeoutError:
-                # The core/device may still be in use.  Preserve the node and
-                # patches so a later destroy attempt can finish safely.
-                raise
-            except BaseException as exc:
-                errors.append(("common runtime", exc))
+            # Any runtime cleanup failure leaves core/device ownership live.
+            # Defer every downstream teardown phase until a retry succeeds.
+            common_runtime.close()
         adapter = getattr(self, "adapter", None)
         if adapter is not None and getattr(self, "run_mode", "debug") == "debug":
             try:
