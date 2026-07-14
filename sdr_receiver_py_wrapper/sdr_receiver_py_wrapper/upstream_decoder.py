@@ -17,6 +17,44 @@ from .models import (
 )
 
 
+_MAX_PAYLOAD_BYTES = 256
+_VERIFIED_CRC_MODE = "kermit-x3014"
+
+
+def _validate_verified_frame_values(
+    *,
+    cmd_id,
+    data,
+    seq,
+    crc8_ok,
+    crc16_ok,
+    crc_mode,
+) -> None:
+    if type(cmd_id) is not int:
+        raise TypeError("frame cmd_id must be an exact int")
+    if not 0 <= cmd_id <= 0xFFFF:
+        raise ValueError("frame cmd_id must be in range 0..65535")
+
+    if type(seq) is not int:
+        raise TypeError("frame seq must be an exact int")
+    if not 0 <= seq <= 0xFF:
+        raise ValueError("frame seq must be in range 0..255")
+
+    if type(data) is not bytes:
+        raise TypeError("frame data must be exact bytes")
+    if len(data) > _MAX_PAYLOAD_BYTES:
+        raise ValueError("frame data payload exceeds 256 bytes")
+
+    if type(crc8_ok) is not bool or crc8_ok is not True:
+        raise TypeError("verified frame crc8_ok must be exact True")
+    if type(crc16_ok) is not bool or crc16_ok is not True:
+        raise TypeError("verified frame crc16_ok must be exact True")
+    if type(crc_mode) is not str or crc_mode != _VERIFIED_CRC_MODE:
+        raise ValueError(
+            "verified frame crc_mode must be exact 'kermit-x3014'"
+        )
+
+
 @dataclass(frozen=True)
 class ActiveProfile:
     """Normalized RF profile metadata selected by a decoder reset."""
@@ -33,11 +71,21 @@ class VerifiedParsedFrame:
     """Backend-owned claim that an upstream parser verified one frame."""
 
     cmd_id: int
-    data: object
+    data: bytes
     seq: int
     crc8_ok: bool
     crc16_ok: bool
     crc_mode: str
+
+    def __post_init__(self) -> None:
+        _validate_verified_frame_values(
+            cmd_id=self.cmd_id,
+            data=self.data,
+            seq=self.seq,
+            crc8_ok=self.crc8_ok,
+            crc16_ok=self.crc16_ok,
+            crc_mode=self.crc_mode,
+        )
 
 
 _PROFILE_FREQUENCIES = MappingProxyType(
@@ -51,7 +99,6 @@ _PROFILE_FREQUENCIES = MappingProxyType(
     }
 )
 _MISSING = object()
-_MAX_PAYLOAD_BYTES = 256
 _MAX_FRAMES_PER_CHUNK = 64
 
 
@@ -64,61 +111,18 @@ def _validated_frame_fields(
 ) -> tuple[int, bytes, int, bool, bool, str]:
     if type(frame) is not VerifiedParsedFrame:
         raise TypeError("backend frames must be exact VerifiedParsedFrame")
-    if type(frame.crc8_ok) is not bool or frame.crc8_ok is not True:
-        raise TypeError("verified frame crc8_ok must be exact True")
-    if type(frame.crc16_ok) is not bool or frame.crc16_ok is not True:
-        raise TypeError("verified frame crc16_ok must be exact True")
-    if type(frame.crc_mode) is not str or frame.crc_mode != "kermit-x3014":
-        raise ValueError(
-            "verified frame crc_mode must be exact 'kermit-x3014'"
-        )
-
-    cmd_id = frame.cmd_id
-    if type(cmd_id) is not int:
-        raise TypeError("frame cmd_id must be an exact int")
-    if not 0 <= cmd_id <= 0xFFFF:
-        raise ValueError("frame cmd_id must be in range 0..65535")
-
-    seq = frame.seq
-    if type(seq) is not int:
-        raise TypeError("frame seq must be an exact int")
-    if not 0 <= seq <= 0xFF:
-        raise ValueError("frame seq must be in range 0..255")
-
-    data = frame.data
-    if type(data) in (bytes, bytearray):
-        if len(data) > _MAX_PAYLOAD_BYTES:
-            raise ValueError("frame data payload exceeds 256 bytes")
-        payload = bytes(data)
-    elif type(data) is memoryview:
-        try:
-            ndim = data.ndim
-            itemsize = data.itemsize
-            data_format = data.format
-            contiguous = data.c_contiguous
-            payload_size = data.nbytes
-        except ValueError as error:
-            raise ValueError("frame data memoryview is unavailable") from error
-        if (
-            ndim != 1
-            or itemsize != 1
-            or data_format not in ("B", "b", "c")
-            or not contiguous
-        ):
-            raise ValueError(
-                "frame data memoryview must be one-dimensional bytes"
-            )
-        if payload_size > _MAX_PAYLOAD_BYTES:
-            raise ValueError("frame data payload exceeds 256 bytes")
-        payload = data.tobytes()
-    else:
-        raise TypeError(
-            "frame data must be bytes, bytearray, or memoryview"
-        )
+    _validate_verified_frame_values(
+        cmd_id=frame.cmd_id,
+        data=frame.data,
+        seq=frame.seq,
+        crc8_ok=frame.crc8_ok,
+        crc16_ok=frame.crc16_ok,
+        crc_mode=frame.crc_mode,
+    )
     return (
-        cmd_id,
-        payload,
-        seq,
+        frame.cmd_id,
+        frame.data,
+        frame.seq,
         frame.crc8_ok,
         frame.crc16_ok,
         frame.crc_mode,

@@ -82,6 +82,93 @@ def released_memoryview() -> memoryview:
     return value
 
 
+def forged_verified_frame(**overrides) -> VerifiedParsedFrame:
+    values = {
+        "cmd_id": 0x0A06,
+        "data": b"ABC123",
+        "seq": 1,
+        "crc8_ok": True,
+        "crc16_ok": True,
+        "crc_mode": "kermit-x3014",
+    }
+    values.update(overrides)
+    frame = object.__new__(VerifiedParsedFrame)
+    for field_name, value in values.items():
+        object.__setattr__(frame, field_name, value)
+    return frame
+
+
+_INVALID_VERIFIED_FRAME_CASES = [
+    pytest.param({"cmd_id": None}, "cmd_id", id="cmd-none"),
+    pytest.param({"cmd_id": True}, "cmd_id", id="cmd-bool"),
+    pytest.param({"cmd_id": -1}, "cmd_id", id="cmd-negative"),
+    pytest.param({"cmd_id": 0x1_0000}, "cmd_id", id="cmd-large"),
+    pytest.param({"seq": None}, "seq", id="seq-none"),
+    pytest.param({"seq": True}, "seq", id="seq-bool"),
+    pytest.param({"seq": -1}, "seq", id="seq-negative"),
+    pytest.param({"seq": 256}, "seq", id="seq-large"),
+    pytest.param({"data": None}, "exact bytes", id="data-none"),
+    pytest.param({"data": 3}, "exact bytes", id="data-int"),
+    pytest.param({"data": "x"}, "exact bytes", id="data-str"),
+    pytest.param({"data": [1]}, "exact bytes", id="data-list"),
+    pytest.param(
+        {"data": bytearray(b"ABC123")},
+        "exact bytes",
+        id="data-bytearray",
+    ),
+    pytest.param(
+        {"data": memoryview(bytearray(b"ABC123"))},
+        "exact bytes",
+        id="data-memoryview",
+    ),
+    pytest.param(
+        {"data": type("BytesSubclass", (bytes,), {})(b"ABC123")},
+        "exact bytes",
+        id="data-bytes-subclass",
+    ),
+    pytest.param({"data": bytes(257)}, "payload", id="data-large-bytes"),
+    pytest.param(
+        {"data": bytearray(257)},
+        "exact bytes",
+        id="data-large-bytearray",
+    ),
+    pytest.param(
+        {"data": memoryview(bytearray(257))},
+        "exact bytes",
+        id="data-large-memoryview",
+    ),
+    pytest.param(
+        {"data": memoryview(bytearray(4)).cast("B", shape=(2, 2))},
+        "exact bytes",
+        id="data-multidimensional-memoryview",
+    ),
+    pytest.param(
+        {"data": memoryview(bytearray(range(4)))[::2]},
+        "exact bytes",
+        id="data-noncontiguous-memoryview",
+    ),
+    pytest.param(
+        {"data": released_memoryview()},
+        "exact bytes",
+        id="data-released-memoryview",
+    ),
+    pytest.param({"crc8_ok": False}, "crc8_ok", id="crc8-false"),
+    pytest.param({"crc8_ok": 1}, "crc8_ok", id="crc8-int"),
+    pytest.param({"crc16_ok": False}, "crc16_ok", id="crc16-false"),
+    pytest.param({"crc16_ok": 1}, "crc16_ok", id="crc16-int"),
+    pytest.param({"crc_mode": "other"}, "crc_mode", id="crc-mode-value"),
+    pytest.param(
+        {
+            "crc_mode": type("StrSubclass", (str,), {})(
+                "kermit-x3014"
+            )
+        },
+        "crc_mode",
+        id="crc-mode-subclass",
+    ),
+]
+
+
 class RecordingBackend:
     def __init__(self, frames=()):
         self.frames = frames
@@ -123,6 +210,27 @@ def test_verified_parsed_frame_contract_exists_and_is_frozen():
     )
     with pytest.raises(FrozenInstanceError):
         frame.seq = 2
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        bytearray(b"ABC123"),
+        memoryview(bytearray(b"ABC123")),
+        type("BytesSubclass", (bytes,), {})(b"ABC123"),
+    ],
+)
+def test_verified_frame_rejects_mutable_or_subclassed_payload(data):
+    with pytest.raises(TypeError, match="exact bytes"):
+        verified_frame(data=data)
+
+
+def test_verified_frame_accepts_exact_immutable_bytes():
+    payload = b"ABC123"
+
+    frame = verified_frame(data=payload)
+
+    assert frame.data is payload
 
 
 @pytest.mark.parametrize(
@@ -475,13 +583,12 @@ def test_malicious_backend_cannot_mutate_shared_chunk_samples():
 
 
 def test_multiple_parsed_frames_are_converted_with_complete_metadata():
-    mutable_data = bytearray(b"ABC123")
     backend = RecordingBackend(
         [
-            verified_frame(cmd_id=0x0A06, data=mutable_data, seq=41),
+            verified_frame(cmd_id=0x0A06, data=b"ABC123", seq=41),
             verified_frame(
                 cmd_id=0x0A02,
-                data=memoryview(b"payload"),
+                data=b"payload",
                 seq=42,
             ),
         ]
@@ -492,7 +599,6 @@ def test_multiple_parsed_frames_are_converted_with_complete_metadata():
     decoder.reset(ResetReason.TARGET_CHANGE, context)
 
     commands = decoder.decode(chunk, context)
-    mutable_data[:] = b"XXXXXX"
 
     assert [command.cmd_id for command in commands] == [0x0A06, 0x0A02]
     assert [command.payload for command in commands] == [b"ABC123", b"payload"]
@@ -520,31 +626,20 @@ def test_multiple_parsed_frames_are_converted_with_complete_metadata():
 
 
 @pytest.mark.parametrize(
-    ("frame", "message"),
-    [
-        (verified_frame(cmd_id=None, data=b"x", seq=1), "cmd_id"),
-        (verified_frame(cmd_id=True, data=b"x", seq=1), "cmd_id"),
-        (verified_frame(cmd_id=-1, data=b"x", seq=1), "cmd_id"),
-        (verified_frame(cmd_id=0x1_0000, data=b"x", seq=1), "cmd_id"),
-        (verified_frame(cmd_id=1, data=b"x", seq=None), "seq"),
-        (verified_frame(cmd_id=1, data=b"x", seq=True), "seq"),
-        (verified_frame(cmd_id=1, data=b"x", seq=-1), "seq"),
-        (verified_frame(cmd_id=1, data=b"x", seq=256), "seq"),
-        (verified_frame(cmd_id=1, data=None, seq=1), "data"),
-        (verified_frame(cmd_id=1, data=3, seq=1), "data"),
-        (verified_frame(cmd_id=1, data="x", seq=1), "data"),
-        (verified_frame(cmd_id=1, data=[1], seq=1), "data"),
-        (
-            verified_frame(
-                cmd_id=1,
-                data=memoryview(np.array([True], dtype=np.bool_)),
-                seq=1,
-            ),
-            "data",
-        ),
-    ],
+    ("overrides", "message"),
+    _INVALID_VERIFIED_FRAME_CASES,
 )
-def test_invalid_frame_fields_reject_the_entire_chunk(frame, message):
+def test_verified_frame_constructor_rejects_invalid_fields(overrides, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        verified_frame(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    _INVALID_VERIFIED_FRAME_CASES,
+)
+def test_decode_defensively_rejects_forged_invalid_frame(overrides, message):
+    frame = forged_verified_frame(**overrides)
     backend = RecordingBackend(
         [verified_frame(cmd_id=1, data=b"valid-first", seq=1), frame]
     )
@@ -559,6 +654,23 @@ def test_invalid_frame_fields_reject_the_entire_chunk(frame, message):
     assert stats.decode_errors == 1
     assert stats.chunks_processed == 0
     assert stats.samples_processed == 0
+    assert stats.commands_emitted == 0
+
+
+def test_mutated_forged_payload_cannot_reuse_verified_crc_claim():
+    mutable_payload = bytearray(b"ABC123")
+    frame = forged_verified_frame(data=mutable_payload)
+    mutable_payload[:] = b"XXXXXX"
+    decoder = UpstreamDecoder(backend=RecordingBackend([frame]))
+    context = make_context(profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    with pytest.raises(TypeError, match="exact bytes"):
+        decoder.decode(make_chunk(), context)
+
+    stats = decoder.stats()
+    assert stats.decode_errors == 1
+    assert stats.chunks_processed == 0
     assert stats.commands_emitted == 0
 
 
@@ -584,68 +696,6 @@ def test_unverified_frame_is_rejected_without_reading_properties():
     assert stats.decode_errors == 1
     assert stats.chunks_processed == 0
     assert stats.samples_processed == 0
-    assert stats.commands_emitted == 0
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"crc8_ok": False}, "crc8_ok"),
-        ({"crc8_ok": 1}, "crc8_ok"),
-        ({"crc16_ok": False}, "crc16_ok"),
-        ({"crc16_ok": 1}, "crc16_ok"),
-        ({"crc_mode": "other"}, "crc_mode"),
-    ],
-)
-def test_verified_frame_crc_claim_must_be_exact(overrides, message):
-    values = {
-        "cmd_id": 0x0A06,
-        "data": b"ABC123",
-        "seq": 1,
-        "crc8_ok": True,
-        "crc16_ok": True,
-        "crc_mode": "kermit-x3014",
-    }
-    values.update(overrides)
-    decoder = UpstreamDecoder(
-        backend=RecordingBackend([VerifiedParsedFrame(**values)])
-    )
-    context = make_context(profile="competition")
-    decoder.reset(ResetReason.STARTUP, context)
-
-    with pytest.raises((TypeError, ValueError), match=message):
-        decoder.decode(make_chunk(), context)
-
-    stats = decoder.stats()
-    assert stats.decode_errors == 1
-    assert stats.chunks_processed == 0
-    assert stats.commands_emitted == 0
-
-
-@pytest.mark.parametrize(
-    "data",
-    [
-        bytes(257),
-        bytearray(257),
-        memoryview(bytearray(257)),
-        memoryview(bytearray(4)).cast("B", shape=(2, 2)),
-        memoryview(bytearray(range(4)))[::2],
-        released_memoryview(),
-    ],
-)
-def test_payload_resource_and_memoryview_contract_is_bounded(data):
-    decoder = UpstreamDecoder(
-        backend=RecordingBackend([verified_frame(data=data)])
-    )
-    context = make_context(profile="competition")
-    decoder.reset(ResetReason.STARTUP, context)
-
-    with pytest.raises(ValueError):
-        decoder.decode(make_chunk(), context)
-
-    stats = decoder.stats()
-    assert stats.decode_errors == 1
-    assert stats.chunks_processed == 0
     assert stats.commands_emitted == 0
 
 
