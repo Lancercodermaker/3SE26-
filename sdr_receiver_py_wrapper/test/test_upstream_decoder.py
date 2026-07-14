@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, FrozenInstanceError
+from dataclasses import FrozenInstanceError
 from pathlib import Path
+import threading
+from types import MappingProxyType
 
 import numpy as np
 import pytest
 
+from sdr_receiver_py_wrapper.command_validator import CommandValidator
 from sdr_receiver_py_wrapper.models import DecodeContext, IqChunk, ResetReason
 import sdr_receiver_py_wrapper.upstream_decoder as upstream_decoder
-from sdr_receiver_py_wrapper.upstream_decoder import UpstreamDecoder
+from sdr_receiver_py_wrapper.upstream_decoder import (
+    UpstreamDecoder,
+    VerifiedParsedFrame,
+)
 
 
 def make_context(
@@ -51,11 +57,29 @@ def make_chunk(samples: np.ndarray | None = None) -> IqChunk:
     )
 
 
-@dataclass
-class ParsedFrame:
-    cmd_id: int
-    data: object
-    seq: int
+def verified_frame(
+    *,
+    cmd_id=0x0A06,
+    data=b"ABC123",
+    seq=1,
+    crc8_ok=True,
+    crc16_ok=True,
+    crc_mode="kermit-x3014",
+):
+    return VerifiedParsedFrame(
+        cmd_id=cmd_id,
+        data=data,
+        seq=seq,
+        crc8_ok=crc8_ok,
+        crc16_ok=crc16_ok,
+        crc_mode=crc_mode,
+    )
+
+
+def released_memoryview() -> memoryview:
+    value = memoryview(b"released")
+    value.release()
+    return value
 
 
 class RecordingBackend:
@@ -85,18 +109,34 @@ def test_plugin_has_stable_identity_and_no_hardware_or_transport_ownership():
         assert not hasattr(decoder, forbidden)
 
 
+def test_verified_parsed_frame_contract_exists_and_is_frozen():
+    frame_type = getattr(upstream_decoder, "VerifiedParsedFrame", None)
+
+    assert frame_type is not None
+    frame = frame_type(
+        cmd_id=0x0A06,
+        data=b"ABC123",
+        seq=1,
+        crc8_ok=True,
+        crc16_ok=True,
+        crc_mode="kermit-x3014",
+    )
+    with pytest.raises(FrozenInstanceError):
+        frame.seq = 2
+
+
 @pytest.mark.parametrize(
-    ("team", "target", "center_freq"),
+    ("team", "target", "center_freq", "level"),
     [
-        ("RED", "L1", 432_200_000),
-        ("RED", "L2", 432_500_000),
-        ("RED", "L3", 432_800_000),
-        ("BLUE", "L1", 434_920_000),
-        ("BLUE", "L2", 434_620_000),
-        ("BLUE", "L3", 434_320_000),
+        ("RED", "L1", 432_200_000, 1),
+        ("RED", "L2", 432_500_000, 2),
+        ("RED", "L3", 432_800_000, 3),
+        ("BLUE", "L1", 434_920_000, 1),
+        ("BLUE", "L2", 434_620_000, 2),
+        ("BLUE", "L3", 434_320_000, 3),
     ],
 )
-def test_reset_selects_each_explicit_profile(team, target, center_freq):
+def test_reset_selects_each_explicit_profile(team, target, center_freq, level):
     decoder = UpstreamDecoder()
 
     decoder.reset(ResetReason.TARGET_CHANGE, make_context(team, target))
@@ -105,7 +145,16 @@ def test_reset_selects_each_explicit_profile(team, target, center_freq):
     assert decoder.active_profile.team == team
     assert decoder.active_profile.target == target
     assert decoder.active_profile.center_freq == center_freq
+    assert decoder.active_profile.level == level
     assert decoder.stats().resets == 1
+
+
+def test_profile_lookup_table_is_read_only():
+    profiles = upstream_decoder._PROFILE_FREQUENCIES
+
+    assert isinstance(profiles, MappingProxyType)
+    with pytest.raises(TypeError):
+        profiles[("BLUE", "L1")] = (1, 1)
 
 
 def test_profile_lookup_strips_whitespace_and_normalizes_case():
@@ -294,6 +343,69 @@ def test_missing_backend_fails_with_clear_configuration_error():
     assert decoder.stats().chunks_processed == 0
 
 
+def test_present_noncallable_decode_hook_does_not_fall_back_to_call():
+    class Backend:
+        decode = 3
+        called = False
+
+        def __call__(self, **_keywords):
+            self.called = True
+            return ()
+
+    backend = Backend()
+    decoder = UpstreamDecoder(backend=backend)
+    context = make_context(profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    with pytest.raises(TypeError, match="decode hook"):
+        decoder.decode(make_chunk(), context)
+
+    assert backend.called is False
+    assert decoder.stats().decode_errors == 1
+
+
+def test_decode_hook_getter_failure_is_counted():
+    class Backend:
+        @property
+        def decode(self):
+            raise RuntimeError("decode hook getter failed")
+
+    decoder = UpstreamDecoder(backend=Backend())
+    context = make_context(profile="debug")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    with pytest.raises(RuntimeError, match="decode hook getter failed"):
+        decoder.decode(make_chunk(), context)
+
+    assert decoder.stats().decode_errors == 1
+    assert decoder.stats().chunks_processed == 0
+
+
+@pytest.mark.parametrize(
+    ("context", "message"),
+    [
+        (None, "DecodeContext"),
+        (DecodeContext(None, "L1", "competition", 3, 4), "team"),
+        (DecodeContext("BLUE", 1, "competition", 3, 4), "target"),
+        (DecodeContext("BLUE", "L1", None, 3, 4), "profile"),
+        (DecodeContext("BLUE", "L1", "   ", 3, 4), "profile"),
+    ],
+)
+def test_decode_context_uses_exact_normalized_text_contract(context, message):
+    backend = RecordingBackend()
+    decoder = UpstreamDecoder(backend=backend)
+    decoder.reset(
+        ResetReason.STARTUP,
+        make_context(profile="competition"),
+    )
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        decoder.decode(make_chunk(), context)
+
+    assert backend.decode_calls == []
+    assert decoder.stats().decode_errors == 1
+
+
 @pytest.mark.parametrize(
     ("samples", "message"),
     [
@@ -326,23 +438,52 @@ def test_backend_receives_only_iq_and_necessary_pure_values():
     decoder.reset(ResetReason.STARTUP, context)
 
     decoder.decode(chunk, context)
+    decoder.decode(chunk, context)
 
-    assert len(backend.decode_calls) == 1
+    assert len(backend.decode_calls) == 2
     call = backend.decode_calls[0]
     assert set(call) == {"samples", "sample_rate_hz", "profile"}
-    assert call["samples"] is chunk.samples
+    assert call["samples"] is not chunk.samples
+    assert call["samples"] is not backend.decode_calls[1]["samples"]
+    assert np.array_equal(call["samples"], chunk.samples)
+    assert call["samples"].dtype == np.complex64
+    assert call["samples"].flags.owndata is True
+    assert call["samples"].flags.c_contiguous is True
     assert call["samples"].flags.writeable is False
     assert call["sample_rate_hz"] == chunk.sample_rate_hz
     assert call["profile"] is decoder.active_profile
     assert not isinstance(call["profile"], IqChunk)
 
 
+def test_malicious_backend_cannot_mutate_shared_chunk_samples():
+    class MutatingBackend:
+        def decode(self, *, samples, sample_rate_hz, profile):
+            samples.flags.writeable = True
+            samples[:] = np.complex64(9 + 4j)
+            return ()
+
+    chunk = make_chunk(np.array([1 + 2j, 3 + 4j], dtype=np.complex64))
+    before = chunk.samples.tobytes()
+    decoder = UpstreamDecoder(backend=MutatingBackend())
+    context = make_context(profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    assert decoder.decode(chunk, context) == []
+
+    assert chunk.samples.tobytes() == before
+    assert chunk.samples.flags.writeable is False
+
+
 def test_multiple_parsed_frames_are_converted_with_complete_metadata():
     mutable_data = bytearray(b"ABC123")
     backend = RecordingBackend(
         [
-            ParsedFrame(cmd_id=0x0A06, data=mutable_data, seq=41),
-            ParsedFrame(cmd_id=0x0A02, data=memoryview(b"payload"), seq=42),
+            verified_frame(cmd_id=0x0A06, data=mutable_data, seq=41),
+            verified_frame(
+                cmd_id=0x0A02,
+                data=memoryview(b"payload"),
+                seq=42,
+            ),
         ]
     )
     decoder = UpstreamDecoder(backend=backend)
@@ -356,7 +497,7 @@ def test_multiple_parsed_frames_are_converted_with_complete_metadata():
     assert [command.cmd_id for command in commands] == [0x0A06, 0x0A02]
     assert [command.payload for command in commands] == [b"ABC123", b"payload"]
     assert [dict(command.evidence) for command in commands] == [
-        {"upstream_seq": 41},
+        {"upstream_seq": 41, "level": 1},
         {"upstream_seq": 42},
     ]
     for command in commands:
@@ -381,20 +522,20 @@ def test_multiple_parsed_frames_are_converted_with_complete_metadata():
 @pytest.mark.parametrize(
     ("frame", "message"),
     [
-        (ParsedFrame(cmd_id=None, data=b"x", seq=1), "cmd_id"),
-        (ParsedFrame(cmd_id=True, data=b"x", seq=1), "cmd_id"),
-        (ParsedFrame(cmd_id=-1, data=b"x", seq=1), "cmd_id"),
-        (ParsedFrame(cmd_id=0x1_0000, data=b"x", seq=1), "cmd_id"),
-        (ParsedFrame(cmd_id=1, data=b"x", seq=None), "seq"),
-        (ParsedFrame(cmd_id=1, data=b"x", seq=True), "seq"),
-        (ParsedFrame(cmd_id=1, data=b"x", seq=-1), "seq"),
-        (ParsedFrame(cmd_id=1, data=b"x", seq=256), "seq"),
-        (ParsedFrame(cmd_id=1, data=None, seq=1), "data"),
-        (ParsedFrame(cmd_id=1, data=3, seq=1), "data"),
-        (ParsedFrame(cmd_id=1, data="x", seq=1), "data"),
-        (ParsedFrame(cmd_id=1, data=[1], seq=1), "data"),
+        (verified_frame(cmd_id=None, data=b"x", seq=1), "cmd_id"),
+        (verified_frame(cmd_id=True, data=b"x", seq=1), "cmd_id"),
+        (verified_frame(cmd_id=-1, data=b"x", seq=1), "cmd_id"),
+        (verified_frame(cmd_id=0x1_0000, data=b"x", seq=1), "cmd_id"),
+        (verified_frame(cmd_id=1, data=b"x", seq=None), "seq"),
+        (verified_frame(cmd_id=1, data=b"x", seq=True), "seq"),
+        (verified_frame(cmd_id=1, data=b"x", seq=-1), "seq"),
+        (verified_frame(cmd_id=1, data=b"x", seq=256), "seq"),
+        (verified_frame(cmd_id=1, data=None, seq=1), "data"),
+        (verified_frame(cmd_id=1, data=3, seq=1), "data"),
+        (verified_frame(cmd_id=1, data="x", seq=1), "data"),
+        (verified_frame(cmd_id=1, data=[1], seq=1), "data"),
         (
-            ParsedFrame(
+            verified_frame(
                 cmd_id=1,
                 data=memoryview(np.array([True], dtype=np.bool_)),
                 seq=1,
@@ -405,7 +546,7 @@ def test_multiple_parsed_frames_are_converted_with_complete_metadata():
 )
 def test_invalid_frame_fields_reject_the_entire_chunk(frame, message):
     backend = RecordingBackend(
-        [ParsedFrame(cmd_id=1, data=b"valid-first", seq=1), frame]
+        [verified_frame(cmd_id=1, data=b"valid-first", seq=1), frame]
     )
     decoder = UpstreamDecoder(backend=backend)
     context = make_context(profile="competition")
@@ -421,33 +562,134 @@ def test_invalid_frame_fields_reject_the_entire_chunk(frame, message):
     assert stats.commands_emitted == 0
 
 
-@pytest.mark.parametrize("failure_kind", ["missing", "getter"])
-def test_frame_attribute_failures_are_counted_transactionally(failure_kind):
-    if failure_kind == "missing":
-        class BadFrame:
-            cmd_id = 1
-            seq = 1
-    else:
-        class BadFrame:
-            cmd_id = 1
-            seq = 1
+def test_unverified_frame_is_rejected_without_reading_properties():
+    class BadFrame:
+        property_read = False
 
-            @property
-            def data(self):
-                raise RuntimeError("frame data getter failed")
+        @property
+        def cmd_id(self):
+            self.property_read = True
+            raise RuntimeError("unverified property must not be read")
 
-    decoder = UpstreamDecoder(backend=RecordingBackend([BadFrame()]))
+    frame = BadFrame()
+    decoder = UpstreamDecoder(backend=RecordingBackend([frame]))
     context = make_context(profile="debug")
     decoder.reset(ResetReason.STARTUP, context)
 
-    with pytest.raises((AttributeError, RuntimeError)):
+    with pytest.raises(TypeError, match="VerifiedParsedFrame"):
         decoder.decode(make_chunk(), context)
 
+    assert frame.property_read is False
     stats = decoder.stats()
     assert stats.decode_errors == 1
     assert stats.chunks_processed == 0
     assert stats.samples_processed == 0
     assert stats.commands_emitted == 0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"crc8_ok": False}, "crc8_ok"),
+        ({"crc8_ok": 1}, "crc8_ok"),
+        ({"crc16_ok": False}, "crc16_ok"),
+        ({"crc16_ok": 1}, "crc16_ok"),
+        ({"crc_mode": "other"}, "crc_mode"),
+    ],
+)
+def test_verified_frame_crc_claim_must_be_exact(overrides, message):
+    values = {
+        "cmd_id": 0x0A06,
+        "data": b"ABC123",
+        "seq": 1,
+        "crc8_ok": True,
+        "crc16_ok": True,
+        "crc_mode": "kermit-x3014",
+    }
+    values.update(overrides)
+    decoder = UpstreamDecoder(
+        backend=RecordingBackend([VerifiedParsedFrame(**values)])
+    )
+    context = make_context(profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        decoder.decode(make_chunk(), context)
+
+    stats = decoder.stats()
+    assert stats.decode_errors == 1
+    assert stats.chunks_processed == 0
+    assert stats.commands_emitted == 0
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        bytes(257),
+        bytearray(257),
+        memoryview(bytearray(257)),
+        memoryview(bytearray(4)).cast("B", shape=(2, 2)),
+        memoryview(bytearray(range(4)))[::2],
+        released_memoryview(),
+    ],
+)
+def test_payload_resource_and_memoryview_contract_is_bounded(data):
+    decoder = UpstreamDecoder(
+        backend=RecordingBackend([verified_frame(data=data)])
+    )
+    context = make_context(profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    with pytest.raises(ValueError):
+        decoder.decode(make_chunk(), context)
+
+    stats = decoder.stats()
+    assert stats.decode_errors == 1
+    assert stats.chunks_processed == 0
+    assert stats.commands_emitted == 0
+
+
+def test_frame_iterable_is_bounded_without_overconsumption():
+    class FrameStream:
+        yielded = 0
+
+        def __iter__(self):
+            while True:
+                self.yielded += 1
+                if self.yielded > 65:
+                    raise AssertionError("decoder over-consumed frame stream")
+                yield verified_frame(cmd_id=1, data=b"x", seq=1)
+
+    stream = FrameStream()
+    decoder = UpstreamDecoder(backend=RecordingBackend(stream))
+    context = make_context(profile="debug")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    with pytest.raises(ValueError, match="at most 64"):
+        decoder.decode(make_chunk(), context)
+
+    assert stream.yielded == 65
+    stats = decoder.stats()
+    assert stats.decode_errors == 1
+    assert stats.chunks_processed == 0
+    assert stats.commands_emitted == 0
+
+
+def test_jam_command_from_verified_frame_is_accepted_by_validator():
+    decoder = UpstreamDecoder(
+        backend=RecordingBackend(
+            [verified_frame(cmd_id=0x0A06, data=b"ABC123", seq=9)]
+        )
+    )
+    context = make_context("BLUE", "L2", profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    command = decoder.decode(make_chunk(), context)[0]
+    result = CommandValidator().validate(command)
+
+    assert result.accepted is True
+    assert result.level == 2
+    assert dict(command.evidence) == {"upstream_seq": 9, "level": 2}
 
 
 def test_empty_backend_result_is_a_successful_chunk():
@@ -505,7 +747,7 @@ def test_decode_rejects_context_that_does_not_match_active_profile(context):
 @pytest.mark.parametrize("runtime_profile", ["competition", "debug"])
 def test_runtime_profile_is_distinct_from_internal_rf_profile(runtime_profile):
     backend = RecordingBackend(
-        [ParsedFrame(cmd_id=1, data=b"ok", seq=1)]
+        [verified_frame(cmd_id=1, data=b"ok", seq=1)]
     )
     decoder = UpstreamDecoder(backend=backend)
     context = make_context("BLUE", "L1", profile=runtime_profile)
@@ -523,7 +765,7 @@ def test_plain_callable_can_be_injected_as_the_pure_decode_backend():
 
     def backend(*, samples, sample_rate_hz, profile):
         calls.append((samples, sample_rate_hz, profile))
-        return [ParsedFrame(cmd_id=9, data=b"ok", seq=5)]
+        return [verified_frame(cmd_id=9, data=b"ok", seq=5)]
 
     decoder = UpstreamDecoder(backend=backend)
     context = make_context()
@@ -557,6 +799,135 @@ def test_stats_updates_are_thread_safe_under_concurrent_decode_calls():
     assert stats.commands_emitted == 0
     assert stats.decode_errors == 0
     assert stats.resets == 1
+
+
+def test_decode_operations_do_not_reenter_backend():
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_entered = threading.Event()
+
+    class Backend:
+        calls = 0
+
+        def decode(self, *, samples, sample_rate_hz, profile):
+            self.calls += 1
+            if self.calls == 1:
+                first_entered.set()
+                assert release_first.wait(2.0)
+            else:
+                second_entered.set()
+            return ()
+
+    decoder = UpstreamDecoder(backend=Backend())
+    context = make_context(profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    def second_decode():
+        second_started.set()
+        return decoder.decode(make_chunk(), context)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(decoder.decode, make_chunk(), context)
+        assert first_entered.wait(2.0)
+        second = pool.submit(second_decode)
+        assert second_started.wait(2.0)
+        assert not second_entered.wait(0.1)
+        release_first.set()
+        assert first.result(timeout=2.0) == []
+        assert second.result(timeout=2.0) == []
+
+
+def test_decode_and_reset_are_serialized_with_consistent_profile():
+    decode_entered = threading.Event()
+    release_decode = threading.Event()
+    reset_started = threading.Event()
+    reset_entered = threading.Event()
+
+    class Backend:
+        block_decode = False
+
+        def reset(self, *, reason, profile):
+            if self.block_decode:
+                reset_entered.set()
+
+        def decode(self, *, samples, sample_rate_hz, profile):
+            decode_entered.set()
+            assert release_decode.wait(2.0)
+            return [
+                verified_frame(cmd_id=0x0A02, data=b"old-profile", seq=7)
+            ]
+
+    backend = Backend()
+    decoder = UpstreamDecoder(backend=backend)
+    old_context = make_context("BLUE", "L1", profile="competition")
+    new_context = make_context("RED", "L2", profile="competition")
+    decoder.reset(ResetReason.STARTUP, old_context)
+    backend.block_decode = True
+
+    def reset_to_new_profile():
+        reset_started.set()
+        decoder.reset(ResetReason.TARGET_CHANGE, new_context)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        decoding = pool.submit(decoder.decode, make_chunk(), old_context)
+        assert decode_entered.wait(2.0)
+        resetting = pool.submit(reset_to_new_profile)
+        assert reset_started.wait(2.0)
+        assert not reset_entered.wait(0.1)
+        release_decode.set()
+        commands = decoding.result(timeout=2.0)
+        resetting.result(timeout=2.0)
+
+    assert commands[0].payload == b"old-profile"
+    assert commands[0].profile == "BLUE-L1"
+    assert decoder.active_profile.name == "RED-L2"
+
+
+def test_reset_operations_commit_in_call_order_without_reentry():
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_entered = threading.Event()
+
+    class Backend:
+        calls = []
+
+        def reset(self, *, reason, profile):
+            self.calls.append(profile.name)
+            if len(self.calls) == 1:
+                first_entered.set()
+                assert release_first.wait(2.0)
+            else:
+                second_entered.set()
+
+    backend = Backend()
+    decoder = UpstreamDecoder(backend=backend)
+
+    def second_reset():
+        second_started.set()
+        decoder.reset(
+            ResetReason.TARGET_CHANGE,
+            make_context("RED", "L2", profile="competition"),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            decoder.reset,
+            ResetReason.STARTUP,
+            make_context("BLUE", "L1", profile="competition"),
+        )
+        assert first_entered.wait(2.0)
+        second = pool.submit(second_reset)
+        assert second_started.wait(2.0)
+        assert not second_entered.wait(0.1)
+        release_first.set()
+        first.result(timeout=2.0)
+        second.result(timeout=2.0)
+
+    assert backend.calls == ["BLUE-L1", "RED-L2"]
+    assert decoder.active_profile.name == "RED-L2"
+    assert decoder.stats().resets == 2
 
 
 def test_source_has_no_hardware_ros_network_or_tuning_dependencies():
