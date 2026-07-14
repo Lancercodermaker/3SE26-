@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -342,7 +343,7 @@ def _windows_close_handle(handle: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def _windows_handle_identity(handle: int) -> tuple[int, int, int]:
+def _windows_handle_information(handle: int):
     from ctypes import wintypes
 
     class FileInformation(ctypes.Structure):
@@ -370,11 +371,73 @@ def _windows_handle_identity(handle: int) -> tuple[int, int, int]:
     information = FileInformation()
     if not get_information(handle, ctypes.byref(information)):
         raise ctypes.WinError(ctypes.get_last_error())
+    return information
+
+
+def _windows_handle_identity(handle: int) -> tuple[int, int, int]:
+    information = _windows_handle_information(handle)
     return (
         information.volume_serial_number,
         information.file_index_high,
         information.file_index_low,
     )
+
+
+def _windows_regular_file_blob_id_no_follow(path: Path) -> str:
+    import msvcrt
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x80000000,  # GENERIC_READ
+        0x0001,  # FILE_SHARE_READ
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    transferred = False
+    try:
+        information = _windows_handle_information(handle)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        directory_flag = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+        if information.file_attributes & (reparse_flag | directory_flag):
+            raise RuntimeError(f"materialized entry is not a file: {path}")
+        get_file_type = ctypes.WinDLL(
+            "kernel32", use_last_error=True
+        ).GetFileType
+        get_file_type.argtypes = [wintypes.HANDLE]
+        get_file_type.restype = wintypes.DWORD
+        if get_file_type(handle) != 1:  # FILE_TYPE_DISK
+            raise RuntimeError(
+                f"materialized entry is not a disk file: {path}"
+            )
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+        transferred = True
+        with os.fdopen(descriptor, "rb") as file:
+            size = (
+                information.file_size_high << 32
+            ) | information.file_size_low
+            return _stream_git_blob_id(file, size, path)
+    finally:
+        if not transferred:
+            _windows_close_handle(handle)
 
 
 class _ParentAnchor:
@@ -890,6 +953,8 @@ def _publish_no_replace(
         )
         raise
     staging.name = destination.name
+    if os.name == "nt":
+        staging.path = destination
     anchor.verify_identity()
 
 
@@ -899,6 +964,207 @@ def _remove_staging(staging: Path) -> None:
         remove(path)
 
     shutil.rmtree(staging, onerror=remove_readonly)
+
+
+MAX_MATERIALIZED_FILE_SIZE = 16 * 1024 * 1024
+HASH_CHUNK_SIZE = 64 * 1024
+
+
+def _stream_git_blob_id(file, size: int, path: object) -> str:
+    if size > MAX_MATERIALIZED_FILE_SIZE:
+        raise RuntimeError(
+            f"final materialized file exceeds size limit: {path} ({size})"
+        )
+    digest = hashlib.sha1()
+    digest.update(f"blob {size}\0".encode("ascii"))
+    remaining = size
+    while remaining:
+        chunk = file.read(min(HASH_CHUNK_SIZE, remaining))
+        if not chunk:
+            raise RuntimeError(
+                f"final materialized file ended early: {path}"
+            )
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if file.read(1):
+        raise RuntimeError(
+            f"final materialized file grew during verification: {path}"
+        )
+    return digest.hexdigest()
+
+
+def _collect_posix_materialized_blobs(
+    descriptor: int, prefix: tuple[str, ...] = ()
+) -> tuple[dict[str, str], set[str]]:
+    blobs: dict[str, str] = {}
+    directories: set[str] = set()
+    for name in os.listdir(descriptor):
+        relative_parts = prefix + (name,)
+        information = os.stat(
+            name, dir_fd=descriptor, follow_symlinks=False
+        )
+        if not prefix and name == ".git":
+            if not stat.S_ISDIR(information.st_mode):
+                raise RuntimeError("final .git entry is not a directory")
+            continue
+        relative_path = "/".join(relative_parts)
+        if stat.S_ISLNK(information.st_mode):
+            raise RuntimeError(
+                f"final materialized tree contains a symlink: {relative_path}"
+            )
+        if stat.S_ISDIR(information.st_mode):
+            directories.add(relative_path)
+            child_descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                child_information = os.fstat(child_descriptor)
+                if (
+                    child_information.st_dev,
+                    child_information.st_ino,
+                ) != (information.st_dev, information.st_ino):
+                    raise RuntimeError(
+                        "final materialized directory identity changed: "
+                        f"{relative_path}"
+                    )
+                child_blobs, child_directories = (
+                    _collect_posix_materialized_blobs(
+                        child_descriptor, relative_parts
+                    )
+                )
+                blobs.update(child_blobs)
+                directories.update(child_directories)
+            finally:
+                os.close(child_descriptor)
+            continue
+        if not stat.S_ISREG(information.st_mode):
+            raise RuntimeError(
+                f"final materialized tree contains a special entry: "
+                f"{relative_path}"
+            )
+        file_descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=descriptor,
+        )
+        try:
+            opened_information = os.fstat(file_descriptor)
+            if not stat.S_ISREG(opened_information.st_mode):
+                raise RuntimeError(
+                    "final materialized entry changed to a non-file: "
+                    f"{relative_path}"
+                )
+            if (
+                opened_information.st_dev,
+                opened_information.st_ino,
+            ) != (information.st_dev, information.st_ino):
+                raise RuntimeError(
+                    "final materialized file identity changed: "
+                    f"{relative_path}"
+                )
+            with os.fdopen(file_descriptor, "rb", closefd=False) as file:
+                blob_id = _stream_git_blob_id(
+                    file, opened_information.st_size, relative_path
+                )
+        finally:
+            os.close(file_descriptor)
+        blobs[relative_path] = blob_id
+    return blobs, directories
+
+
+def _collect_windows_materialized_blobs(
+    root: Path,
+    prefix: tuple[str, ...] = (),
+) -> tuple[dict[str, str], set[str]]:
+    blobs: dict[str, str] = {}
+    directories: set[str] = set()
+    with os.scandir(root) as entries:
+        for entry in entries:
+            path = Path(entry.path)
+            relative_parts = prefix + (entry.name,)
+            relative_path = "/".join(relative_parts)
+            if entry.is_symlink() or _path_is_reparse_point(path):
+                raise RuntimeError(
+                    "final materialized tree contains a reparse point: "
+                    f"{relative_path}"
+                )
+            if not prefix and entry.name == ".git":
+                if not entry.is_dir(follow_symlinks=False):
+                    raise RuntimeError("final .git entry is not a directory")
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                directories.add(relative_path)
+                child_handle = _windows_open_directory(
+                    path, prevent_rename=True
+                )
+                try:
+                    information = _windows_handle_information(child_handle)
+                    reparse_flag = getattr(
+                        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+                    )
+                    if information.file_attributes & reparse_flag:
+                        raise RuntimeError(
+                            "final materialized tree contains a reparse "
+                            "point: "
+                            f"{relative_path}"
+                        )
+                    child_blobs, child_directories = (
+                        _collect_windows_materialized_blobs(
+                            path, relative_parts
+                        )
+                    )
+                    blobs.update(child_blobs)
+                    directories.update(child_directories)
+                finally:
+                    _windows_close_handle(child_handle)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise RuntimeError(
+                    f"final materialized tree contains a special entry: "
+                    f"{relative_path}"
+                )
+            blobs[relative_path] = (
+                _windows_regular_file_blob_id_no_follow(path)
+            )
+    return blobs, directories
+
+
+def _verify_final_materialized_tree(staging: _StagingAnchor) -> None:
+    staging.verify_handle_identity()
+    if os.name == "nt":
+        actual_blobs, actual_directories = (
+            _collect_windows_materialized_blobs(staging.path)
+        )
+    else:
+        actual_blobs, actual_directories = (
+            _collect_posix_materialized_blobs(staging.descriptor)
+        )
+    expected_directories = {
+        "/".join(parts[:index])
+        for relative_path in UPSTREAM_BLOBS
+        for parts in [relative_path.split("/")]
+        for index in range(1, len(parts))
+    }
+    if actual_directories != expected_directories:
+        raise RuntimeError(
+            "unexpected final materialized directories: "
+            f"{sorted(actual_directories)}"
+        )
+    if set(actual_blobs) != set(UPSTREAM_BLOBS):
+        raise RuntimeError(
+            "unexpected final materialized files: "
+            f"{sorted(actual_blobs)}"
+        )
+    for relative_path, expected_blob in UPSTREAM_BLOBS.items():
+        actual_blob = actual_blobs[relative_path]
+        if actual_blob != expected_blob:
+            raise RuntimeError(
+                f"final materialized blob mismatch for {relative_path}: "
+                f"expected {expected_blob}, got {actual_blob}"
+            )
+    staging.verify_handle_identity()
 
 
 def _empty_staging_anchor(staging: _StagingAnchor) -> None:
@@ -975,11 +1241,13 @@ def fetch(destination: Path) -> None:
         )
         _materialize_checkout(staging_anchor.path)
         _verify_checkout(staging_anchor.path)
+        _verify_final_materialized_tree(staging_anchor)
         if anchor.entry_exists(destination.name):
             raise FileExistsError(
                 f"destination appeared during fetch: {destination}"
             )
         _publish_no_replace(anchor, staging_anchor, destination)
+        _verify_final_materialized_tree(staging_anchor)
         published = True
     except BaseException as error:
         primary_error = error

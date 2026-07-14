@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -394,6 +395,161 @@ def test_partial_fetch_materializes_only_allowlisted_blobs(
     assert not _has_local_blob(destination, blobs["server_" + "comm.py"])
 
 
+@pytest.mark.parametrize("extra_kind", ["file", "empty-directory"])
+def test_fetch_rejects_extra_entry_added_after_flatten(
+    tmp_path: Path, monkeypatch, extra_kind: str
+):
+    source, commit, blobs = _create_local_upstream(tmp_path)
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module, "UPSTREAM_REPOSITORY", source.as_uri())
+    monkeypatch.setattr(fetch_module, "UPSTREAM_COMMIT", commit)
+    monkeypatch.setattr(
+        fetch_module,
+        "UPSTREAM_BLOBS",
+        {path: blobs[path] for path in ALLOWED_UPSTREAM_FILES},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fetch_module, "ALLOWED_UPSTREAM_FILES", ALLOWED_UPSTREAM_FILES
+    )
+    real_verify = fetch_module._verify_checkout
+
+    def verify_then_add_extra(staging: Path) -> None:
+        real_verify(staging)
+        if extra_kind == "file":
+            (staging / "unexpected.txt").write_text(
+                "must not publish", encoding="utf-8"
+            )
+        else:
+            (staging / "unexpected-empty-dir").mkdir()
+
+    monkeypatch.setattr(
+        fetch_module, "_verify_checkout", verify_then_add_extra
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected|allowlist|final"):
+        fetch_module.fetch(destination)
+
+    assert not destination.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+@pytest.mark.parametrize("extra_kind", ["file", "empty-directory"])
+def test_fetch_rolls_back_extra_entry_added_after_publish(
+    tmp_path: Path, monkeypatch, extra_kind: str
+):
+    source, commit, blobs = _create_local_upstream(tmp_path)
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module, "UPSTREAM_REPOSITORY", source.as_uri())
+    monkeypatch.setattr(fetch_module, "UPSTREAM_COMMIT", commit)
+    monkeypatch.setattr(
+        fetch_module,
+        "UPSTREAM_BLOBS",
+        {path: blobs[path] for path in ALLOWED_UPSTREAM_FILES},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fetch_module, "ALLOWED_UPSTREAM_FILES", ALLOWED_UPSTREAM_FILES
+    )
+    real_publish = fetch_module._publish_no_replace
+
+    def publish_then_add_extra(anchor, staging, target: Path) -> None:
+        real_publish(anchor, staging, target)
+        if extra_kind == "file":
+            (target / "unexpected.txt").write_text(
+                "must roll back", encoding="utf-8"
+            )
+        else:
+            (target / "unexpected-empty-dir").mkdir()
+
+    monkeypatch.setattr(
+        fetch_module, "_publish_no_replace", publish_then_add_extra
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected|allowlist|final"):
+        fetch_module.fetch(destination)
+
+    assert not destination.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO regression")
+def test_final_tree_check_never_blocks_on_regular_file_replaced_by_fifo(
+    tmp_path: Path, monkeypatch
+):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    candidate = checkout / "phy.py"
+    candidate.write_text("regular", encoding="utf-8")
+    stale_information = candidate.stat()
+    candidate.unlink()
+    os.mkfifo(candidate)
+    descriptor = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    fetch_module = _load_fetch_module()
+    real_stat = fetch_module.os.stat
+    errors = []
+    finished = threading.Event()
+
+    def stale_stat(path, *arguments, **keywords):
+        if path == candidate.name and keywords.get("dir_fd") == descriptor:
+            return stale_information
+        return real_stat(path, *arguments, **keywords)
+
+    def collect() -> None:
+        try:
+            fetch_module._collect_posix_materialized_blobs(descriptor)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(fetch_module.os, "stat", stale_stat)
+    thread = threading.Thread(target=collect, daemon=True)
+    thread.start()
+    completed_without_writer = finished.wait(0.5)
+    if not completed_without_writer:
+        writer = os.open(candidate, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer)
+        assert finished.wait(2.0), (
+            "collector remained blocked after FIFO release"
+        )
+    thread.join(timeout=2.0)
+    os.close(descriptor)
+
+    assert completed_without_writer, (
+        "collector blocked opening a replaced FIFO"
+    )
+    assert errors
+    assert isinstance(errors[0], RuntimeError)
+
+
+def test_final_tree_check_rejects_oversized_sparse_file(
+    tmp_path: Path
+):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    candidate = checkout / "phy.py"
+    with candidate.open("wb") as file:
+        file.truncate(17 * 1024 * 1024)
+    fetch_module = _load_fetch_module()
+
+    with pytest.raises(RuntimeError, match="large|size|limit"):
+        if os.name == "nt":
+            fetch_module._collect_windows_materialized_blobs(checkout)
+        else:
+            descriptor = os.open(
+                checkout, os.O_RDONLY | os.O_DIRECTORY
+            )
+            try:
+                fetch_module._collect_posix_materialized_blobs(descriptor)
+            finally:
+                os.close(descriptor)
+
+
 def test_staging_entry_swap_never_touches_victim_or_publishes(
     tmp_path: Path, monkeypatch
 ):
@@ -521,6 +677,11 @@ def test_fetch_failure_is_atomic_and_retryable(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         fetch_module, "_verify_checkout", lambda _staging: None
     )
+    monkeypatch.setattr(
+        fetch_module,
+        "_verify_final_materialized_tree",
+        lambda _staging: None,
+    )
     fetch_module.fetch(destination)
     assert (destination / "marker").read_text(encoding="utf-8") == "complete"
 
@@ -563,6 +724,11 @@ def _stub_fetch_io(fetch_module, monkeypatch) -> None:
     monkeypatch.setattr(fetch_module, "_materialize_checkout", materialize)
     monkeypatch.setattr(
         fetch_module, "_verify_checkout", lambda _staging: None
+    )
+    monkeypatch.setattr(
+        fetch_module,
+        "_verify_final_materialized_tree",
+        lambda _staging: None,
     )
     monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
 
@@ -722,6 +888,11 @@ def test_parent_swap_after_validation_never_writes_replacement_parent(
     monkeypatch.setattr(fetch_module, "_materialize_checkout", swap_parent)
     monkeypatch.setattr(
         fetch_module, "_verify_checkout", lambda _staging: None
+    )
+    monkeypatch.setattr(
+        fetch_module,
+        "_verify_final_materialized_tree",
+        lambda _staging: None,
     )
 
     with pytest.raises(RuntimeError, match="identity"):
