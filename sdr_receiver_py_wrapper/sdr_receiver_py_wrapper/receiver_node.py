@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import numbers
 import os
 from pathlib import Path
+from queue import Empty
 import sys
 import threading
 import time
@@ -34,9 +35,12 @@ from .original_receiver_adapter import ReceiverCoreAdapter
 from .patches import JamKeyEvent, PatchCallbacks, RawFrameEvent, TargetChangeEvent
 from .profile_import import AdaptiveProfileLoadError, load_adaptive_profile
 from .acquisition import AcquisitionEngine
+from .device_session import DeviceSession
+from .iq_file_source import IqFilePluto
 from .models import DecodedCommand, DecodeContext, IqChunk
 from . import rf_safety
 from .structured_recorder import StructuredRecorder, _json_snapshot
+from .v67_decoder import V67Decoder
 
 
 DEFAULT_ORIGINAL_SCRIPT = "auto"
@@ -48,11 +52,18 @@ class ReceiverPipelineError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class PipelineDiagnosticError:
+    stage: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class ReceiverPipelineResult:
     primary_commands: tuple[DecodedCommand, ...]
     shadow_commands: tuple[DecodedCommand, ...]
     validation_results: tuple[ValidationResult, ...]
     shadow_error: Optional[str] = None
+    diagnostic_errors: tuple[PipelineDiagnosticError, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -121,6 +132,264 @@ class ReceiverFoundationConfig:
         return metrics, state
 
 
+@dataclass(frozen=True)
+class CommonRuntimeResult:
+    chunk: IqChunk
+    rf_state: rf_safety.RfState
+    pipeline_result: ReceiverPipelineResult
+
+
+class CommonReceiverRuntime:
+    """Own the competition device and drive one common receive pipeline."""
+
+    def __init__(
+        self,
+        *,
+        backend_factory,
+        config: ReceiverFoundationConfig,
+        primary,
+        output,
+        context_provider,
+        radio_settings_provider,
+        snapshot_provider=None,
+        shadow=None,
+        recorder=None,
+    ) -> None:
+        self.recorder = recorder
+        self.device = None
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.acquisition_thread: Optional[threading.Thread] = None
+        self.processing_thread: Optional[threading.Thread] = None
+        self.worker_error: Optional[BaseException] = None
+        self.last_rf_state: Optional[rf_safety.RfState] = None
+        self._closed = False
+        self._context_condition = threading.Condition()
+        self._chunk_contexts: dict[int, DecodeContext] = {}
+        self._error_lock = threading.Lock()
+        try:
+            if not isinstance(config, ReceiverFoundationConfig):
+                raise TypeError("config must be a ReceiverFoundationConfig")
+            self.config = config
+            self.context_provider = context_provider
+            self.radio_settings_provider = radio_settings_provider
+            self.snapshot_provider = snapshot_provider
+            self.pipeline = ReceiverPipeline(
+                primary=primary,
+                shadow=shadow,
+                output=output,
+                recorder=recorder,
+                config=config,
+            )
+            self.device = DeviceSession(backend_factory)
+            self.acquisition = config.create_acquisition(self.device)
+            if self.snapshot_provider is None:
+                self._sync_device_settings()
+            else:
+                _context, settings = self.snapshot_provider()
+                self._sync_device_settings(settings)
+        except BaseException:
+            if self.device is not None:
+                try:
+                    self.device.close()
+                except BaseException:
+                    pass
+            close_recorder = getattr(self.recorder, "close", None)
+            if callable(close_recorder):
+                try:
+                    close_recorder(stopped_reason="common receiver setup failed")
+                except BaseException:
+                    pass
+            raise
+
+    def process_once(self) -> CommonRuntimeResult:
+        if self._closed:
+            raise RuntimeError("common receiver runtime is closed")
+        produced = self.acquire_once()
+        if produced is None:
+            raise RuntimeError("acquisition queue rejected IQ chunk")
+        result = self.process_next(timeout_sec=0.0)
+        if result is None or result.chunk.chunk_id != produced.chunk_id:
+            raise RuntimeError("acquisition queue order is inconsistent")
+        return result
+
+    def acquire_once(self):
+        if self.snapshot_provider is None:
+            context = self.context_provider()
+            settings = None
+        else:
+            context, settings = self.snapshot_provider()
+        if not isinstance(context, DecodeContext):
+            raise TypeError("context_provider must return a DecodeContext")
+        self._sync_device_settings(settings)
+        with self.acquisition._state_lock:
+            self.acquisition._target_version = context.target_version
+            self.acquisition._context_version = context.context_version
+        read_errors_before = self.acquisition.stats.read_errors
+        produced = self.acquisition.read_once()
+        if produced is None:
+            if self.acquisition.stats.read_errors > read_errors_before:
+                raise RuntimeError("acquisition read failed")
+            return None
+        with self._context_condition:
+            self._chunk_contexts[produced.chunk_id] = context
+            self._context_condition.notify_all()
+        return produced
+
+    def process_next(self, *, timeout_sec=0.05) -> Optional[CommonRuntimeResult]:
+        try:
+            queued = self.acquisition._queue.get(timeout=timeout_sec)
+        except Empty:
+            return None
+        try:
+            context = self._context_for_chunk(queued.chunk_id, timeout_sec)
+            return self._process_queued(queued, context)
+        finally:
+            self.acquisition._queue.task_done()
+
+    def _process_queued(self, queued, context) -> CommonRuntimeResult:
+        metrics, state = self.config.measure_and_classify(queued.samples)
+        chunk = replace(queued, rf_metrics=metrics)
+        self.last_rf_state = state
+        if self.recorder is not None:
+            accepted = self.recorder.write_event(
+                "rf_state",
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "first_sample_index": chunk.first_sample_index,
+                    "last_sample_index": (
+                        chunk.first_sample_index + int(chunk.samples.size) - 1
+                    ),
+                    "target_version": chunk.target_version,
+                    "context_version": chunk.context_version,
+                    "target": context.target,
+                    "team": context.team,
+                    "profile": context.profile,
+                    "adc_code_scale": self.config.adc_code_scale,
+                    "rf_clipping_ratio": self.config.rf_clipping_ratio,
+                    "state": state.value,
+                    "metrics": metrics.__dict__,
+                },
+            )
+            if accepted is not True:
+                raise ReceiverPipelineError("failed to record RF state event")
+        result = self.pipeline.process(chunk, context)
+        return CommonRuntimeResult(
+            chunk=chunk,
+            rf_state=state,
+            pipeline_result=result,
+        )
+
+    def start(self) -> None:
+        if self.processing_thread is not None and self.processing_thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.worker_error = None
+        self.acquisition_thread = threading.Thread(
+            target=self._run_acquisition,
+            name="sdr-common-acquisition",
+            daemon=True,
+        )
+        self.processing_thread = threading.Thread(
+            target=self._run_processing,
+            name="sdr-common-processing",
+            daemon=True,
+        )
+        self.thread = self.processing_thread
+        self.acquisition_thread.start()
+        self.processing_thread.start()
+
+    def close(self, *, timeout_sec: float = 3.0) -> None:
+        if self._closed:
+            return
+        self.stop_event.set()
+        with self._context_condition:
+            self._context_condition.notify_all()
+        for thread in (self.acquisition_thread, self.processing_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=timeout_sec)
+        self.device.close()
+        close_recorder = getattr(self.recorder, "close", None)
+        if callable(close_recorder):
+            close_recorder(stopped_reason="common receiver stopped")
+        self._closed = True
+
+    def status(self) -> dict:
+        return {
+            "running": any(
+                thread is not None and thread.is_alive()
+                for thread in (self.acquisition_thread, self.processing_thread)
+            ),
+            "worker_error": (
+                None if self.worker_error is None else str(self.worker_error)
+            ),
+            "rf_state": (
+                None if self.last_rf_state is None else self.last_rf_state.value
+            ),
+        }
+
+    def _run_acquisition(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                self.acquire_once()
+        except BaseException as exc:
+            self._fail_worker(exc)
+
+    def _run_processing(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                self.process_next()
+        except BaseException as exc:
+            self._fail_worker(exc)
+
+    def _fail_worker(self, exc) -> None:
+        with self._error_lock:
+            if self.worker_error is None:
+                self.worker_error = exc
+        self.stop_event.set()
+        with self._context_condition:
+            self._context_condition.notify_all()
+
+    def _context_for_chunk(self, chunk_id, timeout_sec):
+        deadline = time.monotonic() + max(0.05, float(timeout_sec))
+        with self._context_condition:
+            while chunk_id not in self._chunk_contexts:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("IQ chunk has no matching DecodeContext")
+                self._context_condition.wait(timeout=remaining)
+            return self._chunk_contexts.pop(chunk_id)
+
+    def _sync_device_settings(self, settings=None) -> None:
+        if settings is None:
+            settings = self.radio_settings_provider()
+        settings = dict(settings)
+        required = {
+            "sample_rate_hz",
+            "lo_hz",
+            "rf_bandwidth_hz",
+            "rx_gain_db",
+        }
+        if set(settings) != required:
+            raise ValueError("radio settings provider returned invalid keys")
+        self.device.configure(
+            sample_rate=settings["sample_rate_hz"],
+            lo_hz=settings["lo_hz"],
+            rf_bandwidth=settings["rf_bandwidth_hz"],
+            gain=settings["rx_gain_db"],
+        )
+
+
+def _create_decoder_plugin(decoder_id: str, core):
+    _require_decoder_available(decoder_id)
+    return V67Decoder(core=core)
+
+
+def _require_decoder_available(decoder_id: str) -> None:
+    if decoder_id != PRIMARY_DECODER_ID:
+        raise ValueError(f"unavailable decoder: {decoder_id!r}")
+
+
 class NodeCommandOutput:
     """Adapt the pipeline output contract to the existing sole JamCode gate."""
 
@@ -128,8 +397,11 @@ class NodeCommandOutput:
         self._node = node
         self.publisher_decoder_id = node.primary_decoder_id
 
-    def publish(self, command: DecodedCommand) -> ValidationResult:
-        return self._node._handle_decoded_command(command)
+    def publish(self, command: DecodedCommand, *, before_commit=None) -> ValidationResult:
+        return self._node._handle_competition_decoded_command(
+            command,
+            before_publish=before_commit,
+        )
 
 
 class ReceiverPipeline:
@@ -196,6 +468,14 @@ class ReceiverPipeline:
                 chunk,
                 metadata={
                     "target": context.target,
+                    "team": context.team,
+                    "profile": context.profile,
+                    "target_version": context.target_version,
+                    "context_version": context.context_version,
+                    "decoder_primary": self.primary.decoder_id,
+                    "decoder_shadow": (
+                        "" if self.shadow is None else self.shadow.decoder_id
+                    ),
                     "adc_code_scale": self.config.adc_code_scale,
                 },
             )
@@ -218,10 +498,11 @@ class ReceiverPipeline:
             )
 
         for command in primary_commands:
-            self._record_command(command, "primary")
+            self._record_command(command, "primary", chunk, context)
 
         shadow_commands: tuple[DecodedCommand, ...] = ()
         shadow_error = None
+        diagnostic_errors = []
         if self.shadow is not None:
             try:
                 shadow_commands = self._decode(
@@ -231,27 +512,54 @@ class ReceiverPipeline:
                 )
             except Exception as exc:
                 shadow_error = str(exc)
-                self._record_diagnostic(
+                diagnostic_error = self._record_diagnostic(
                     "decoder_error",
                     self._error_payload("shadow", self.shadow.decoder_id, chunk, exc),
                 )
+                if diagnostic_error is not None:
+                    diagnostic_errors.append(
+                        PipelineDiagnosticError(
+                            stage="shadow_decoder_diagnostic",
+                            reason=f"shadow {diagnostic_error}",
+                        )
+                    )
 
         if primary_failure is not None:
             for command in shadow_commands:
                 self._record_diagnostic(
                     "command",
-                    self._command_payload(command, "shadow"),
+                    self._command_payload(command, "shadow", chunk, context),
                 )
             error, traceback = primary_failure
             raise error.with_traceback(traceback)
 
         for command in shadow_commands:
-            self._record_command(command, "shadow")
+            diagnostic_error = self._record_diagnostic(
+                "command",
+                self._command_payload(command, "shadow", chunk, context),
+            )
+            if diagnostic_error is not None:
+                diagnostic_errors.append(
+                    PipelineDiagnosticError(
+                        stage="shadow_command_recording",
+                        reason=f"shadow {diagnostic_error}",
+                    )
+                )
 
         validation_results = []
         for command in primary_commands:
             try:
-                result = self.output.publish(command)
+                result = self.output.publish(
+                    command,
+                    before_commit=lambda validation, item=command: (
+                        self._record_validation(
+                            item,
+                            validation,
+                            chunk,
+                            context,
+                        )
+                    ),
+                )
             except Exception as exc:
                 self._record_diagnostic(
                     "output_error",
@@ -265,13 +573,13 @@ class ReceiverPipeline:
             if not isinstance(result, ValidationResult):
                 raise TypeError("output publish must return a ValidationResult")
             validation_results.append(result)
-            self._record_validation(command, result)
 
         return ReceiverPipelineResult(
             primary_commands=primary_commands,
             shadow_commands=shadow_commands,
             validation_results=tuple(validation_results),
             shadow_error=shadow_error,
+            diagnostic_errors=tuple(diagnostic_errors),
         )
 
     @staticmethod
@@ -297,11 +605,14 @@ class ReceiverPipeline:
             raise ValueError("decoded command context_version does not match context")
         chunk_last_sample = chunk.first_sample_index + int(chunk.samples.size) - 1
         if (
-            command.first_sample_index > command.last_sample_index
-            or command.last_sample_index < chunk.first_sample_index
+            command.first_sample_index < chunk.first_sample_index
+            or command.first_sample_index > command.last_sample_index
             or command.last_sample_index > chunk_last_sample
         ):
             raise ValueError("decoded command sample range is not correlated to chunk")
+        for name in ("target", "team", "profile"):
+            if getattr(command, name) != getattr(context, name):
+                raise ValueError(f"decoded command {name} does not match context")
 
     @staticmethod
     def _error_payload(role, decoder_id, chunk, exc):
@@ -312,32 +623,55 @@ class ReceiverPipeline:
             "role": role,
         }
 
-    def _record_command(self, command, role) -> None:
+    def _record_command(self, command, role, chunk, context) -> None:
         self._record_event(
             "command",
-            self._command_payload(command, role),
+            self._command_payload(command, role, chunk, context),
         )
 
     @staticmethod
-    def _command_payload(command, role):
+    def _command_payload(command, role, chunk, context):
+        chunk_last_sample = chunk.first_sample_index + int(chunk.samples.size) - 1
         return {
             "role": role,
+            "chunk_id": chunk.chunk_id,
+            "chunk_first_sample_index": chunk.first_sample_index,
+            "chunk_last_sample_index": chunk_last_sample,
+            "target_version": chunk.target_version,
+            "context_version": context.context_version,
+            "target": context.target,
+            "team": context.team,
+            "profile": context.profile,
             "decoder_id": command.decoder_id,
             "cmd_id": command.cmd_id,
             "payload": command.payload,
+            "crc8_ok": command.crc8_ok,
+            "crc16_ok": command.crc16_ok,
+            "crc_mode": command.crc_mode,
+            "receive_wall_time": command.receive_wall_time,
             "first_sample_index": command.first_sample_index,
             "last_sample_index": command.last_sample_index,
-            "context_version": command.context_version,
             "evidence": command.evidence,
         }
 
-    def _record_validation(self, command, validation) -> None:
+    def _record_validation(self, command, validation, chunk, context) -> None:
+        chunk_last_sample = chunk.first_sample_index + int(chunk.samples.size) - 1
         self._record_event(
             "validation",
             {
+                "chunk_id": chunk.chunk_id,
+                "chunk_first_sample_index": chunk.first_sample_index,
+                "chunk_last_sample_index": chunk_last_sample,
+                "target_version": chunk.target_version,
+                "context_version": context.context_version,
+                "target": context.target,
+                "team": context.team,
+                "profile": context.profile,
                 "decoder_id": command.decoder_id,
                 "cmd_id": command.cmd_id,
                 "payload": command.payload,
+                "command_first_sample_index": command.first_sample_index,
+                "command_last_sample_index": command.last_sample_index,
                 "accepted": validation.accepted,
                 "reason": validation.reason,
                 "ascii_code": validation.ascii_code,
@@ -349,14 +683,17 @@ class ReceiverPipeline:
         if self.recorder is not None and self.recorder.write_event(kind, payload) is not True:
             raise ReceiverPipelineError(f"failed to record {kind} event")
 
-    def _record_diagnostic(self, kind, payload) -> None:
+    def _record_diagnostic(self, kind, payload) -> Optional[str]:
         if self.recorder is None:
-            return
+            return None
         try:
-            self.recorder.write_event(kind, payload)
-        except Exception:
+            accepted = self.recorder.write_event(kind, payload)
+        except Exception as exc:
             # Preserve the primary stage failure; diagnostics are best effort here.
-            pass
+            return f"{kind} event failed: {exc}"
+        if accepted is not True:
+            return f"{kind} event was rejected"
+        return None
 
 
 @dataclass(frozen=True)
@@ -665,7 +1002,13 @@ class SdrReceiverPyWrapperNode(Node):
             ),
         )
         self.profile_config = self._load_profile_config(str(self.get_parameter("profile_path").value))
-        self.iq_recorder = self._create_iq_recorder()
+        self.iq_recorder = (
+            self._create_iq_recorder() if self.run_mode == "debug" else None
+        )
+        self.common_runtime: Optional[CommonReceiverRuntime] = None
+        self._common_shadow_adapter = None
+        self._common_target_key = None
+        self._common_target_version = 0
         self.latest_context: Optional[RadarContext] = None
         self._fallback_msg_self_id = 0
         self._fallback_self_color = -1
@@ -717,10 +1060,10 @@ class SdrReceiverPyWrapperNode(Node):
             on_raw_iq=self._on_raw_iq if self.iq_recorder is not None else None,
         )
         original_script_path = str(self.get_parameter("original_script_path").value)
+        self.original_script_path = original_script_path
         self.adapter = ReceiverCoreAdapter(original_script_path, logger=self._log_from_patch)
         self.adapter.load(allow_adi_import_stub=self.import_allow_adi_stub or bool(self.iq_source_path))
-        self.adapter.apply_patches(run_mode=self.run_mode, callbacks=callbacks)
-        if self.iq_source_path:
+        if self.iq_source_path and self.run_mode == "debug":
             self.adapter.configure_iq_file_source(
                 path=self.iq_source_path,
                 loop=bool(self.get_parameter("iq_source_loop").value),
@@ -734,8 +1077,7 @@ class SdrReceiverPyWrapperNode(Node):
         status_period = float(self.get_parameter("status_period_sec").value)
         self.status_timer = self.create_timer(status_period, self._publish_status)
 
-        if self.start_receiver:
-            self.adapter.start()
+        self._configure_receiver_runtime(callbacks)
 
         self.get_logger().info(
             "sdr_receiver_py_wrapper ready: "
@@ -753,7 +1095,11 @@ class SdrReceiverPyWrapperNode(Node):
     def destroy_node(self) -> bool:
         result = False
         try:
-            self.adapter.stop()
+            common_runtime = getattr(self, "common_runtime", None)
+            if common_runtime is not None:
+                common_runtime.close()
+            if getattr(self, "run_mode", "debug") == "debug":
+                self.adapter.stop()
             self.adapter.restore_patches()
             if self.iq_recorder is not None:
                 self.iq_recorder.close()
@@ -840,6 +1186,153 @@ class SdrReceiverPyWrapperNode(Node):
             recorder=recorder,
             config=self.foundation_config,
         )
+
+    def _start_receiver_runtime(self, callbacks) -> None:
+        if self.run_mode == "competition":
+            if self.start_receiver:
+                if self.common_runtime is None:
+                    raise RuntimeError("competition common runtime is not configured")
+                self.common_runtime.start()
+            return
+        self.adapter.apply_patches(run_mode=self.run_mode, callbacks=callbacks)
+        if self.start_receiver:
+            self.adapter.start()
+
+    def _configure_receiver_runtime(self, callbacks) -> None:
+        if self.run_mode == "competition" and self.start_receiver:
+            self.common_runtime = self._build_common_runtime()
+        self._start_receiver_runtime(callbacks)
+
+    def _build_common_runtime(self) -> CommonReceiverRuntime:
+        if self.foundation_config.decoder_shadow:
+            _require_decoder_available(self.foundation_config.decoder_shadow)
+        primary = _create_decoder_plugin(
+            self.foundation_config.decoder_primary,
+            self.adapter,
+        )
+        shadow = None
+        if self.foundation_config.decoder_shadow:
+            self._common_shadow_adapter = ReceiverCoreAdapter(
+                self.original_script_path,
+                logger=self._log_from_patch,
+            )
+            self._common_shadow_adapter.load(
+                allow_adi_import_stub=(
+                    self.import_allow_adi_stub or bool(self.iq_source_path)
+                )
+            )
+            shadow = _create_decoder_plugin(
+                self.foundation_config.decoder_shadow,
+                self._common_shadow_adapter,
+            )
+        return CommonReceiverRuntime(
+            backend_factory=self._common_backend_factory(),
+            config=self.foundation_config,
+            primary=primary,
+            shadow=shadow,
+            output=NodeCommandOutput(self),
+            recorder=self._create_common_recorder(),
+            context_provider=self._common_decode_context,
+            radio_settings_provider=self._common_radio_settings,
+            snapshot_provider=self._common_runtime_snapshot,
+        )
+
+    def _common_backend_factory(self):
+        rx_buffer_size = int(
+            self.adapter.get_core_config_snapshot().get("rx_buffer_size", 0) or 0
+        )
+        if self.iq_source_path:
+            def create_file_backend():
+                backend = IqFilePluto(
+                    self.iq_source_path,
+                    loop=bool(self.get_parameter("iq_source_loop").value),
+                    throttle=bool(self.get_parameter("iq_source_throttle").value),
+                    center_hz=float(
+                        self.get_parameter("iq_source_center_hz").value
+                    ),
+                    start_offset_sec=float(
+                        self.get_parameter("iq_source_start_offset_sec").value
+                    ),
+                    logger=self._log_from_patch,
+                )
+                if rx_buffer_size > 0:
+                    backend.rx_buffer_size = rx_buffer_size
+                return backend
+
+            return create_file_backend
+
+        module = self.adapter.module
+        pluto_factory = getattr(getattr(module, "adi", None), "Pluto", None)
+        if not callable(pluto_factory):
+            raise RuntimeError("receiver core has no callable adi.Pluto backend")
+
+        def create_hardware_backend():
+            backend = pluto_factory()
+            if rx_buffer_size > 0:
+                backend.rx_buffer_size = rx_buffer_size
+            return backend
+
+        return create_hardware_backend
+
+    def _common_radio_settings(self) -> dict:
+        config = self.adapter.get_core_config_snapshot()
+        radio = self.adapter.get_current_radio_snapshot()
+        source_rate = int(self.get_parameter("iq_source_sample_rate").value)
+        return {
+            "sample_rate_hz": source_rate or int(config.get("sample_rate", 0) or 0),
+            "lo_hz": int(radio.get("rx_lo_hz", 0) or 0),
+            "rf_bandwidth_hz": int(radio.get("rf_bandwidth_hz", 0) or 0),
+            "rx_gain_db": int(
+                radio.get("rx_gain", self.foundation_config.initial_rx_gain)
+            ),
+        }
+
+    def _common_decode_context(self) -> DecodeContext:
+        with self._get_controller_lock():
+            radio = self.adapter.get_current_radio_snapshot()
+            team = str(radio.get("team") or "RED").upper()
+            target = str(radio.get("target") or "INFO").upper()
+            target_key = (team, target)
+            if target_key != self._common_target_key:
+                self._common_target_version += 1
+                self._common_target_key = target_key
+            return DecodeContext(
+                team=team,
+                target=target,
+                profile=self.run_mode,
+                target_version=self._common_target_version,
+                context_version=int(
+                    getattr(self.context_arbiter, "context_version", 0)
+                ),
+            )
+
+    def _common_runtime_snapshot(self):
+        with self._get_controller_lock():
+            return self._common_decode_context(), self._common_radio_settings()
+
+    def _create_common_recorder(self):
+        if not bool(self.get_parameter("record_iq").value):
+            return None
+        stamp = f"{time.time_ns()}_{os.getpid()}"
+        prefix = f"{self._iq_record_prefix()}_common_{stamp}"
+        return self.foundation_config.create_recorder(
+            str(self.get_parameter("iq_record_dir").value),
+            prefix,
+            summary_metadata={
+                "runtime": "common_competition",
+                "decoder_primary": self.foundation_config.decoder_primary,
+                "decoder_shadow": self.foundation_config.decoder_shadow,
+                "adc_code_scale": self.foundation_config.adc_code_scale,
+                "rf_clipping_ratio": self.foundation_config.rf_clipping_ratio,
+            },
+            summary_metadata_provider=self._iq_record_metadata,
+        )
+
+    def _common_runtime_status(self) -> dict:
+        common_runtime = getattr(self, "common_runtime", None)
+        if common_runtime is None:
+            return {"enabled": False}
+        return common_runtime.status()
 
     def _setup_fallback_subscriptions(self, qos: QoSProfile) -> None:
         match_info_type = self._resolve_match_info_type()
@@ -1149,78 +1642,125 @@ class SdrReceiverPyWrapperNode(Node):
 
     def _on_jam_key(self, event: JamKeyEvent) -> None:
         if self.run_mode == "competition":
-            with self._get_controller_lock():
-                self._retry_pending_rf_transition_locked()
-                candidate = self._decoded_command_from_legacy_event(
-                    event,
-                    event.level,
-                )
-                prevalidation = self.command_validator.prevalidate(candidate)
-                if not prevalidation.accepted:
-                    self.get_logger().debug(prevalidation.reason)
-                    return
-                controller_snapshot = self._snapshot_jam_key_controller_state()
-                publication_committed = False
-                try:
-                    decision = self.controller.handle_jam_key(
-                        level=event.level,
-                        key=event.key,
-                    )
-                    for warning in decision.warnings:
-                        self.get_logger().warn(warning)
-                    if decision.publish:
-                        if not self.publish_ros_outputs:
-                            self._restore_jam_key_controller_state(
-                                controller_snapshot
-                            )
-                            self.get_logger().debug(
-                                "ROS output disabled; controller key decision aborted"
-                            )
-                            return
-                        result = self._handle_controller_decoded_command(
-                            self._decoded_command_from_legacy_event(
-                                event,
-                                decision.level,
-                            )
-                        )
-                        if not result.accepted:
-                            self._restore_jam_key_controller_state(
-                                controller_snapshot
-                            )
-                            self.get_logger().debug(result.reason)
-                            return
-                        publication_committed = True
-                except Exception:
-                    if not publication_committed:
-                        self._restore_jam_key_controller_state(
-                            controller_snapshot
-                        )
-                    raise
-                if decision.target:
-                    transition = _PendingRfTransition(
-                        target=decision.target,
-                        reason=decision.reason,
-                        team=self.controller.rx_team,
-                    )
-                    try:
-                        self._set_receiver_target_or_profile(
-                            transition.target,
-                            reason=transition.reason,
-                            team=transition.team,
-                        )
-                    except Exception:
-                        if publication_committed:
-                            self._pending_rf_transition = transition
-                        raise
-                    self._pending_rf_transition = None
-                elif decision.reason:
-                    self.get_logger().debug(decision.reason)
+            self._handle_competition_decoded_command(
+                self._decoded_command_from_legacy_event(event, event.level)
+            )
             return
 
         if self.publish_ros_outputs:
             self._handle_decoded_command(
                 self._decoded_command_from_legacy_event(event, event.level)
             )
+
+    def _handle_competition_decoded_command(
+        self,
+        command: DecodedCommand,
+        *,
+        before_publish=None,
+    ) -> ValidationResult:
+        """Apply the controller transaction before the sole ROS command gate."""
+
+        if command.decoder_id != self.primary_decoder_id:
+            result = ValidationResult(
+                False,
+                f"decoder_id {command.decoder_id!r} is not primary decoder "
+                f"{self.primary_decoder_id!r}",
+            )
+            if before_publish is not None:
+                before_publish(result)
+            self.get_logger().debug(result.reason)
+            return result
+
+        with self._get_controller_lock():
+            self._retry_pending_rf_transition_locked()
+            prevalidation = self.command_validator.prevalidate(command)
+            if not prevalidation.accepted:
+                if before_publish is not None:
+                    before_publish(prevalidation)
+                self.get_logger().debug(prevalidation.reason)
+                return prevalidation
+
+            controller_snapshot = self._snapshot_jam_key_controller_state()
+            publication_committed = False
+            try:
+                decision = self.controller.handle_jam_key(
+                    level=prevalidation.level,
+                    key=command.payload,
+                )
+                for warning in decision.warnings:
+                    self.get_logger().warn(warning)
+
+                if decision.publish:
+                    if not self.publish_ros_outputs:
+                        self._restore_jam_key_controller_state(controller_snapshot)
+                        result = ValidationResult(
+                            False,
+                            "ROS output disabled; controller key decision aborted",
+                            ascii_code=prevalidation.ascii_code,
+                            level=prevalidation.level,
+                        )
+                        if before_publish is not None:
+                            before_publish(result)
+                        self.get_logger().debug(result.reason)
+                        return result
+                    approved_command = command
+                    if decision.level != prevalidation.level:
+                        approved_command = replace(
+                            command,
+                            target=f"JAM_L{decision.level}_KEY",
+                            evidence={
+                                **dict(command.evidence),
+                                "level": decision.level,
+                            },
+                        )
+                    if before_publish is None:
+                        result = self._handle_controller_decoded_command(
+                            approved_command
+                        )
+                    else:
+                        result = self._handle_controller_decoded_command(
+                            approved_command,
+                            before_publish=before_publish,
+                        )
+                    if not result.accepted:
+                        self._restore_jam_key_controller_state(controller_snapshot)
+                        self.get_logger().debug(result.reason)
+                        return result
+                    publication_committed = True
+                else:
+                    result = ValidationResult(
+                        False,
+                        decision.reason or "competition controller rejected command",
+                        ascii_code=prevalidation.ascii_code,
+                        level=prevalidation.level,
+                    )
+                    if before_publish is not None:
+                        before_publish(result)
+            except Exception:
+                if not publication_committed:
+                    self._restore_jam_key_controller_state(controller_snapshot)
+                raise
+
+            if decision.target:
+                transition = _PendingRfTransition(
+                    target=decision.target,
+                    reason=decision.reason,
+                    team=self.controller.rx_team,
+                )
+                try:
+                    self._set_receiver_target_or_profile(
+                        transition.target,
+                        reason=transition.reason,
+                        team=transition.team,
+                    )
+                except Exception:
+                    if publication_committed:
+                        self._pending_rf_transition = transition
+                    raise
+                self._pending_rf_transition = None
+            elif decision.reason:
+                self.get_logger().debug(decision.reason)
+            return result
 
     def _get_controller_lock(self):
         lock = getattr(self, "_controller_lock", None)
@@ -1309,6 +1849,8 @@ class SdrReceiverPyWrapperNode(Node):
     def _handle_decoded_command(
         self,
         command: DecodedCommand,
+        *,
+        before_publish=None,
     ) -> ValidationResult:
         """Gate one decoder command into the sole production Jam publisher."""
 
@@ -1322,6 +1864,16 @@ class SdrReceiverPyWrapperNode(Node):
             return result
 
         result = self.command_validator.validate(command)
+        if before_publish is not None:
+            try:
+                before_publish(result)
+            except Exception:
+                if result.accepted:
+                    self.command_validator.abort_publish_authorization(
+                        command,
+                        result,
+                    )
+                raise
         if result.accepted:
             if self.publish_ros_outputs:
                 self._publish_validated_jam_code(command, result)
@@ -1337,6 +1889,8 @@ class SdrReceiverPyWrapperNode(Node):
     def _handle_controller_decoded_command(
         self,
         command: DecodedCommand,
+        *,
+        before_publish=None,
     ) -> ValidationResult:
         """Publish a command whose retry policy is owned by the controller."""
 
@@ -1350,6 +1904,16 @@ class SdrReceiverPyWrapperNode(Node):
             return result
 
         result = self.command_validator.reserve_controller_publication(command)
+        if before_publish is not None:
+            try:
+                before_publish(result)
+            except Exception:
+                if result.accepted:
+                    self.command_validator.abort_publish_authorization(
+                        command,
+                        result,
+                    )
+                raise
         if result.accepted:
             if self.publish_ros_outputs:
                 self._publish_validated_jam_code(command, result)
@@ -1527,6 +2091,7 @@ class SdrReceiverPyWrapperNode(Node):
             if self.iq_recorder is None
             else self.iq_recorder.status(),
             "competition": competition_status,
+            "common_runtime": self._common_runtime_status(),
             "core": adapter_status,
             "receiver_thread_exception": None
             if self.adapter.receiver_exception is None
