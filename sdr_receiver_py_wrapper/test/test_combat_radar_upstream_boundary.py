@@ -698,8 +698,10 @@ def test_parent_anchor_closes_after_materialization_failure(
     assert hasattr(fetch_module, "_open_parent_anchor")
     monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
 
+    primary_failure = RuntimeError("injected materialization failure")
+
     def fail_materialization(_staging: Path) -> None:
-        raise RuntimeError("injected materialization failure")
+        raise primary_failure
 
     monkeypatch.setattr(
         fetch_module, "_materialize_checkout", fail_materialization
@@ -709,11 +711,142 @@ def test_parent_anchor_closes_after_materialization_failure(
     if proc_fds.is_dir():
         descriptors_before = set(os.listdir(proc_fds))
 
-    with pytest.raises(RuntimeError, match="injected materialization failure"):
+    with pytest.raises(
+        RuntimeError, match="injected materialization failure"
+    ) as raised:
         fetch_module.fetch(destination)
 
+    assert raised.value is primary_failure
     if descriptors_before is not None:
         assert set(os.listdir(proc_fds)) == descriptors_before
     renamed_parent = tmp_path / "renamed-parent"
     parent.rename(renamed_parent)
     assert list(renamed_parent.iterdir()) == []
+
+
+def test_fetch_reports_primary_and_missing_lock_cleanup_failure(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+    primary_failure = RuntimeError("injected primary failure")
+
+    def fail_after_removing_lock(staging: Path) -> None:
+        (staging / "marker").write_text("partial", encoding="utf-8")
+        (staging.parent / ".checkout.fetch.lock").unlink()
+        raise primary_failure
+
+    monkeypatch.setattr(
+        fetch_module, "_materialize_checkout", fail_after_removing_lock
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "injected primary failure" in message
+    assert "lock cleanup" in message
+    assert "FileNotFoundError" in message
+    assert raised.value.__cause__ is primary_failure
+    assert not destination.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_fetch_cleans_lock_when_staging_cleanup_fails(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+    primary_failure = RuntimeError("injected primary failure")
+
+    def fail_materialization(staging: Path) -> None:
+        (staging / "marker").write_text("partial", encoding="utf-8")
+        raise primary_failure
+
+    def fail_staging_cleanup(_staging: Path) -> None:
+        raise OSError("injected staging cleanup failure")
+
+    monkeypatch.setattr(
+        fetch_module, "_materialize_checkout", fail_materialization
+    )
+    monkeypatch.setattr(
+        fetch_module, "_remove_staging", fail_staging_cleanup
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "injected primary failure" in message
+    assert "staging cleanup" in message
+    assert "injected staging cleanup failure" in message
+    assert raised.value.__cause__ is primary_failure
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert len(list(tmp_path.glob(".checkout.staging-*"))) == 1
+
+
+def test_fetch_reports_primary_and_both_cleanup_failures(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+    primary_failure = RuntimeError("injected primary failure")
+
+    def fail_after_removing_lock(staging: Path) -> None:
+        (staging / "marker").write_text("partial", encoding="utf-8")
+        (staging.parent / ".checkout.fetch.lock").unlink()
+        raise primary_failure
+
+    def fail_staging_cleanup(_staging: Path) -> None:
+        raise OSError("injected staging cleanup failure")
+
+    monkeypatch.setattr(
+        fetch_module, "_materialize_checkout", fail_after_removing_lock
+    )
+    monkeypatch.setattr(
+        fetch_module, "_remove_staging", fail_staging_cleanup
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "injected primary failure" in message
+    assert "injected staging cleanup failure" in message
+    assert "FileNotFoundError" in message
+    assert message.index("staging cleanup") < message.index("lock cleanup")
+    assert raised.value.__cause__ is primary_failure
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+
+
+def test_fetch_reports_cleanup_failure_after_successful_publish(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    cleanup_failure = OSError("injected lock cleanup failure")
+    real_unlink = fetch_module._ParentAnchor.unlink
+
+    def remove_lock_then_fail(anchor, name: str) -> None:
+        real_unlink(anchor, name)
+        raise cleanup_failure
+
+    monkeypatch.setattr(
+        fetch_module._ParentAnchor, "unlink", remove_lock_then_fail
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "lock cleanup" in message
+    assert "injected lock cleanup failure" in message
+    assert raised.value.__cause__ is cleanup_failure
+    assert (destination / "marker").read_text(encoding="utf-8") == "complete"
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))

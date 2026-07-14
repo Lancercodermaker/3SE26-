@@ -549,6 +549,8 @@ def fetch(destination: Path) -> None:
         staging_name: str | None = None
         staging: Path | None = None
         lock_owned = False
+        primary_error: BaseException | None = None
+        primary_traceback = None
         try:
             try:
                 lock_descriptor = anchor.create_lock(lock_name)
@@ -579,11 +581,39 @@ def fetch(destination: Path) -> None:
             _publish_no_replace(anchor, staging, destination)
             staging_name = None
             staging = None
-        finally:
-            if staging_name is not None and anchor.entry_exists(staging_name):
-                _remove_staging(anchor.child_path(staging_name))
-            if lock_owned:
+        except BaseException as error:
+            primary_error = error
+            primary_traceback = error.__traceback__
+
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if staging_name is not None:
+            try:
+                if anchor.entry_exists(staging_name):
+                    _remove_staging(anchor.child_path(staging_name))
+            except BaseException as error:
+                cleanup_errors.append(("staging cleanup", error))
+        if lock_owned:
+            try:
                 anchor.unlink(lock_name)
+            except BaseException as error:
+                cleanup_errors.append(("lock cleanup", error))
+
+        if cleanup_errors:
+            failures = []
+            if primary_error is not None:
+                failures.append(
+                    "primary failure: "
+                    f"{type(primary_error).__name__}: {primary_error}"
+                )
+            failures.extend(
+                f"{label}: {type(error).__name__}: {error}"
+                for label, error in cleanup_errors
+            )
+            aggregate = RuntimeError("; ".join(failures))
+            cause = primary_error or cleanup_errors[0][1]
+            raise aggregate from cause
+        if primary_error is not None:
+            raise primary_error.with_traceback(primary_traceback)
 
 
 def main() -> int:
