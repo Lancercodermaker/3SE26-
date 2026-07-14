@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
 import threading
 from types import MappingProxyType
 
@@ -45,47 +45,113 @@ def _validate_verified_frame_values(
     if len(data) > _MAX_PAYLOAD_BYTES:
         raise ValueError("frame data payload exceeds 256 bytes")
 
-    if type(crc8_ok) is not bool or crc8_ok is not True:
-        raise TypeError("verified frame crc8_ok must be exact True")
-    if type(crc16_ok) is not bool or crc16_ok is not True:
-        raise TypeError("verified frame crc16_ok must be exact True")
-    if type(crc_mode) is not str or crc_mode != _VERIFIED_CRC_MODE:
+    if type(crc8_ok) is not bool:
+        raise TypeError("verified frame crc8_ok must be an exact bool")
+    if crc8_ok is not True:
+        raise ValueError("verified frame crc8_ok must be True")
+    if type(crc16_ok) is not bool:
+        raise TypeError("verified frame crc16_ok must be an exact bool")
+    if crc16_ok is not True:
+        raise ValueError("verified frame crc16_ok must be True")
+    if type(crc_mode) is not str:
+        raise TypeError("verified frame crc_mode must be an exact str")
+    if crc_mode != _VERIFIED_CRC_MODE:
         raise ValueError(
             "verified frame crc_mode must be exact 'kermit-x3014'"
         )
 
 
-@dataclass(frozen=True)
-class ActiveProfile:
+class ActiveProfile(tuple):
     """Normalized RF profile metadata selected by a decoder reset."""
 
-    name: str
-    team: str
-    target: str
-    center_freq: int
-    level: int
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        *,
+        name: str,
+        team: str,
+        target: str,
+        center_freq: int,
+        level: int,
+    ) -> ActiveProfile:
+        return tuple.__new__(
+            cls,
+            (name, team, target, center_freq, level),
+        )
+
+    @property
+    def name(self) -> str:
+        return self[0]
+
+    @property
+    def team(self) -> str:
+        return self[1]
+
+    @property
+    def target(self) -> str:
+        return self[2]
+
+    @property
+    def center_freq(self) -> int:
+        return self[3]
+
+    @property
+    def level(self) -> int:
+        return self[4]
 
 
-@dataclass(frozen=True)
-class VerifiedParsedFrame:
+class VerifiedParsedFrame(tuple):
     """Backend-owned claim that an upstream parser verified one frame."""
 
-    cmd_id: int
-    data: bytes
-    seq: int
-    crc8_ok: bool
-    crc16_ok: bool
-    crc_mode: str
+    __slots__ = ()
 
-    def __post_init__(self) -> None:
+    def __new__(
+        cls,
+        *,
+        cmd_id: int,
+        data: bytes,
+        seq: int,
+        crc8_ok: bool,
+        crc16_ok: bool,
+        crc_mode: str,
+    ) -> VerifiedParsedFrame:
         _validate_verified_frame_values(
-            cmd_id=self.cmd_id,
-            data=self.data,
-            seq=self.seq,
-            crc8_ok=self.crc8_ok,
-            crc16_ok=self.crc16_ok,
-            crc_mode=self.crc_mode,
+            cmd_id=cmd_id,
+            data=data,
+            seq=seq,
+            crc8_ok=crc8_ok,
+            crc16_ok=crc16_ok,
+            crc_mode=crc_mode,
         )
+        return tuple.__new__(
+            cls,
+            (cmd_id, data, seq, crc8_ok, crc16_ok, crc_mode),
+        )
+
+    @property
+    def cmd_id(self) -> int:
+        return self[0]
+
+    @property
+    def data(self) -> bytes:
+        return self[1]
+
+    @property
+    def seq(self) -> int:
+        return self[2]
+
+    @property
+    def crc8_ok(self) -> bool:
+        return self[3]
+
+    @property
+    def crc16_ok(self) -> bool:
+        return self[4]
+
+    @property
+    def crc_mode(self) -> str:
+        return self[5]
 
 
 _PROFILE_FREQUENCIES = MappingProxyType(
@@ -111,22 +177,16 @@ def _validated_frame_fields(
 ) -> tuple[int, bytes, int, bool, bool, str]:
     if type(frame) is not VerifiedParsedFrame:
         raise TypeError("backend frames must be exact VerifiedParsedFrame")
+    cmd_id, data, seq, crc8_ok, crc16_ok, crc_mode = frame
     _validate_verified_frame_values(
-        cmd_id=frame.cmd_id,
-        data=frame.data,
-        seq=frame.seq,
-        crc8_ok=frame.crc8_ok,
-        crc16_ok=frame.crc16_ok,
-        crc_mode=frame.crc_mode,
+        cmd_id=cmd_id,
+        data=data,
+        seq=seq,
+        crc8_ok=crc8_ok,
+        crc16_ok=crc16_ok,
+        crc_mode=crc_mode,
     )
-    return (
-        frame.cmd_id,
-        frame.data,
-        frame.seq,
-        frame.crc8_ok,
-        frame.crc16_ok,
-        frame.crc_mode,
-    )
+    return cmd_id, data, seq, crc8_ok, crc16_ok, crc_mode
 
 
 def _normalized_text(
@@ -151,6 +211,7 @@ class UpstreamDecoder:
     def __init__(self, *, backend=None) -> None:
         self._backend = backend
         self._operation_lock = threading.Lock()
+        self._operation_state = threading.local()
         self._stats_lock = threading.Lock()
         self._active_profile: ActiveProfile | None = None
         self._chunks_processed = 0
@@ -169,8 +230,29 @@ class UpstreamDecoder:
         chunk: IqChunk,
         context: DecodeContext,
     ) -> list[DecodedCommand]:
-        with self._operation_lock:
+        with self._serialized_operation("decode"):
             return self._decode_locked(chunk, context)
+
+    @contextmanager
+    def _serialized_operation(self, requested_operation: str):
+        active_operation = getattr(
+            self._operation_state,
+            "active_operation",
+            None,
+        )
+        if active_operation is not None:
+            with self._stats_lock:
+                self._decode_errors += 1
+            raise RuntimeError(
+                "reentrant upstream decoder operation is forbidden: "
+                f"{active_operation} -> {requested_operation}"
+            )
+        self._operation_state.active_operation = requested_operation
+        try:
+            with self._operation_lock:
+                yield
+        finally:
+            del self._operation_state.active_operation
 
     def _decode_locked(
         self,
@@ -182,6 +264,13 @@ class UpstreamDecoder:
                 profile = self._active_profile
             if profile is None:
                 raise RuntimeError("reset must succeed before decode")
+            (
+                profile_name,
+                profile_team,
+                profile_target,
+                _profile_center_freq,
+                profile_level,
+            ) = profile
             if type(context) is not DecodeContext:
                 raise TypeError(
                     "decode context must be an exact DecodeContext"
@@ -197,7 +286,7 @@ class UpstreamDecoder:
                 team,
                 target,
             )
-            active_context = (profile.team, profile.target)
+            active_context = (profile_team, profile_target)
             if normalized_context != active_context:
                 raise ValueError(
                     "decode context does not match active profile"
@@ -251,13 +340,13 @@ class UpstreamDecoder:
                 ) = _validated_frame_fields(frame)
                 evidence = {"upstream_seq": seq}
                 if cmd_id == 0x0A06:
-                    evidence["level"] = profile.level
+                    evidence["level"] = profile_level
                 commands.append(
                     DecodedCommand(
                         cmd_id=cmd_id,
                         payload=payload,
                         decoder_id=self.decoder_id,
-                        profile=profile.name,
+                        profile=profile_name,
                         crc8_ok=crc8_ok,
                         crc16_ok=crc16_ok,
                         crc_mode=crc_mode,
@@ -266,8 +355,8 @@ class UpstreamDecoder:
                             chunk.first_sample_index + len(chunk.samples) - 1
                         ),
                         receive_wall_time=chunk.rx_wall_time,
-                        target=profile.target,
-                        team=profile.team,
+                        target=profile_target,
+                        team=profile_team,
                         context_version=context.context_version,
                         evidence=evidence,
                     )
@@ -283,7 +372,7 @@ class UpstreamDecoder:
         return commands
 
     def reset(self, reason: ResetReason, context: DecodeContext) -> None:
-        with self._operation_lock:
+        with self._serialized_operation("reset"):
             self._reset_locked(reason, context)
 
     def _reset_locked(

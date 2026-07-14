@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 import threading
 from types import MappingProxyType
@@ -80,22 +79,6 @@ def released_memoryview() -> memoryview:
     value = memoryview(b"released")
     value.release()
     return value
-
-
-def forged_verified_frame(**overrides) -> VerifiedParsedFrame:
-    values = {
-        "cmd_id": 0x0A06,
-        "data": b"ABC123",
-        "seq": 1,
-        "crc8_ok": True,
-        "crc16_ok": True,
-        "crc_mode": "kermit-x3014",
-    }
-    values.update(overrides)
-    frame = object.__new__(VerifiedParsedFrame)
-    for field_name, value in values.items():
-        object.__setattr__(frame, field_name, value)
-    return frame
 
 
 _INVALID_VERIFIED_FRAME_CASES = [
@@ -185,6 +168,35 @@ class RecordingBackend:
         return self.frames
 
 
+class LockBoundaryProbe:
+    """Signals each attempt before delegating to a real non-reentrant lock."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counter_lock = threading.Lock()
+        self._boundaries = []
+
+    def boundary(self, index):
+        with self._counter_lock:
+            while len(self._boundaries) <= index:
+                self._boundaries.append(threading.Event())
+            return self._boundaries[index]
+
+    def __enter__(self):
+        with self._counter_lock:
+            index = getattr(self, "_attempts", 0)
+            self._attempts = index + 1
+            while len(self._boundaries) <= index:
+                self._boundaries.append(threading.Event())
+            boundary = self._boundaries[index]
+        boundary.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._lock.release()
+
+
 def test_plugin_has_stable_identity_and_no_hardware_or_transport_ownership():
     decoder = UpstreamDecoder()
 
@@ -196,7 +208,7 @@ def test_plugin_has_stable_identity_and_no_hardware_or_transport_ownership():
         assert not hasattr(decoder, forbidden)
 
 
-def test_verified_parsed_frame_contract_exists_and_is_frozen():
+def test_verified_parsed_frame_contract_is_truly_immutable():
     frame_type = getattr(upstream_decoder, "VerifiedParsedFrame", None)
 
     assert frame_type is not None
@@ -208,8 +220,10 @@ def test_verified_parsed_frame_contract_exists_and_is_frozen():
         crc16_ok=True,
         crc_mode="kermit-x3014",
     )
-    with pytest.raises(FrozenInstanceError):
+    with pytest.raises(AttributeError):
         frame.seq = 2
+    with pytest.raises(AttributeError):
+        object.__setattr__(frame, "data", b"detached-from-crc")
 
 
 @pytest.mark.parametrize(
@@ -231,6 +245,34 @@ def test_verified_frame_accepts_exact_immutable_bytes():
     frame = verified_frame(data=payload)
 
     assert frame.data is payload
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error_type"),
+    [
+        pytest.param({"crc8_ok": 1}, TypeError, id="crc8-wrong-type"),
+        pytest.param({"crc8_ok": False}, ValueError, id="crc8-false"),
+        pytest.param({"crc16_ok": 1}, TypeError, id="crc16-wrong-type"),
+        pytest.param({"crc16_ok": False}, ValueError, id="crc16-false"),
+        pytest.param({"crc_mode": None}, TypeError, id="mode-wrong-type"),
+        pytest.param(
+            {"crc_mode": type("StrSubclass", (str,), {})("kermit-x3014")},
+            TypeError,
+            id="mode-subclass",
+        ),
+        pytest.param(
+            {"crc_mode": "other"},
+            ValueError,
+            id="mode-wrong-value",
+        ),
+    ],
+)
+def test_verified_frame_crc_errors_distinguish_type_from_value(
+    overrides,
+    error_type,
+):
+    with pytest.raises(error_type):
+        verified_frame(**overrides)
 
 
 @pytest.mark.parametrize(
@@ -294,12 +336,35 @@ def test_unknown_profile_values_raise_without_defaulting(team, target):
     assert decoder.stats().decode_errors == 1
 
 
-def test_active_profile_is_immutable():
+def test_active_profile_is_truly_immutable_through_getter():
     decoder = UpstreamDecoder()
     decoder.reset(ResetReason.TARGET_CHANGE, make_context())
+    external_profile = decoder.active_profile
 
-    with pytest.raises(FrozenInstanceError):
-        decoder.active_profile.center_freq = 1
+    with pytest.raises(AttributeError):
+        object.__setattr__(external_profile, "center_freq", 1)
+
+    assert decoder.active_profile.center_freq == 434_920_000
+
+
+def test_malicious_reset_hook_cannot_mutate_committed_profile():
+    class Backend:
+        mutation_error = None
+
+        def reset(self, *, reason, profile):
+            try:
+                object.__setattr__(profile, "level", 99)
+            except AttributeError as error:
+                self.mutation_error = error
+
+    backend = Backend()
+    decoder = UpstreamDecoder(backend=backend)
+
+    decoder.reset(ResetReason.STARTUP, make_context("BLUE", "L1"))
+
+    assert isinstance(backend.mutation_error, AttributeError)
+    assert decoder.active_profile.name == "BLUE-L1"
+    assert decoder.active_profile.level == 1
 
 
 def test_reset_calls_optional_pure_backend_hook_before_committing_profile():
@@ -582,6 +647,68 @@ def test_malicious_backend_cannot_mutate_shared_chunk_samples():
     assert chunk.samples.flags.writeable is False
 
 
+def test_malicious_decode_hook_cannot_mutate_profile_or_jam_metadata():
+    class Backend:
+        mutation_error = None
+
+        def decode(self, *, samples, sample_rate_hz, profile):
+            try:
+                object.__setattr__(profile, "name", "RED-L3")
+            except AttributeError as error:
+                self.mutation_error = error
+            return [verified_frame(cmd_id=0x0A06, seq=9)]
+
+    backend = Backend()
+    decoder = UpstreamDecoder(backend=backend)
+    context = make_context("BLUE", "L2", profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    command = decoder.decode(make_chunk(), context)[0]
+    result = CommandValidator().validate(command)
+
+    assert isinstance(backend.mutation_error, AttributeError)
+    assert command.profile == "BLUE-L2"
+    assert command.team == "BLUE"
+    assert command.target == "L2"
+    assert dict(command.evidence) == {"upstream_seq": 9, "level": 2}
+    assert result.accepted is True
+
+
+def test_frame_validation_uses_one_immutable_snapshot(monkeypatch):
+    frame = verified_frame(data=b"CRC-BOUND", crc8_ok=True)
+    reads = {"data": 0, "crc8_ok": 0}
+
+    def changing_data(_frame):
+        reads["data"] += 1
+        return b"CRC-BOUND" if reads["data"] == 1 else b"DETACHED"
+
+    def changing_crc8(_frame):
+        reads["crc8_ok"] += 1
+        return True if reads["crc8_ok"] == 1 else False
+
+    monkeypatch.setattr(
+        VerifiedParsedFrame,
+        "data",
+        property(changing_data),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        VerifiedParsedFrame,
+        "crc8_ok",
+        property(changing_crc8),
+        raising=False,
+    )
+    decoder = UpstreamDecoder(backend=RecordingBackend([frame]))
+    context = make_context(profile="competition")
+    decoder.reset(ResetReason.STARTUP, context)
+
+    command = decoder.decode(make_chunk(), context)[0]
+
+    assert reads == {"data": 0, "crc8_ok": 0}
+    assert command.payload == b"CRC-BOUND"
+    assert command.crc8_ok is True
+
+
 def test_multiple_parsed_frames_are_converted_with_complete_metadata():
     backend = RecordingBackend(
         [
@@ -634,12 +761,28 @@ def test_verified_frame_constructor_rejects_invalid_fields(overrides, message):
         verified_frame(**overrides)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    _INVALID_VERIFIED_FRAME_CASES,
-)
-def test_decode_defensively_rejects_forged_invalid_frame(overrides, message):
-    frame = forged_verified_frame(**overrides)
+def test_verified_frame_cannot_be_forged_with_object_allocator():
+    with pytest.raises(TypeError):
+        object.__new__(VerifiedParsedFrame)
+
+
+@pytest.mark.parametrize("forged_kind", ["plain-tuple", "subclass"])
+def test_decode_defensively_rejects_forged_frame_type(forged_kind):
+    values = (0x0A06, b"ABC123", 1, True, True, "kermit-x3014")
+    if forged_kind == "plain-tuple":
+        frame = values
+    else:
+        class FrameSubclass(VerifiedParsedFrame):
+            pass
+
+        frame = FrameSubclass(
+            cmd_id=values[0],
+            data=values[1],
+            seq=values[2],
+            crc8_ok=values[3],
+            crc16_ok=values[4],
+            crc_mode=values[5],
+        )
     backend = RecordingBackend(
         [verified_frame(cmd_id=1, data=b"valid-first", seq=1), frame]
     )
@@ -647,7 +790,7 @@ def test_decode_defensively_rejects_forged_invalid_frame(overrides, message):
     context = make_context(profile="competition")
     decoder.reset(ResetReason.STARTUP, context)
 
-    with pytest.raises((TypeError, ValueError), match=message):
+    with pytest.raises(TypeError, match="exact VerifiedParsedFrame"):
         decoder.decode(make_chunk(), context)
 
     stats = decoder.stats()
@@ -657,15 +800,15 @@ def test_decode_defensively_rejects_forged_invalid_frame(overrides, message):
     assert stats.commands_emitted == 0
 
 
-def test_mutated_forged_payload_cannot_reuse_verified_crc_claim():
+def test_mutated_payload_in_frame_impostor_cannot_reuse_verified_crc_claim():
     mutable_payload = bytearray(b"ABC123")
-    frame = forged_verified_frame(data=mutable_payload)
+    frame = (0x0A06, mutable_payload, 1, True, True, "kermit-x3014")
     mutable_payload[:] = b"XXXXXX"
     decoder = UpstreamDecoder(backend=RecordingBackend([frame]))
     context = make_context(profile="competition")
     decoder.reset(ResetReason.STARTUP, context)
 
-    with pytest.raises(TypeError, match="exact bytes"):
+    with pytest.raises(TypeError, match="exact VerifiedParsedFrame"):
         decoder.decode(make_chunk(), context)
 
     stats = decoder.stats()
@@ -851,10 +994,69 @@ def test_stats_updates_are_thread_safe_under_concurrent_decode_calls():
     assert stats.resets == 1
 
 
+@pytest.mark.parametrize(
+    ("outer_operation", "inner_operation"),
+    [
+        ("decode", "decode"),
+        ("decode", "reset"),
+        ("reset", "decode"),
+        ("reset", "reset"),
+    ],
+)
+def test_same_thread_reentrant_operation_fails_fast_and_outer_completes(
+    outer_operation,
+    inner_operation,
+):
+    nested_errors = []
+    context = make_context(profile="competition")
+
+    class Backend:
+        armed = False
+
+        def invoke_nested(self):
+            try:
+                if inner_operation == "decode":
+                    decoder.decode(make_chunk(), context)
+                else:
+                    decoder.reset(ResetReason.MANUAL, context)
+            except RuntimeError as error:
+                nested_errors.append(error)
+
+        def decode(self, *, samples, sample_rate_hz, profile):
+            if self.armed:
+                self.invoke_nested()
+            return ()
+
+        def reset(self, *, reason, profile):
+            if self.armed:
+                self.invoke_nested()
+
+    backend = Backend()
+    decoder = UpstreamDecoder(backend=backend)
+    decoder.reset(ResetReason.STARTUP, context)
+    baseline = decoder.stats()
+    backend.armed = True
+
+    if outer_operation == "decode":
+        assert decoder.decode(make_chunk(), context) == []
+    else:
+        decoder.reset(ResetReason.MANUAL, context)
+
+    assert len(nested_errors) == 1
+    assert "reentrant" in str(nested_errors[0]).lower()
+    assert outer_operation in str(nested_errors[0])
+    assert inner_operation in str(nested_errors[0])
+    stats = decoder.stats()
+    assert stats.decode_errors == baseline.decode_errors + 1
+    assert stats.chunks_processed == baseline.chunks_processed + (
+        outer_operation == "decode"
+    )
+    assert stats.resets == baseline.resets + (outer_operation == "reset")
+
+
 def test_decode_operations_do_not_reenter_backend():
     first_entered = threading.Event()
     release_first = threading.Event()
-    second_started = threading.Event()
     second_entered = threading.Event()
 
     class Backend:
@@ -872,17 +1074,18 @@ def test_decode_operations_do_not_reenter_backend():
     decoder = UpstreamDecoder(backend=Backend())
     context = make_context(profile="competition")
     decoder.reset(ResetReason.STARTUP, context)
+    lock_probe = LockBoundaryProbe()
+    decoder._operation_lock = lock_probe
 
     def second_decode():
-        second_started.set()
         return decoder.decode(make_chunk(), context)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(decoder.decode, make_chunk(), context)
         assert first_entered.wait(2.0)
         second = pool.submit(second_decode)
-        assert second_started.wait(2.0)
-        assert not second_entered.wait(0.1)
+        assert lock_probe.boundary(1).wait(2.0)
+        assert second_entered.is_set() is False
         release_first.set()
         assert first.result(timeout=2.0) == []
         assert second.result(timeout=2.0) == []
@@ -891,7 +1094,6 @@ def test_decode_operations_do_not_reenter_backend():
 def test_decode_and_reset_are_serialized_with_consistent_profile():
     decode_entered = threading.Event()
     release_decode = threading.Event()
-    reset_started = threading.Event()
     reset_entered = threading.Event()
 
     class Backend:
@@ -913,18 +1115,19 @@ def test_decode_and_reset_are_serialized_with_consistent_profile():
     old_context = make_context("BLUE", "L1", profile="competition")
     new_context = make_context("RED", "L2", profile="competition")
     decoder.reset(ResetReason.STARTUP, old_context)
+    lock_probe = LockBoundaryProbe()
+    decoder._operation_lock = lock_probe
     backend.block_decode = True
 
     def reset_to_new_profile():
-        reset_started.set()
         decoder.reset(ResetReason.TARGET_CHANGE, new_context)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         decoding = pool.submit(decoder.decode, make_chunk(), old_context)
         assert decode_entered.wait(2.0)
         resetting = pool.submit(reset_to_new_profile)
-        assert reset_started.wait(2.0)
-        assert not reset_entered.wait(0.1)
+        assert lock_probe.boundary(1).wait(2.0)
+        assert reset_entered.is_set() is False
         release_decode.set()
         commands = decoding.result(timeout=2.0)
         resetting.result(timeout=2.0)
@@ -937,7 +1140,6 @@ def test_decode_and_reset_are_serialized_with_consistent_profile():
 def test_reset_operations_commit_in_call_order_without_reentry():
     first_entered = threading.Event()
     release_first = threading.Event()
-    second_started = threading.Event()
     second_entered = threading.Event()
 
     class Backend:
@@ -953,9 +1155,10 @@ def test_reset_operations_commit_in_call_order_without_reentry():
 
     backend = Backend()
     decoder = UpstreamDecoder(backend=backend)
+    lock_probe = LockBoundaryProbe()
+    decoder._operation_lock = lock_probe
 
     def second_reset():
-        second_started.set()
         decoder.reset(
             ResetReason.TARGET_CHANGE,
             make_context("RED", "L2", profile="competition"),
@@ -969,8 +1172,8 @@ def test_reset_operations_commit_in_call_order_without_reentry():
         )
         assert first_entered.wait(2.0)
         second = pool.submit(second_reset)
-        assert second_started.wait(2.0)
-        assert not second_entered.wait(0.1)
+        assert lock_probe.boundary(1).wait(2.0)
+        assert second_entered.is_set() is False
         release_first.set()
         first.result(timeout=2.0)
         second.result(timeout=2.0)
