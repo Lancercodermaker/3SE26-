@@ -50,18 +50,28 @@ python third_party/CombatRadarSdr2026/fetch_upstream.py --acknowledge-no-license
 ```
 
 It uses a `blob:none` partial fetch and creates a separate sparse checkout at the
-pinned commit. The helper verifies each `HEAD:path` and materialized file against
-the blob table above with lazy fetching disabled. It also verifies that the local
-Git object database contains exactly the four allowlisted blobs; non-allowlisted
-upstream blobs are neither downloaded nor materialized.
+pinned commit. After the four allowlisted blobs are materialized, the helper
+removes the promisor remote and `extensions.partialClone` configuration before
+any verification. Verification therefore has no configured upstream transport
+or remote helper to consult, including on Git 2.32 and 2.34, which ignore
+`GIT_NO_LAZY_FETCH`. That environment variable remains an additional safeguard
+on newer Git versions. The helper then verifies each `HEAD:path` and materialized
+file against the blob table above and verifies that the local Git object database
+contains exactly the four allowlisted blobs; non-allowlisted upstream blobs are
+neither downloaded nor materialized. Repository URL and commit provenance remain
+in this notice and `__init__.py`, not in a checkout remote.
 
 Fetching occurs in a uniquely named staging directory beside the destination.
 An exclusive sibling lock rejects concurrent helper runs for the same target.
 Only a fully verified checkout is atomically renamed to the requested path.
-Failures before publication are atomic: the helper removes only its own staging
-directory and lock, while a requested target remains absent or a pre-existing
-target remains untouched, so a later retry is safe. Once publication and the
-post-publication verification succeed, the destination is the committed result.
+Failures before publication are atomic with respect to entries whose transaction
+identity is known: the helper removes only its own staging directory and lock and
+never deletes a replacement whose identity cannot be read or does not match. A
+concurrently inserted entry with unknown ownership can therefore remain under a
+staging or requested-target name after the helper reports failure. It and its
+payload require operator inspection; retry only after the operator resolves that
+foreign entry. Once publication and the post-publication verification succeed,
+the destination is the committed result.
 Any later handle, stream, or lock cleanup problem is logged as
 `published successfully; cleanup warning`; the command still succeeds and
 prints the destination because retrying is neither necessary nor safe. A cleanup

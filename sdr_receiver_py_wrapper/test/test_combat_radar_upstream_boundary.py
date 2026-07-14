@@ -151,6 +151,8 @@ def test_upstream_metadata_and_notice_share_pinned_blob_map():
     assert "written permission" in upstream_notice.lower()
     assert "published successfully; cleanup warning" in upstream_notice
     assert "before publication" in upstream_notice
+    assert "unknown ownership" in upstream_notice
+    assert "operator inspection" in upstream_notice
     for path, blob in UPSTREAM_BLOBS.items():
         assert f"| `{path}` | `{blob}` |" in upstream_notice
 
@@ -338,6 +340,15 @@ def test_fetch_sanitizes_hostile_git_environment_and_preserves_victim(
     assert "--object-format=sha1" in commands[0]
     assert "--template=" in commands[0]
     assert any("core.hooksPath" in command for command in commands)
+    assert any(
+        command[-3:]
+        == ["config", "--unset-all", "extensions.partialClone"]
+        for command in commands
+    )
+    assert any(
+        command[-3:] == ["remote", "remove", "origin"]
+        for command in commands
+    )
     assert _snapshot_files(victim) == victim_before
 
 
@@ -396,6 +407,95 @@ def test_partial_fetch_materializes_only_allowlisted_blobs(
     )
     assert not _has_local_blob(destination, blobs["README.md"])
     assert not _has_local_blob(destination, blobs["server_" + "comm.py"])
+
+
+def test_verification_uses_detached_local_objects_without_lazy_fetch(
+    tmp_path: Path, monkeypatch
+):
+    source, commit, blobs = _create_local_upstream(tmp_path)
+    offline_source = tmp_path / "source-offline"
+    destination = tmp_path / "checkout"
+    trace = tmp_path / "missing-object-trace.json"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module, "UPSTREAM_REPOSITORY", source.as_uri())
+    monkeypatch.setattr(fetch_module, "UPSTREAM_COMMIT", commit)
+    monkeypatch.setattr(
+        fetch_module,
+        "UPSTREAM_BLOBS",
+        {path: blobs[path] for path in ALLOWED_UPSTREAM_FILES},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fetch_module, "ALLOWED_UPSTREAM_FILES", ALLOWED_UPSTREAM_FILES
+    )
+    real_verify = fetch_module._verify_checkout
+
+    def verify_with_source_offline(staging: Path) -> None:
+        checkout = fetch_module._active_checkout_path(staging)
+        assert _git(checkout, "remote").stdout.strip() == ""
+        partial_clone = _git(
+            checkout,
+            "config",
+            "--get",
+            "extensions.partialClone",
+            check=False,
+        )
+        remote_config = _git(
+            checkout,
+            "config",
+            "--get-regexp",
+            r"^remote\.",
+            check=False,
+        )
+        assert partial_clone.returncode == 1
+        assert remote_config.returncode == 1
+        assert fetch_module._local_blob_ids(checkout) == {
+            blobs[path] for path in ALLOWED_UPSTREAM_FILES
+        }
+
+        source.rename(offline_source)
+        real_verify(staging)
+
+        environment = os.environ.copy()
+        for name in tuple(environment):
+            if name.startswith("GIT_"):
+                del environment[name]
+        environment.update(
+            {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_TRACE2_EVENT": str(trace),
+            }
+        )
+        missing = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(staging),
+                "cat-file",
+                "-e",
+                "HEAD:README.md",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=environment,
+        )
+        assert missing.returncode != 0
+        trace_text = trace.read_text(encoding="utf-8")
+        assert '"child_class":"remote"' not in trace_text
+        assert "git-upload-pack" not in trace_text
+
+    monkeypatch.setattr(
+        fetch_module, "_verify_checkout", verify_with_source_offline
+    )
+
+    fetch_module.fetch(destination)
+
+    assert destination.is_dir()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
 
 
 @pytest.mark.parametrize("extra_kind", ["file", "empty-directory"])
@@ -592,24 +692,8 @@ def test_staging_entry_swap_never_touches_victim_or_publishes(
             if os.name == "nt" and error.winerror == 32:
                 raise RuntimeError("staging swap blocked") from error
             raise
-        if os.name == "nt":
-            completed = subprocess.run(
-                [
-                    "cmd.exe",
-                    "/d",
-                    "/c",
-                    "mklink",
-                    "/J",
-                    str(original),
-                    str(victim),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            assert completed.returncode == 0, completed.stderr
-        else:
-            original.symlink_to(victim, target_is_directory=True)
+        _directory_link_or_skip(original, victim)
+        created["replacement_installed"] = True
         real_materialize(stable_staging)
 
     monkeypatch.setattr(
@@ -622,11 +706,22 @@ def test_staging_entry_swap_never_touches_victim_or_publishes(
     with pytest.raises(RuntimeError, match="staging|swap|identity|reparse"):
         fetch_module.fetch(destination)
 
+    replacement = tmp_path / created["name"]
     assert _snapshot_files(victim) == victim_before
+    if created.get("replacement_installed"):
+        assert os.path.lexists(replacement)
+        assert (replacement / "owned.txt").read_text(encoding="utf-8") == (
+            "preserve\n"
+        )
+    else:
+        assert not os.path.lexists(replacement)
     assert not os.path.lexists(destination)
     assert not orphan.exists()
     assert not (tmp_path / ".checkout.fetch.lock").exists()
-    assert not list(tmp_path.glob(".checkout.staging-*"))
+    expected_replacements = (
+        [replacement] if created.get("replacement_installed") else []
+    )
+    assert list(tmp_path.glob(".checkout.staging-*")) == expected_replacements
 
 
 def test_blob_pin_mismatch_fails_without_publishing_destination(
@@ -718,6 +813,28 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
     except OSError as error:
         pytest.skip(f"directory symlinks are unavailable: {error}")
+
+
+def _directory_link_or_skip(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        _symlink_or_skip(link, target)
+        return
+    completed = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"directory junctions are unavailable: {completed.stderr}")
 
 
 def _stub_fetch_io(fetch_module, monkeypatch) -> None:
@@ -968,7 +1085,10 @@ def test_posix_publish_rejects_staging_swap_at_rename_gap(
         fetch_module.fetch(destination)
 
     assert _snapshot_files(victim) == victim_before
-    assert not os.path.lexists(destination)
+    assert os.path.lexists(destination)
+    assert (destination / "owned.txt").read_text(encoding="utf-8") == (
+        "preserve"
+    )
     assert not orphan.exists()
     assert not (tmp_path / ".checkout.fetch.lock").exists()
     assert not list(tmp_path.glob(".checkout.staging-*"))
@@ -1103,6 +1223,85 @@ def test_expected_identity_cleanup_never_recursively_deletes_late_swap(
 
     assert (expected / "owned.txt").read_text(encoding="utf-8") == "preserve"
     assert (orphan / "trusted.txt").read_text(encoding="utf-8") == "trusted"
+
+
+def test_expected_identity_cleanup_preserves_unknown_replacement(
+    tmp_path: Path, monkeypatch
+):
+    expected = tmp_path / "expected"
+    expected.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    payload = victim / "owned.txt"
+    payload.write_text("preserve", encoding="utf-8")
+    orphan = tmp_path / "owned-orphan"
+    fetch_module = _load_fetch_module()
+    parent = fetch_module._open_parent_anchor(
+        tmp_path, fetch_module._path_identity(tmp_path)
+    )
+    expected_identity = parent.entry_identity(expected.name)
+    expected.rename(orphan)
+    _directory_link_or_skip(expected, victim)
+    real_entry_identity = parent.entry_identity
+
+    def fail_for_replacement(name: str):
+        if name == expected.name:
+            raise RuntimeError("injected unknown replacement identity")
+        return real_entry_identity(name)
+
+    monkeypatch.setattr(parent, "entry_identity", fail_for_replacement)
+    try:
+        fetch_module._cleanup_created_staging(
+            parent, expected.name, expected_identity
+        )
+    finally:
+        parent.close()
+
+    assert os.path.lexists(expected)
+    assert payload.read_text(encoding="utf-8") == "preserve"
+    assert not orphan.exists()
+
+
+def test_staging_identity_capture_failure_preserves_unknown_replacement(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    payload = victim / "owned.txt"
+    payload.write_text("preserve", encoding="utf-8")
+    orphan = tmp_path / "identity-unknown-orphan"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_entry_identity = fetch_module._ParentAnchor.entry_identity
+    attacked = {}
+
+    def replace_before_identity(anchor, name: str):
+        if name.startswith(".checkout.staging-") and not attacked:
+            anchored_replacement = anchor.child_path(name)
+            anchored_replacement.rename(orphan)
+            replacement = tmp_path / name
+            _directory_link_or_skip(replacement, victim)
+            attacked["replacement"] = replacement
+            raise RuntimeError("injected unknown staging ownership")
+        return real_entry_identity(anchor, name)
+
+    monkeypatch.setattr(
+        fetch_module._ParentAnchor,
+        "entry_identity",
+        replace_before_identity,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    assert "unknown staging ownership" in str(raised.value)
+    replacement = attacked["replacement"]
+    assert os.path.lexists(replacement)
+    assert payload.read_text(encoding="utf-8") == "preserve"
+    assert orphan.exists()
+    assert not destination.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
 
 
 @pytest.mark.skipif(

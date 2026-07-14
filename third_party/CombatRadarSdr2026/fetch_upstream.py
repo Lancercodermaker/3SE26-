@@ -74,6 +74,9 @@ def _fetch_commands(checkout: Path) -> list[list[str]]:
             UPSTREAM_COMMIT,
         ],
         git_at_checkout + ["checkout", "--detach", UPSTREAM_COMMIT],
+        git_at_checkout
+        + ["config", "--unset-all", "extensions.partialClone"],
+        git_at_checkout + ["remote", "remove", "origin"],
     ]
 
 
@@ -712,8 +715,7 @@ def _remove_entry_if_expected(
     try:
         current_identity = parent.entry_identity(name)
     except RuntimeError:
-        parent.remove_entry_no_follow(name)
-        return True
+        return False
     if current_identity != expected_identity:
         return False
     parent.remove_entry_no_follow(name)
@@ -746,29 +748,27 @@ def _create_staging_anchor(
             continue
         try:
             created_identity = parent.entry_identity(name)
-            try:
-                return _open_staging_anchor(
-                    parent, name, created_identity
-                )
-            except BaseException as primary_error:
-                try:
-                    _cleanup_created_staging(
-                        parent, name, created_identity
-                    )
-                except BaseException as cleanup_error:
-                    raise RuntimeError(
-                        "staging anchor open failed; staging cleanup failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    ) from primary_error
-                raise
-        except BaseException:
+        except BaseException as primary_error:
             try:
                 if parent.entry_exists(name):
-                    path = parent.child_path(name)
-                    if path.is_symlink() or _path_is_reparse_point(path):
-                        parent.remove_entry_no_follow(name)
-            except BaseException:
+                    raise RuntimeError(
+                        "staging identity capture failed; cleanup refused "
+                        "an entry with unknown ownership: "
+                        f"{type(primary_error).__name__}: {primary_error}"
+                    ) from primary_error
+            except (FileNotFoundError, NotADirectoryError):
                 pass
+            raise
+        try:
+            return _open_staging_anchor(parent, name, created_identity)
+        except BaseException as primary_error:
+            try:
+                _cleanup_created_staging(parent, name, created_identity)
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "staging anchor open failed; staging cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                ) from primary_error
             raise
     raise RuntimeError("could not allocate a unique staging directory")
 
@@ -1192,7 +1192,7 @@ def _cleanup_staging_anchor(staging: _StagingAnchor) -> None:
         try:
             named_identity = parent.entry_identity(staging.name)
         except RuntimeError:
-            parent.remove_entry_no_follow(staging.name)
+            pass
         else:
             if named_identity == staging.identity:
                 parent.remove_entry_no_follow(staging.name)
