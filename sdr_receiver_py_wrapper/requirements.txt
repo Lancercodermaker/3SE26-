@@ -1,2 +1,6 @@
 numpy>=1.21
 pyadi-iio>=0.0.14
+
+# CombatRadarSdr2026 is intentionally not a package dependency: the pinned
+# upstream commit has no explicit license or Python packaging metadata. See
+# third_party/CombatRadarSdr2026/UPSTREAM.md for the opt-in sparse fetch process.
