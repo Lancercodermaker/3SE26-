@@ -39,7 +39,14 @@ def _git_at(checkout: Path) -> list[str]:
 def _fetch_commands(checkout: Path) -> list[list[str]]:
     git_at_checkout = _git_at(checkout)
     return [
-        ["git", "init", str(checkout)],
+        [
+            "git",
+            "init",
+            "--object-format=sha1",
+            "--template=",
+            str(checkout),
+        ],
+        git_at_checkout + ["config", "core.hooksPath", ".git/no-hooks"],
         git_at_checkout + ["remote", "add", "origin", UPSTREAM_REPOSITORY],
         git_at_checkout + ["config", "core.repositoryformatversion", "1"],
         git_at_checkout + ["config", "extensions.partialClone", "origin"],
@@ -82,6 +89,16 @@ def _run(
     command: list[str], *, check: bool = True, no_lazy_fetch: bool = False
 ) -> subprocess.CompletedProcess:
     environment = os.environ.copy()
+    for name in tuple(environment):
+        if name.startswith("GIT_"):
+            del environment[name]
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
     if no_lazy_fetch:
         environment["GIT_NO_LAZY_FETCH"] = "1"
     return subprocess.run(
@@ -96,8 +113,44 @@ def _run(
 
 
 def _materialize_checkout(staging: Path) -> None:
-    for command in _fetch_commands(staging):
+    checkout = staging
+    if os.name == "nt":
+        checkout = staging / f"payload-{uuid.uuid4().hex}"
+        os.mkdir(checkout, 0o700)
+    commands = _fetch_commands(checkout)
+    _run(commands[0])
+    (checkout / ".git" / "info").mkdir(parents=True, exist_ok=True)
+    for command in commands[1:]:
         _run(command)
+
+
+def _active_checkout_path(staging: Path) -> Path:
+    if os.name != "nt":
+        return staging
+    payloads = [
+        path
+        for path in staging.iterdir()
+        if path.name.startswith("payload-")
+    ]
+    if not payloads:
+        return staging
+    if len(payloads) != 1:
+        raise RuntimeError("staging payload identity changed")
+    payload = payloads[0]
+    if payload.is_symlink() or _path_is_reparse_point(payload):
+        raise RuntimeError("staging payload is a reparse point")
+    return payload
+
+
+def _flatten_checkout(staging: Path, checkout: Path) -> None:
+    if checkout == staging:
+        return
+    for child in checkout.iterdir():
+        target = staging / child.name
+        if _path_entry_exists(target):
+            raise RuntimeError("staging payload target already exists")
+        child.rename(target)
+    checkout.rmdir()
 
 
 def _tree_blobs(checkout: Path) -> dict[str, str]:
@@ -135,6 +188,8 @@ def _local_blob_ids(checkout: Path) -> set[str]:
 
 
 def _verify_checkout(checkout: Path) -> None:
+    staging = checkout
+    checkout = _active_checkout_path(staging)
     resolved_commit = _run(
         _git_at(checkout) + ["rev-parse", "HEAD"], no_lazy_fetch=True
     ).stdout.strip()
@@ -186,6 +241,7 @@ def _verify_checkout(checkout: Path) -> None:
             "local blob object allowlist mismatch: "
             f"expected {sorted(expected_blobs)}, got {sorted(local_blobs)}"
         )
+    _flatten_checkout(staging, checkout)
 
 
 def _path_entry_exists(path: Path) -> bool:
@@ -391,6 +447,61 @@ class _ParentAnchor:
             return name, self.child_path(name)
         raise RuntimeError("could not allocate a unique staging directory")
 
+    def entry_stat(self, name: str):
+        if os.name == "nt":
+            return os.lstat(self.child_path(name))
+        return os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
+
+    def entry_identity(self, name: str) -> tuple[int, ...]:
+        path = self.child_path(name)
+        if path.is_symlink() or _path_is_reparse_point(path):
+            raise RuntimeError(f"anchored entry is a reparse point: {name}")
+        if os.name == "nt":
+            handle = _windows_open_directory(path)
+            try:
+                return _windows_handle_identity(handle)
+            finally:
+                _windows_close_handle(handle)
+        information = self.entry_stat(name)
+        return information.st_dev, information.st_ino
+
+    def find_entry_by_identity(
+        self, identity: tuple[int, ...]
+    ) -> str | None:
+        names = (
+            os.listdir(self.path)
+            if os.name == "nt"
+            else os.listdir(self.descriptor)
+        )
+        for name in names:
+            try:
+                if self.entry_identity(name) == identity:
+                    return name
+            except (FileNotFoundError, NotADirectoryError, RuntimeError):
+                continue
+        return None
+
+    def remove_entry_no_follow(self, name: str) -> None:
+        path = self.child_path(name)
+        information = self.entry_stat(name)
+        if path.is_symlink() or _path_is_reparse_point(path):
+            if os.name == "nt" and path.is_dir():
+                os.rmdir(path)
+            elif os.name == "nt":
+                os.unlink(path)
+            else:
+                os.unlink(name, dir_fd=self.descriptor)
+            return
+        if stat.S_ISDIR(information.st_mode):
+            if os.name == "nt":
+                os.rmdir(path)
+            else:
+                os.rmdir(name, dir_fd=self.descriptor)
+        elif os.name == "nt":
+            os.unlink(path)
+        else:
+            os.unlink(name, dir_fd=self.descriptor)
+
     def verify_identity(self) -> None:
         if self.closed:
             raise RuntimeError("parent anchor is closed")
@@ -412,6 +523,187 @@ class _ParentAnchor:
             current_identity = (current.st_dev, current.st_ino)
         if current_identity != self.identity:
             raise RuntimeError("destination parent identity changed")
+
+
+class _StagingAnchor:
+    def __init__(
+        self,
+        parent: _ParentAnchor,
+        name: str,
+        descriptor: int,
+        identity: tuple[int, ...],
+        path: Path,
+    ) -> None:
+        self.parent = parent
+        self.name = name
+        self.descriptor = descriptor
+        self.identity = identity
+        self.path = path
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if os.name == "nt":
+            _windows_close_handle(self.descriptor)
+        else:
+            os.close(self.descriptor)
+
+    def verify_parent_entry(self, name: str | None = None) -> None:
+        entry_name = self.name if name is None else name
+        try:
+            current_identity = self.parent.entry_identity(entry_name)
+        except (FileNotFoundError, NotADirectoryError) as error:
+            raise RuntimeError("staging identity changed") from error
+        if current_identity != self.identity:
+            raise RuntimeError("staging identity changed")
+
+    def verify_handle_identity(self) -> None:
+        if self.closed:
+            raise RuntimeError("staging anchor is closed")
+        if os.name == "nt":
+            current_identity = _windows_handle_identity(self.descriptor)
+        else:
+            information = os.fstat(self.descriptor)
+            current_identity = information.st_dev, information.st_ino
+        if current_identity != self.identity:
+            raise RuntimeError("staging handle identity changed")
+
+
+def _open_staging_anchor(
+    parent: _ParentAnchor,
+    name: str,
+    expected_identity: tuple[int, ...] | None = None,
+) -> _StagingAnchor:
+    if os.name == "nt":
+        path = parent.child_path(name)
+        if path.is_symlink() or _path_is_reparse_point(path):
+            raise RuntimeError("staging entry is a reparse point")
+        descriptor = _windows_open_directory(path, prevent_rename=True)
+        try:
+            anchor = _StagingAnchor(
+                parent,
+                name,
+                descriptor,
+                _windows_handle_identity(descriptor),
+                path,
+            )
+            if (
+                expected_identity is not None
+                and anchor.identity != expected_identity
+            ):
+                raise RuntimeError("created staging identity changed")
+            anchor.verify_parent_entry()
+        except BaseException:
+            _windows_close_handle(descriptor)
+            raise
+        return anchor
+
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+    if any(not hasattr(os, flag) for flag in required_flags):
+        raise RuntimeError("safe staging anchoring is unsupported")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent.descriptor,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            "staging entry is not an anchored directory"
+        ) from error
+    try:
+        information = os.fstat(descriptor)
+        path = Path(f"/proc/{os.getpid()}/fd/{descriptor}")
+        if not path.is_dir():
+            raise RuntimeError("safe staging anchoring is unsupported")
+        anchor = _StagingAnchor(
+            parent,
+            name,
+            descriptor,
+            (information.st_dev, information.st_ino),
+            path,
+        )
+        if (
+            expected_identity is not None
+            and anchor.identity != expected_identity
+        ):
+            raise RuntimeError("created staging identity changed")
+        anchor.verify_parent_entry()
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return anchor
+
+
+def _remove_entry_if_expected(
+    parent: _ParentAnchor, name: str, expected_identity: tuple[int, ...]
+) -> bool:
+    if not parent.entry_exists(name):
+        return False
+    try:
+        current_identity = parent.entry_identity(name)
+    except RuntimeError:
+        parent.remove_entry_no_follow(name)
+        return True
+    if current_identity != expected_identity:
+        return False
+    parent.remove_entry_no_follow(name)
+    return True
+
+
+def _cleanup_created_staging(
+    parent: _ParentAnchor, name: str, identity: tuple[int, ...]
+) -> None:
+    _remove_entry_if_expected(parent, name, identity)
+    original_name = parent.find_entry_by_identity(identity)
+    if original_name is not None:
+        if not _remove_entry_if_expected(parent, original_name, identity):
+            raise RuntimeError(
+                "created staging identity changed during cleanup"
+            )
+
+
+def _create_staging_anchor(
+    parent: _ParentAnchor, prefix: str
+) -> _StagingAnchor:
+    for _attempt in range(100):
+        name = f"{prefix}{uuid.uuid4().hex}"
+        try:
+            if os.name == "nt":
+                os.mkdir(parent.child_path(name), 0o700)
+            else:
+                os.mkdir(name, 0o700, dir_fd=parent.descriptor)
+        except FileExistsError:
+            continue
+        try:
+            created_identity = parent.entry_identity(name)
+            try:
+                return _open_staging_anchor(
+                    parent, name, created_identity
+                )
+            except BaseException as primary_error:
+                try:
+                    _cleanup_created_staging(
+                        parent, name, created_identity
+                    )
+                except BaseException as cleanup_error:
+                    raise RuntimeError(
+                        "staging anchor open failed; staging cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    ) from primary_error
+                raise
+        except BaseException:
+            try:
+                if parent.entry_exists(name):
+                    path = parent.child_path(name)
+                    if path.is_symlink() or _path_is_reparse_point(path):
+                        parent.remove_entry_no_follow(name)
+            except BaseException:
+                pass
+            raise
+    raise RuntimeError("could not allocate a unique staging directory")
 
 
 def _open_parent_anchor(
@@ -497,38 +789,108 @@ def _rename_no_replace_posix(
     raise OSError(error_number, os.strerror(error_number), destination_name)
 
 
-def _rename_no_replace_windows(source: Path, destination: Path) -> None:
+def _windows_rename_handle_no_replace(
+    source_handle: int, destination: Path
+) -> None:
     from ctypes import wintypes
 
-    move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
-    move_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
-    move_file.restype = wintypes.BOOL
-    if move_file(str(source), str(destination), 0):
+    class FileRenameInformation(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", ctypes.c_ubyte),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    destination_name = os.fspath(destination)
+    encoded_name = destination_name.encode("utf-16-le")
+    terminated_name = encoded_name + b"\x00\x00"
+    file_name_offset = FileRenameInformation.file_name.offset
+    buffer_size = max(
+        ctypes.sizeof(FileRenameInformation),
+        file_name_offset + len(terminated_name),
+    )
+    buffer = ctypes.create_string_buffer(buffer_size)
+    information = ctypes.cast(
+        buffer, ctypes.POINTER(FileRenameInformation)
+    ).contents
+    information.replace_if_exists = 0
+    information.root_directory = None
+    information.file_name_length = len(encoded_name)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + file_name_offset,
+        terminated_name,
+        len(terminated_name),
+    )
+
+    set_information = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).SetFileInformationByHandle
+    set_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    set_information.restype = wintypes.BOOL
+    if set_information(source_handle, 3, buffer, buffer_size):
         return
     error_number = ctypes.get_last_error()
-    if error_number in (80, 183):  # FILE_EXISTS, ALREADY_EXISTS
-        raise FileExistsError(error_number, "destination exists", destination)
+    if error_number in (80, 183):
+        raise FileExistsError(
+            error_number, "destination exists", destination_name
+        )
     raise ctypes.WinError(error_number)
 
 
+def _remove_replaced_entry(
+    parent: _ParentAnchor,
+    name: str,
+    expected_identity: tuple[int, ...],
+    identity_error: BaseException,
+) -> None:
+    try:
+        removed = _remove_entry_if_expected(
+            parent, name, expected_identity
+        )
+    except BaseException as rollback_error:
+        raise RuntimeError(
+            f"{identity_error}; rollback failed: {rollback_error}"
+        ) from identity_error
+    if not removed and parent.entry_exists(name):
+        raise RuntimeError(
+            f"{identity_error}; rollback refused unknown directory identity"
+        ) from identity_error
+
+
 def _publish_no_replace(
-    anchor: _ParentAnchor, staging: Path, destination: Path
+    anchor: _ParentAnchor,
+    staging: _StagingAnchor,
+    destination: Path,
 ) -> None:
     anchor.verify_identity()
+    try:
+        staging.verify_parent_entry()
+    except BaseException as identity_error:
+        _remove_replaced_entry(
+            anchor, staging.name, staging.identity, identity_error
+        )
+        raise
     if os.name == "nt":
-        _rename_no_replace_windows(staging, destination)
+        _windows_rename_handle_no_replace(
+            staging.descriptor, destination
+        )
     else:
         _rename_no_replace_posix(anchor, staging.name, destination.name)
-        try:
-            anchor.verify_identity()
-        except Exception as identity_error:
-            try:
-                _remove_staging(anchor.child_path(destination.name))
-            except Exception as rollback_error:
-                raise RuntimeError(
-                    f"{identity_error}; rollback failed: {rollback_error}"
-                ) from identity_error
-            raise
+    try:
+        staging.verify_parent_entry(destination.name)
+    except BaseException as identity_error:
+        _remove_replaced_entry(
+            anchor, destination.name, staging.identity, identity_error
+        )
+        raise
+    staging.name = destination.name
+    anchor.verify_identity()
 
 
 def _remove_staging(staging: Path) -> None:
@@ -539,81 +901,147 @@ def _remove_staging(staging: Path) -> None:
     shutil.rmtree(staging, onerror=remove_readonly)
 
 
+def _empty_staging_anchor(staging: _StagingAnchor) -> None:
+    staging.verify_handle_identity()
+    for child in staging.path.iterdir():
+        if child.is_symlink() or _path_is_reparse_point(child):
+            if os.name == "nt" and child.is_dir():
+                os.rmdir(child)
+            else:
+                os.unlink(child)
+        elif child.is_dir():
+            _remove_staging(child)
+        else:
+            child.unlink()
+    staging.verify_handle_identity()
+
+
+def _cleanup_staging_anchor(staging: _StagingAnchor) -> None:
+    parent = staging.parent
+    if parent.entry_exists(staging.name):
+        try:
+            named_identity = parent.entry_identity(staging.name)
+        except RuntimeError:
+            parent.remove_entry_no_follow(staging.name)
+        else:
+            if named_identity == staging.identity:
+                parent.remove_entry_no_follow(staging.name)
+
+    original_name = parent.find_entry_by_identity(staging.identity)
+    if original_name is None:
+        return
+    if parent.entry_identity(original_name) != staging.identity:
+        raise RuntimeError("staging identity changed during cleanup")
+    parent.remove_entry_no_follow(original_name)
+
+
 def fetch(destination: Path) -> None:
     destination, parent_identity = _validate_destination(destination)
     if shutil.which("git") is None:
         raise RuntimeError("git is required for the explicit upstream fetch")
 
     lock_name = f".{destination.name}.fetch.lock"
-    with _open_parent_anchor(destination.parent, parent_identity) as anchor:
-        staging_name: str | None = None
-        staging: Path | None = None
-        lock_owned = False
-        primary_error: BaseException | None = None
-        primary_traceback = None
+    anchor = _open_parent_anchor(destination.parent, parent_identity)
+    staging_anchor: _StagingAnchor | None = None
+    lock_descriptor: int | None = None
+    lock_stream = None
+    published = False
+    lock_owned = False
+    primary_error: BaseException | None = None
+    primary_traceback = None
+    try:
         try:
-            try:
-                lock_descriptor = anchor.create_lock(lock_name)
-            except FileExistsError as error:
-                raise FileExistsError(
-                    "concurrent fetch lock exists: "
-                    f"{anchor.child_path(lock_name)}"
-                ) from error
-            lock_owned = True
-            with os.fdopen(
-                lock_descriptor, "w", encoding="utf-8"
-            ) as lock_file:
-                lock_file.write(f"pid={os.getpid()}\n")
+            lock_descriptor = anchor.create_lock(lock_name)
+        except FileExistsError as error:
+            raise FileExistsError(
+                "concurrent fetch lock exists: "
+                f"{anchor.child_path(lock_name)}"
+            ) from error
+        lock_owned = True
+        lock_stream = os.fdopen(
+            lock_descriptor, "w", encoding="utf-8"
+        )
+        lock_descriptor = None
+        lock_stream.write(f"pid={os.getpid()}\n")
+        lock_stream.flush()
 
-            if anchor.entry_exists(destination.name):
-                raise FileExistsError(
-                    f"destination appeared during fetch: {destination}"
-                )
-            staging_name, staging = anchor.create_staging(
-                f".{destination.name}.staging-"
+        if anchor.entry_exists(destination.name):
+            raise FileExistsError(
+                f"destination appeared during fetch: {destination}"
             )
-            _materialize_checkout(staging)
-            _verify_checkout(staging)
-            if anchor.entry_exists(destination.name):
-                raise FileExistsError(
-                    f"destination appeared during fetch: {destination}"
-                )
-            _publish_no_replace(anchor, staging, destination)
-            staging_name = None
-            staging = None
+        staging_anchor = _create_staging_anchor(
+            anchor,
+            f".{destination.name}.staging-"
+        )
+        _materialize_checkout(staging_anchor.path)
+        _verify_checkout(staging_anchor.path)
+        if anchor.entry_exists(destination.name):
+            raise FileExistsError(
+                f"destination appeared during fetch: {destination}"
+            )
+        _publish_no_replace(anchor, staging_anchor, destination)
+        published = True
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
+
+    cleanup_errors: list[tuple[str, BaseException]] = []
+    if staging_anchor is not None:
+        staging_cleanup_label = (
+            "staging rollback"
+            if staging_anchor.name == destination.name
+            else "staging cleanup"
+        )
+        if not published:
+            try:
+                _empty_staging_anchor(staging_anchor)
+            except BaseException as error:
+                cleanup_errors.append((staging_cleanup_label, error))
+        try:
+            staging_anchor.close()
         except BaseException as error:
-            primary_error = error
-            primary_traceback = error.__traceback__
-
-        cleanup_errors: list[tuple[str, BaseException]] = []
-        if staging_name is not None:
+            cleanup_errors.append(("staging anchor close", error))
+        if not published:
             try:
-                if anchor.entry_exists(staging_name):
-                    _remove_staging(anchor.child_path(staging_name))
+                _cleanup_staging_anchor(staging_anchor)
             except BaseException as error:
-                cleanup_errors.append(("staging cleanup", error))
-        if lock_owned:
-            try:
-                anchor.unlink(lock_name)
-            except BaseException as error:
-                cleanup_errors.append(("lock cleanup", error))
+                cleanup_errors.append((staging_cleanup_label, error))
+    if lock_stream is not None:
+        try:
+            lock_stream.close()
+        except BaseException as error:
+            cleanup_errors.append(("lock stream close", error))
+    elif lock_descriptor is not None:
+        try:
+            os.close(lock_descriptor)
+        except BaseException as error:
+            cleanup_errors.append(("lock descriptor close", error))
+    if lock_owned:
+        try:
+            anchor.unlink(lock_name)
+        except BaseException as error:
+            cleanup_errors.append(("lock cleanup", error))
+    try:
+        anchor.close()
+    except BaseException as error:
+        cleanup_errors.append(("parent anchor close", error))
 
-        if cleanup_errors:
-            failures = []
-            if primary_error is not None:
-                failures.append(
-                    "primary failure: "
-                    f"{type(primary_error).__name__}: {primary_error}"
-                )
-            failures.extend(
-                f"{label}: {type(error).__name__}: {error}"
-                for label, error in cleanup_errors
-            )
-            aggregate = RuntimeError("; ".join(failures))
-            cause = primary_error or cleanup_errors[0][1]
-            raise aggregate from cause
+    if cleanup_errors:
+        failures = []
         if primary_error is not None:
-            raise primary_error.with_traceback(primary_traceback)
+            failures.append(
+                "primary failure: "
+                f"{type(primary_error).__name__}: {primary_error}"
+            )
+        failures.extend(
+            f"{label}: {type(error).__name__}: {error}"
+            for label, error in cleanup_errors
+        )
+        aggregate = RuntimeError("; ".join(failures))
+        cause = primary_error or cleanup_errors[0][1]
+        raise aggregate from cause
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_traceback)
 
 
 def main() -> int:

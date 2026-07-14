@@ -122,6 +122,14 @@ def _has_local_blob(repository: Path, blob: str) -> bool:
     return blob in local_blobs
 
 
+def _snapshot_files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 def test_upstream_metadata_and_notice_share_pinned_blob_map():
     metadata = _load_boundary_metadata()
 
@@ -226,6 +234,109 @@ def test_fixed_fetch_plan_is_offline_parseable(tmp_path: Path):
     assert not destination.exists()
 
 
+def test_fetch_sanitizes_hostile_git_environment_and_preserves_victim(
+    tmp_path: Path, monkeypatch
+):
+    source, commit, blobs = _create_local_upstream(tmp_path)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    _git(victim, "init", "--quiet")
+    _git(victim, "config", "user.name", "Victim Test")
+    _git(victim, "config", "user.email", "victim@example.invalid")
+    tracked = victim / "tracked.txt"
+    tracked.write_text("committed\n", encoding="utf-8")
+    _git(victim, "add", "tracked.txt")
+    _git(victim, "commit", "--quiet", "-m", "victim baseline")
+    tracked.write_text("dirty working tree\n", encoding="utf-8")
+    staged = victim / "staged.txt"
+    staged.write_text("staged state\n", encoding="utf-8")
+    _git(victim, "add", "staged.txt")
+    _git(victim, "config", "boundary.sentinel", "preserve")
+    object_source = victim / "loose-object.txt"
+    object_source.write_text("preserve object\n", encoding="utf-8")
+    _git(victim, "hash-object", "-w", "loose-object.txt")
+    victim_before = _snapshot_files(victim)
+
+    hostile_global = tmp_path / "hostile-global.gitconfig"
+    hostile_global.write_text(
+        "[core]\n\thooksPath = hostile-hooks\n", encoding="utf-8"
+    )
+    hostile_template = tmp_path / "hostile-template"
+    hostile_template.mkdir()
+    hostile_hooks = tmp_path / "hostile-hooks"
+    hostile_hooks.mkdir()
+    hostile_environment = {
+        "GIT_DIR": str(victim / ".git"),
+        "GIT_WORK_TREE": str(victim),
+        "GIT_INDEX_FILE": str(victim / ".git" / "index"),
+        "GIT_OBJECT_DIRECTORY": str(victim / ".git" / "objects"),
+        "GIT_COMMON_DIR": str(victim / ".git"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(victim / ".git" / "objects"),
+        "GIT_CEILING_DIRECTORIES": str(tmp_path),
+        "GIT_TEMPLATE_DIR": str(hostile_template),
+        "GIT_CONFIG_GLOBAL": str(hostile_global),
+        "GIT_CONFIG_SYSTEM": str(hostile_global),
+        "GIT_CONFIG_NOSYSTEM": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": str(hostile_hooks),
+        "GIT_SSH_COMMAND": "hostile-ssh-command",
+        "GIT_SSH_VARIANT": "ssh",
+        "GIT_EXEC_PATH": str(tmp_path / "hostile-git-exec"),
+        "GIT_TERMINAL_PROMPT": "1",
+    }
+    for name, value in hostile_environment.items():
+        monkeypatch.setenv(name, value)
+
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module, "UPSTREAM_REPOSITORY", source.as_uri())
+    monkeypatch.setattr(fetch_module, "UPSTREAM_COMMIT", commit)
+    monkeypatch.setattr(
+        fetch_module,
+        "UPSTREAM_BLOBS",
+        {path: blobs[path] for path in ALLOWED_UPSTREAM_FILES},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fetch_module, "ALLOWED_UPSTREAM_FILES", ALLOWED_UPSTREAM_FILES
+    )
+    real_run = fetch_module.subprocess.run
+    git_environments = []
+
+    def capture_git_environment(command, **kwargs):
+        if command and command[0] == "git":
+            git_environments.append(dict(kwargs["env"]))
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(
+        fetch_module.subprocess, "run", capture_git_environment
+    )
+
+    fetch_module.fetch(destination)
+
+    safe_git_environment = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    assert git_environments
+    for environment in git_environments:
+        git_environment = {
+            name: value
+            for name, value in environment.items()
+            if name.startswith("GIT_")
+        }
+        if "GIT_NO_LAZY_FETCH" in git_environment:
+            assert git_environment.pop("GIT_NO_LAZY_FETCH") == "1"
+        assert git_environment == safe_git_environment
+    commands = fetch_module._fetch_commands(destination)
+    assert "--object-format=sha1" in commands[0]
+    assert "--template=" in commands[0]
+    assert any("core.hooksPath" in command for command in commands)
+    assert _snapshot_files(victim) == victim_before
+
+
 def test_fetch_requires_explicit_license_acknowledgement(tmp_path: Path):
     destination = tmp_path / "upstream"
     environment = os.environ.copy()
@@ -281,6 +392,82 @@ def test_partial_fetch_materializes_only_allowlisted_blobs(
     )
     assert not _has_local_blob(destination, blobs["README.md"])
     assert not _has_local_blob(destination, blobs["server_" + "comm.py"])
+
+
+def test_staging_entry_swap_never_touches_victim_or_publishes(
+    tmp_path: Path, monkeypatch
+):
+    source, commit, blobs = _create_local_upstream(tmp_path)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "owned.txt").write_text("preserve\n", encoding="utf-8")
+    victim_before = _snapshot_files(victim)
+    orphan = tmp_path / "orphaned-staging"
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module, "UPSTREAM_REPOSITORY", source.as_uri())
+    monkeypatch.setattr(fetch_module, "UPSTREAM_COMMIT", commit)
+    monkeypatch.setattr(
+        fetch_module,
+        "UPSTREAM_BLOBS",
+        {path: blobs[path] for path in ALLOWED_UPSTREAM_FILES},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fetch_module, "ALLOWED_UPSTREAM_FILES", ALLOWED_UPSTREAM_FILES
+    )
+    real_create_staging = fetch_module._create_staging_anchor
+    real_materialize = fetch_module._materialize_checkout
+    created = {}
+
+    def record_staging(parent, prefix: str):
+        anchor = real_create_staging(parent, prefix)
+        created.update(anchor=parent, name=anchor.name)
+        return anchor
+
+    def swap_staging_entry(stable_staging: Path) -> None:
+        original = created["anchor"].child_path(created["name"])
+        try:
+            original.rename(orphan)
+        except OSError as error:
+            if os.name == "nt" and error.winerror == 32:
+                raise RuntimeError("staging swap blocked") from error
+            raise
+        if os.name == "nt":
+            completed = subprocess.run(
+                [
+                    "cmd.exe",
+                    "/d",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    str(original),
+                    str(victim),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert completed.returncode == 0, completed.stderr
+        else:
+            original.symlink_to(victim, target_is_directory=True)
+        real_materialize(stable_staging)
+
+    monkeypatch.setattr(
+        fetch_module, "_create_staging_anchor", record_staging
+    )
+    monkeypatch.setattr(
+        fetch_module, "_materialize_checkout", swap_staging_entry
+    )
+
+    with pytest.raises(RuntimeError, match="staging|swap|identity|reparse"):
+        fetch_module.fetch(destination)
+
+    assert _snapshot_files(victim) == victim_before
+    assert not os.path.lexists(destination)
+    assert not orphan.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
 
 
 def test_blob_pin_mismatch_fails_without_publishing_destination(
@@ -577,6 +764,192 @@ def test_atomic_publish_never_replaces_racing_empty_destination(
     assert not list(tmp_path.glob(".checkout.staging-*"))
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX publish identity regression"
+)
+def test_posix_publish_rejects_staging_swap_at_rename_gap(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    orphan = tmp_path / "orphaned-staging"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "owned.txt").write_text("preserve", encoding="utf-8")
+    victim_before = _snapshot_files(victim)
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_rename = fetch_module._rename_no_replace_posix
+
+    def swap_then_rename(anchor, source_name: str, target_name: str) -> None:
+        source = tmp_path / source_name
+        source.rename(orphan)
+        source.symlink_to(victim, target_is_directory=True)
+        real_rename(anchor, source_name, target_name)
+
+    monkeypatch.setattr(
+        fetch_module, "_rename_no_replace_posix", swap_then_rename
+    )
+
+    with pytest.raises(RuntimeError, match="staging|identity|reparse"):
+        fetch_module.fetch(destination)
+
+    assert _snapshot_files(victim) == victim_before
+    assert not os.path.lexists(destination)
+    assert not orphan.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX regular replacement regression"
+)
+def test_posix_publish_never_deletes_regular_directory_replacement(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    orphan = tmp_path / "orphaned-staging"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "owned.txt").write_text("preserve", encoding="utf-8")
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_rename = fetch_module._rename_no_replace_posix
+
+    def replace_with_victim(
+        anchor, source_name: str, target_name: str
+    ) -> None:
+        source = tmp_path / source_name
+        source.rename(orphan)
+        victim.rename(source)
+        real_rename(anchor, source_name, target_name)
+
+    monkeypatch.setattr(
+        fetch_module, "_rename_no_replace_posix", replace_with_victim
+    )
+
+    with pytest.raises(RuntimeError, match="staging|identity|rollback"):
+        fetch_module.fetch(destination)
+
+    assert (
+        destination / "owned.txt"
+    ).read_text(encoding="utf-8") == "preserve"
+    assert not orphan.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_staging_anchor_rejects_regular_directory_swap_before_open(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "owned.txt").write_text("preserve", encoding="utf-8")
+    orphan = tmp_path / "orphaned-staging"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_open = fetch_module._open_staging_anchor
+
+    def swap_then_open(parent, name: str, *arguments, **keywords):
+        source = parent.child_path(name)
+        source.rename(orphan)
+        victim.rename(source)
+        return real_open(parent, name, *arguments, **keywords)
+
+    monkeypatch.setattr(
+        fetch_module, "_open_staging_anchor", swap_then_open
+    )
+
+    with pytest.raises(RuntimeError, match="staging|identity"):
+        fetch_module.fetch(destination)
+
+    preserved = list(tmp_path.rglob("owned.txt"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == "preserve"
+    assert not destination.exists()
+    assert not orphan.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+
+
+def test_staging_anchor_open_failure_cleans_created_directory(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+
+    def fail_open(*_arguments, **_keywords):
+        raise OSError("injected staging anchor open failure")
+
+    monkeypatch.setattr(fetch_module, "_open_staging_anchor", fail_open)
+
+    with pytest.raises(OSError, match="injected staging anchor open failure"):
+        fetch_module.fetch(destination)
+
+    assert not destination.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_expected_identity_cleanup_never_recursively_deletes_late_swap(
+    tmp_path: Path, monkeypatch
+):
+    expected = tmp_path / "expected"
+    expected.mkdir()
+    (expected / "trusted.txt").write_text("trusted", encoding="utf-8")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "owned.txt").write_text("preserve", encoding="utf-8")
+    orphan = tmp_path / "trusted-orphan"
+    fetch_module = _load_fetch_module()
+    parent = fetch_module._open_parent_anchor(
+        tmp_path, fetch_module._path_identity(tmp_path)
+    )
+    expected_identity = parent.entry_identity(expected.name)
+    real_entry_identity = parent.entry_identity
+    swapped = False
+
+    def identity_then_swap(name: str):
+        nonlocal swapped
+        identity = real_entry_identity(name)
+        if name == expected.name and not swapped:
+            expected.rename(orphan)
+            victim.rename(expected)
+            swapped = True
+        return identity
+
+    monkeypatch.setattr(parent, "entry_identity", identity_then_swap)
+    try:
+        with pytest.raises(OSError):
+            fetch_module._remove_entry_if_expected(
+                parent, expected.name, expected_identity
+            )
+    finally:
+        parent.close()
+
+    assert (expected / "owned.txt").read_text(encoding="utf-8") == "preserve"
+    assert (orphan / "trusted.txt").read_text(encoding="utf-8") == "trusted"
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="Windows handle publish regression"
+)
+def test_windows_publish_renames_the_anchored_staging_handle(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    assert hasattr(fetch_module, "_windows_rename_handle_no_replace")
+    assert not hasattr(fetch_module, "_rename_no_replace_windows")
+    _stub_fetch_io(fetch_module, monkeypatch)
+
+    fetch_module.fetch(destination)
+
+    assert (destination / "marker").read_text(encoding="utf-8") == "complete"
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle regression")
 def test_windows_parent_anchor_blocks_rename_at_publish_entry(
     tmp_path: Path, monkeypatch
@@ -669,13 +1042,13 @@ def test_posix_publish_reports_identity_and_rollback_failures(
         replacement.rename(parent)
         real_rename(anchor, source_name, target_name)
 
-    def fail_rollback(_published: Path) -> None:
+    def fail_rollback(_staging) -> None:
         raise OSError("injected rollback failure")
 
     monkeypatch.setattr(
         fetch_module, "_rename_no_replace_posix", swap_then_rename
     )
-    monkeypatch.setattr(fetch_module, "_remove_staging", fail_rollback)
+    monkeypatch.setattr(fetch_module, "_empty_staging_anchor", fail_rollback)
 
     with pytest.raises(RuntimeError) as raised:
         fetch_module.fetch(destination)
@@ -731,14 +1104,23 @@ def test_fetch_reports_primary_and_missing_lock_cleanup_failure(
     fetch_module = _load_fetch_module()
     monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
     primary_failure = RuntimeError("injected primary failure")
+    real_unlink = fetch_module._ParentAnchor.unlink
 
-    def fail_after_removing_lock(staging: Path) -> None:
+    def fail_materialization(staging: Path) -> None:
         (staging / "marker").write_text("partial", encoding="utf-8")
-        (staging.parent / ".checkout.fetch.lock").unlink()
         raise primary_failure
 
+    def remove_lock_then_report_missing(anchor, name: str) -> None:
+        real_unlink(anchor, name)
+        raise FileNotFoundError("injected missing lock")
+
     monkeypatch.setattr(
-        fetch_module, "_materialize_checkout", fail_after_removing_lock
+        fetch_module, "_materialize_checkout", fail_materialization
+    )
+    monkeypatch.setattr(
+        fetch_module._ParentAnchor,
+        "unlink",
+        remove_lock_then_report_missing,
     )
 
     with pytest.raises(RuntimeError) as raised:
@@ -766,14 +1148,14 @@ def test_fetch_cleans_lock_when_staging_cleanup_fails(
         (staging / "marker").write_text("partial", encoding="utf-8")
         raise primary_failure
 
-    def fail_staging_cleanup(_staging: Path) -> None:
+    def fail_staging_cleanup(_staging) -> None:
         raise OSError("injected staging cleanup failure")
 
     monkeypatch.setattr(
         fetch_module, "_materialize_checkout", fail_materialization
     )
     monkeypatch.setattr(
-        fetch_module, "_remove_staging", fail_staging_cleanup
+        fetch_module, "_empty_staging_anchor", fail_staging_cleanup
     )
 
     with pytest.raises(RuntimeError) as raised:
@@ -795,20 +1177,29 @@ def test_fetch_reports_primary_and_both_cleanup_failures(
     fetch_module = _load_fetch_module()
     monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
     primary_failure = RuntimeError("injected primary failure")
+    real_unlink = fetch_module._ParentAnchor.unlink
 
-    def fail_after_removing_lock(staging: Path) -> None:
+    def fail_materialization(staging: Path) -> None:
         (staging / "marker").write_text("partial", encoding="utf-8")
-        (staging.parent / ".checkout.fetch.lock").unlink()
         raise primary_failure
 
-    def fail_staging_cleanup(_staging: Path) -> None:
+    def remove_lock_then_report_missing(anchor, name: str) -> None:
+        real_unlink(anchor, name)
+        raise FileNotFoundError("injected missing lock")
+
+    def fail_staging_cleanup(_staging) -> None:
         raise OSError("injected staging cleanup failure")
 
     monkeypatch.setattr(
-        fetch_module, "_materialize_checkout", fail_after_removing_lock
+        fetch_module, "_materialize_checkout", fail_materialization
     )
     monkeypatch.setattr(
-        fetch_module, "_remove_staging", fail_staging_cleanup
+        fetch_module, "_empty_staging_anchor", fail_staging_cleanup
+    )
+    monkeypatch.setattr(
+        fetch_module._ParentAnchor,
+        "unlink",
+        remove_lock_then_report_missing,
     )
 
     with pytest.raises(RuntimeError) as raised:
@@ -848,5 +1239,154 @@ def test_fetch_reports_cleanup_failure_after_successful_publish(
     assert "injected lock cleanup failure" in message
     assert raised.value.__cause__ is cleanup_failure
     assert (destination / "marker").read_text(encoding="utf-8") == "complete"
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_fetch_reports_primary_and_parent_anchor_close_failure(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+    primary_failure = RuntimeError("injected primary failure")
+    real_close = fetch_module._ParentAnchor.close
+
+    def fail_materialization(_staging: Path) -> None:
+        raise primary_failure
+
+    def close_then_fail(anchor) -> None:
+        real_close(anchor)
+        raise OSError("injected parent anchor close failure")
+
+    monkeypatch.setattr(
+        fetch_module, "_materialize_checkout", fail_materialization
+    )
+    monkeypatch.setattr(fetch_module._ParentAnchor, "close", close_then_fail)
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "injected primary failure" in message
+    assert "parent anchor close" in message
+    assert "injected parent anchor close failure" in message
+    assert raised.value.__cause__ is primary_failure
+    assert not destination.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_fetch_reports_parent_anchor_close_failure_after_publish(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    close_failure = OSError("injected parent anchor close failure")
+    real_close = fetch_module._ParentAnchor.close
+
+    def close_then_fail(anchor) -> None:
+        real_close(anchor)
+        raise close_failure
+
+    monkeypatch.setattr(fetch_module._ParentAnchor, "close", close_then_fail)
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "parent anchor close" in message
+    assert "injected parent anchor close failure" in message
+    assert raised.value.__cause__ is close_failure
+    assert (destination / "marker").read_text(encoding="utf-8") == "complete"
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_fetch_reports_primary_and_staging_anchor_close_failure(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    assert hasattr(fetch_module, "_StagingAnchor")
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+    primary_failure = RuntimeError("injected primary failure")
+    real_close = fetch_module._StagingAnchor.close
+
+    def fail_materialization(_staging: Path) -> None:
+        raise primary_failure
+
+    def close_then_fail(anchor) -> None:
+        real_close(anchor)
+        raise OSError("injected staging anchor close failure")
+
+    monkeypatch.setattr(
+        fetch_module, "_materialize_checkout", fail_materialization
+    )
+    monkeypatch.setattr(fetch_module._StagingAnchor, "close", close_then_fail)
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "injected primary failure" in message
+    assert "staging anchor close" in message
+    assert "injected staging anchor close failure" in message
+    assert raised.value.__cause__ is primary_failure
+    assert not destination.exists()
+    assert not (tmp_path / ".checkout.fetch.lock").exists()
+    assert not list(tmp_path.glob(".checkout.staging-*"))
+
+
+def test_fetch_reports_primary_and_lock_stream_close_failure(
+    tmp_path: Path, monkeypatch
+):
+    destination = tmp_path / "checkout"
+    fetch_module = _load_fetch_module()
+    monkeypatch.setattr(fetch_module.shutil, "which", lambda _name: "git")
+    primary_failure = RuntimeError("injected primary failure")
+    real_fdopen = fetch_module.os.fdopen
+
+    class DeferredCloseFailure:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _type, _value, _traceback):
+            return False
+
+        def write(self, value):
+            return self.stream.write(value)
+
+        def flush(self):
+            return self.stream.flush()
+
+        def close(self):
+            self.stream.close()
+            raise OSError("injected lock stream close failure")
+
+    def deferred_close_fdopen(*arguments, **keywords):
+        return DeferredCloseFailure(real_fdopen(*arguments, **keywords))
+
+    def fail_materialization(_staging: Path) -> None:
+        raise primary_failure
+
+    monkeypatch.setattr(fetch_module.os, "fdopen", deferred_close_fdopen)
+    monkeypatch.setattr(
+        fetch_module, "_materialize_checkout", fail_materialization
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "injected primary failure" in message
+    assert "lock stream close" in message
+    assert "injected lock stream close failure" in message
+    assert raised.value.__cause__ is primary_failure
+    assert not destination.exists()
     assert not (tmp_path / ".checkout.fetch.lock").exists()
     assert not list(tmp_path.glob(".checkout.staging-*"))
