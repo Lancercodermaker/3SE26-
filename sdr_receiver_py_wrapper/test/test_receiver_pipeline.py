@@ -1243,6 +1243,110 @@ def test_common_runtime_multiple_reconnect_generations_are_not_collapsed(
     assert runtime._pending_device_reconnect is False
 
 
+def test_common_runtime_shadow_failure_blocks_later_reconnect_markers(
+    receiver_node_module,
+):
+    class FirstDeviceResetFails(ResetTrackingDecoder):
+        def __init__(self, decoder_id):
+            super().__init__(decoder_id)
+            self.failed = False
+
+        def reset(self, reason, context):
+            super().reset(reason, context)
+            if (
+                reason is receiver_node_module.ResetReason.DEVICE_RECONNECT
+                and not self.failed
+            ):
+                self.failed = True
+                raise RuntimeError("generation one shadow reset failed")
+
+    primary = ResetTrackingDecoder("improved_v67")
+    shadow = FirstDeviceResetFails("shadow")
+    current_context = make_context()
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=lambda: current_context,
+        radio_settings_provider=radio_settings,
+    )
+    runtime.process_once()
+    current_context = replace(
+        current_context,
+        target="JAM_L2_KEY",
+        target_version=5,
+        team="RED",
+        context_version=13,
+    )
+    runtime.acquisition._next_sample_index += 3
+    with runtime.acquisition._state_lock:
+        first_chunk_id = runtime.acquisition._next_chunk_id
+    runtime._record_reconnect_marker(1, first_chunk_id)
+    runtime._record_reconnect_marker(2, first_chunk_id)
+    cleared_generations = []
+    clear_marker = runtime._clear_reconnect_marker
+
+    def record_clear(marker):
+        cleared_generations.append(marker.device_generation)
+        clear_marker(marker)
+
+    runtime._clear_reconnect_marker = record_clear
+
+    first_retry = runtime.process_once()
+
+    assert any(
+        diagnostic.stage == "shadow_decoder_reset"
+        for diagnostic in first_retry.pipeline_result.diagnostic_errors
+    )
+    assert [reason for reason, _ in primary.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.TARGET_CHANGE,
+        receiver_node_module.ResetReason.CONTEXT_CHANGE,
+        receiver_node_module.ResetReason.MANUAL,
+    ]
+    assert [reason for reason, _ in shadow.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.TARGET_CHANGE,
+        receiver_node_module.ResetReason.CONTEXT_CHANGE,
+        receiver_node_module.ResetReason.MANUAL,
+    ]
+    assert cleared_generations == []
+    assert [
+        marker.device_generation for marker in runtime._reconnect_markers
+    ] == [1, 2]
+
+    runtime.process_once()
+    runtime.close()
+
+    assert cleared_generations == [1, 2]
+    assert [reason for reason, _ in primary.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.TARGET_CHANGE,
+        receiver_node_module.ResetReason.CONTEXT_CHANGE,
+        receiver_node_module.ResetReason.MANUAL,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+    assert [reason for reason, _ in shadow.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.TARGET_CHANGE,
+        receiver_node_module.ResetReason.CONTEXT_CHANGE,
+        receiver_node_module.ResetReason.MANUAL,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+    assert runtime._reconnect_markers == []
+
+
 def test_common_runtime_compatibility_pending_assignment_is_idempotent(
     receiver_node_module,
 ):
@@ -1321,19 +1425,24 @@ def test_common_runtime_shadow_reset_diagnostic_failure_clears_marker(
     receiver_node_module,
 ):
     recorder = ShadowFailingRecorder(fail_kind="decoder_reset")
+    primary = ResetTrackingDecoder("improved_v67")
+    shadow = ResetTrackingDecoder("shadow")
     runtime = receiver_node_module.CommonReceiverRuntime(
         backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
         config=receiver_node_module.ReceiverFoundationConfig(
             decoder_shadow="shadow"
         ),
-        primary=ResetTrackingDecoder("improved_v67"),
-        shadow=ResetTrackingDecoder("shadow"),
+        primary=primary,
+        shadow=shadow,
         output=FakeOutput("improved_v67"),
         recorder=recorder,
         context_provider=make_context,
         radio_settings_provider=radio_settings,
     )
-    runtime._pending_device_reconnect = True
+    with runtime.acquisition._state_lock:
+        first_chunk_id = runtime.acquisition._next_chunk_id
+    runtime._record_reconnect_marker(1, first_chunk_id)
+    runtime._record_reconnect_marker(2, first_chunk_id)
 
     result = runtime.process_once()
     runtime.close()
@@ -1342,6 +1451,13 @@ def test_common_runtime_shadow_reset_diagnostic_failure_clears_marker(
         diagnostic.stage == "shadow_decoder_reset_diagnostic"
         for diagnostic in result.pipeline_result.diagnostic_errors
     )
+    expected = [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+    assert [reason for reason, _ in primary.reset_calls] == expected
+    assert [reason for reason, _ in shadow.reset_calls] == expected
     assert runtime._pending_device_reconnect is False
 
 

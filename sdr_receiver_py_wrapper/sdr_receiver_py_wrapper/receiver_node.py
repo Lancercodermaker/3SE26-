@@ -331,18 +331,25 @@ class CommonReceiverRuntime:
         chunk = replace(queued, rf_metrics=metrics)
         self.last_rf_state = state
         reset_diagnostics = []
+        reconnect_resets_blocked = False
         for reason, reconnect_marker in self._reset_plan(chunk, context):
+            if (
+                reason is ResetReason.DEVICE_RECONNECT
+                and reconnect_resets_blocked
+            ):
+                continue
             reason_diagnostics = self.pipeline.reset_decoders(
                 reason, context, chunk
             )
             reset_diagnostics.extend(reason_diagnostics)
-            if (
-                reason is ResetReason.DEVICE_RECONNECT
-                and not any(
+            if reason is ResetReason.DEVICE_RECONNECT:
+                shadow_reset_failed = any(
                     diagnostic.stage == "shadow_decoder_reset"
                     for diagnostic in reason_diagnostics
                 )
-            ):
+                if shadow_reset_failed:
+                    reconnect_resets_blocked = True
+                    continue
                 self._clear_reconnect_marker(reconnect_marker)
         if self.recorder is not None:
             accepted = self.recorder.write_event(
