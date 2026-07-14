@@ -239,7 +239,9 @@ def _validate_destination(
     return destination, _path_identity(destination.parent)
 
 
-def _windows_open_directory(path: Path) -> int:
+def _windows_open_directory(
+    path: Path, *, prevent_rename: bool = False
+) -> int:
     from ctypes import wintypes
 
     create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
@@ -253,10 +255,16 @@ def _windows_open_directory(path: Path) -> int:
         wintypes.HANDLE,
     ]
     create_file.restype = wintypes.HANDLE
+    desired_access = 0x0080  # FILE_READ_ATTRIBUTES
+    share_mode = 0x0001 | 0x0002  # FILE_SHARE_READ | FILE_SHARE_WRITE
+    if prevent_rename:
+        desired_access |= 0x00010000  # DELETE
+    else:
+        share_mode |= 0x0004  # FILE_SHARE_DELETE
     handle = create_file(
         str(path),
-        0x0080,  # FILE_READ_ATTRIBUTES
-        0x0001 | 0x0002,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        desired_access,
+        share_mode,
         None,
         3,  # OPEN_EXISTING
         0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
@@ -410,7 +418,7 @@ def _open_parent_anchor(
     parent: Path, expected_identity: tuple[int, int]
 ) -> _ParentAnchor:
     if os.name == "nt":
-        descriptor = _windows_open_directory(parent)
+        descriptor = _windows_open_directory(parent, prevent_rename=True)
         try:
             if _path_identity(parent) != expected_identity:
                 raise RuntimeError("destination parent identity changed")
@@ -511,6 +519,16 @@ def _publish_no_replace(
         _rename_no_replace_windows(staging, destination)
     else:
         _rename_no_replace_posix(anchor, staging.name, destination.name)
+        try:
+            anchor.verify_identity()
+        except Exception as identity_error:
+            try:
+                _remove_staging(anchor.child_path(destination.name))
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"{identity_error}; rollback failed: {rollback_error}"
+                ) from identity_error
+            raise
 
 
 def _remove_staging(staging: Path) -> None:

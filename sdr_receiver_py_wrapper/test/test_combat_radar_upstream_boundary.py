@@ -577,6 +577,117 @@ def test_atomic_publish_never_replaces_racing_empty_destination(
     assert not list(tmp_path.glob(".checkout.staging-*"))
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle regression")
+def test_windows_parent_anchor_blocks_rename_at_publish_entry(
+    tmp_path: Path, monkeypatch
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    destination = parent / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_publish = fetch_module._publish_no_replace
+    rename_errors = []
+
+    def attempt_parent_rename(anchor, staging: Path, target: Path) -> None:
+        try:
+            parent.rename(moved_parent)
+        except OSError as error:
+            rename_errors.append(error.winerror)
+        else:
+            rename_errors.append(None)
+        real_publish(anchor, staging, target)
+
+    monkeypatch.setattr(
+        fetch_module, "_publish_no_replace", attempt_parent_rename
+    )
+
+    fetch_module.fetch(destination)
+
+    assert rename_errors == [32]
+    assert (destination / "marker").read_text(encoding="utf-8") == "complete"
+    assert parent.is_dir()
+    assert not moved_parent.exists()
+    assert not (parent / ".checkout.fetch.lock").exists()
+    assert not list(parent.glob(".checkout.staging-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX rollback regression")
+def test_posix_publish_rolls_back_if_visible_parent_changes(
+    tmp_path: Path, monkeypatch
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    sentinel = replacement / "owned.txt"
+    sentinel.write_text("preserve", encoding="utf-8")
+    replacement_inode = replacement.stat().st_ino
+    destination = parent / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_rename = fetch_module._rename_no_replace_posix
+
+    def swap_then_rename(anchor, source_name: str, target_name: str) -> None:
+        parent.rename(moved_parent)
+        replacement.rename(parent)
+        real_rename(anchor, source_name, target_name)
+
+    monkeypatch.setattr(
+        fetch_module, "_rename_no_replace_posix", swap_then_rename
+    )
+
+    with pytest.raises(RuntimeError, match="identity"):
+        fetch_module.fetch(destination)
+
+    assert parent.stat().st_ino == replacement_inode
+    assert (parent / sentinel.name).read_text(encoding="utf-8") == "preserve"
+    assert not destination.exists()
+    assert list(moved_parent.iterdir()) == []
+    assert not (moved_parent / ".checkout.fetch.lock").exists()
+    assert not list(moved_parent.glob(".checkout.staging-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX rollback regression")
+def test_posix_publish_reports_identity_and_rollback_failures(
+    tmp_path: Path, monkeypatch
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    destination = parent / "checkout"
+    fetch_module = _load_fetch_module()
+    _stub_fetch_io(fetch_module, monkeypatch)
+    real_rename = fetch_module._rename_no_replace_posix
+
+    def swap_then_rename(anchor, source_name: str, target_name: str) -> None:
+        parent.rename(moved_parent)
+        replacement.rename(parent)
+        real_rename(anchor, source_name, target_name)
+
+    def fail_rollback(_published: Path) -> None:
+        raise OSError("injected rollback failure")
+
+    monkeypatch.setattr(
+        fetch_module, "_rename_no_replace_posix", swap_then_rename
+    )
+    monkeypatch.setattr(fetch_module, "_remove_staging", fail_rollback)
+
+    with pytest.raises(RuntimeError) as raised:
+        fetch_module.fetch(destination)
+
+    message = str(raised.value)
+    assert "identity" in message
+    assert "rollback" in message
+    assert "injected rollback failure" in message
+    assert not (moved_parent / ".checkout.fetch.lock").exists()
+    assert not list(moved_parent.glob(".checkout.staging-*"))
+
+
 def test_parent_anchor_closes_after_materialization_failure(
     tmp_path: Path, monkeypatch
 ):
