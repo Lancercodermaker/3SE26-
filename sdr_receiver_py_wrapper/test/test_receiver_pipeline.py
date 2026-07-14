@@ -16,7 +16,7 @@ import yaml
 
 from sdr_receiver_py_wrapper.acquisition import AcquisitionEngine
 from sdr_receiver_py_wrapper.command_validator import CommandValidator
-from sdr_receiver_py_wrapper.device_session import DeviceSession
+from sdr_receiver_py_wrapper.device_session import DeviceConnectionError, DeviceSession
 from sdr_receiver_py_wrapper.models import (
     DecodedCommand,
     DecodeContext,
@@ -1152,6 +1152,162 @@ def test_common_runtime_connection_failure_closes_recorder(receiver_node_module)
         )
 
     assert recorder.closed_reasons == ["common receiver setup failed"]
+
+
+def test_common_runtime_connection_failure_does_not_wait_for_blocked_recorder(
+    receiver_node_module,
+    monkeypatch,
+):
+    class BlockingRecorder(MemoryRecorder):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+            self.close_attempts = 0
+            self.close_thread = None
+
+        def close(self, *, stopped_reason="closed"):
+            self.close_attempts += 1
+            self.close_thread = threading.current_thread()
+            self.entered.set()
+            self.release.wait(timeout=2.0)
+            self.finished.set()
+
+    monkeypatch.setattr(
+        receiver_node_module,
+        "CONSTRUCTOR_CLEANUP_WAIT_SEC",
+        0.02,
+        raising=False,
+    )
+    recorder = BlockingRecorder()
+    returned = threading.Event()
+    errors = []
+
+    def construct():
+        try:
+            receiver_node_module.CommonReceiverRuntime(
+                backend_factory=lambda: (_ for _ in ()).throw(
+                    OSError("radio unavailable")
+                ),
+                config=receiver_node_module.ReceiverFoundationConfig(),
+                primary=RecordingDecoder("improved_v67"),
+                output=FakeOutput("improved_v67"),
+                recorder=recorder,
+                context_provider=make_context,
+                radio_settings_provider=radio_settings,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            returned.set()
+
+    constructor_thread = threading.Thread(
+        target=construct,
+        name="constructor-test",
+        daemon=True,
+    )
+    constructor_thread.start()
+    assert recorder.entered.wait(timeout=0.5)
+    try:
+        assert returned.wait(timeout=0.2), "constructor waited for recorder cleanup"
+        assert isinstance(errors[0], DeviceConnectionError)
+        assert isinstance(errors[0].__cause__, OSError)
+        assert recorder.close_thread.name == "sdr-common-cleanup"
+        assert recorder.close_thread.daemon is True
+    finally:
+        recorder.release.set()
+        constructor_thread.join(timeout=1.0)
+    assert recorder.finished.wait(timeout=0.5)
+    assert recorder.close_attempts == 1
+
+
+def test_common_runtime_setup_failure_closes_created_device_before_async_recorder(
+    receiver_node_module,
+    monkeypatch,
+):
+    class BlockingRecorder(MemoryRecorder):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+            self.close_attempts = 0
+
+        def close(self, *, stopped_reason="closed"):
+            self.close_attempts += 1
+            self.entered.set()
+            self.release.wait(timeout=2.0)
+            self.finished.set()
+
+    monkeypatch.setattr(
+        receiver_node_module,
+        "CONSTRUCTOR_CLEANUP_WAIT_SEC",
+        0.02,
+        raising=False,
+    )
+    backend = FakeBackend(np.ones(2, dtype=np.complex64))
+    recorder = BlockingRecorder()
+    returned = threading.Event()
+    errors = []
+
+    def construct():
+        try:
+            receiver_node_module.CommonReceiverRuntime(
+                backend_factory=lambda: backend,
+                config=receiver_node_module.ReceiverFoundationConfig(),
+                primary=RecordingDecoder("improved_v67"),
+                output=FakeOutput("improved_v67"),
+                recorder=recorder,
+                context_provider=make_context,
+                radio_settings_provider=lambda: {},
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            returned.set()
+
+    constructor_thread = threading.Thread(target=construct, daemon=True)
+    constructor_thread.start()
+    assert recorder.entered.wait(timeout=0.5)
+    try:
+        assert backend.closed is True
+        assert returned.wait(timeout=0.2), "constructor waited for recorder cleanup"
+        assert isinstance(errors[0], ValueError)
+        assert "invalid keys" in str(errors[0])
+    finally:
+        recorder.release.set()
+        constructor_thread.join(timeout=1.0)
+    assert recorder.finished.wait(timeout=0.5)
+    assert recorder.close_attempts == 1
+    assert backend.close_calls == 1
+
+
+def test_common_runtime_constructor_cleanup_error_is_logged_not_raised(
+    receiver_node_module,
+    caplog,
+):
+    class RaisingRecorder(MemoryRecorder):
+        def close(self, *, stopped_reason="closed"):
+            raise RuntimeError("recorder cleanup exploded")
+
+    def fail_connection():
+        raise OSError("radio unavailable")
+
+    with caplog.at_level("ERROR", logger=receiver_node_module.__name__):
+        with pytest.raises(DeviceConnectionError) as raised:
+            receiver_node_module.CommonReceiverRuntime(
+                backend_factory=fail_connection,
+                config=receiver_node_module.ReceiverFoundationConfig(),
+                primary=RecordingDecoder("improved_v67"),
+                output=FakeOutput("improved_v67"),
+                recorder=RaisingRecorder(),
+                context_provider=make_context,
+                radio_settings_provider=radio_settings,
+            )
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert "recorder: recorder cleanup exploded" in caplog.text
 
 
 def test_common_runtime_configuration_failure_closes_device(receiver_node_module):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict, dataclass, replace
 import json
+import logging
 import math
 import numbers
 import os
@@ -45,6 +46,8 @@ from .v67_decoder import V67Decoder
 
 DEFAULT_ORIGINAL_SCRIPT = "auto"
 PRIMARY_DECODER_ID = "improved_v67"
+CONSTRUCTOR_CLEANUP_WAIT_SEC = 0.25
+_LOGGER = logging.getLogger(__name__)
 
 
 class ReceiverPipelineError(RuntimeError):
@@ -215,7 +218,15 @@ class CommonReceiverRuntime:
                 _context, settings = self.snapshot_provider()
                 self._sync_device_settings(settings)
         except BaseException:
-            self._close_resources_once("common receiver setup failed")
+            try:
+                cleanup_done = self._start_cleanup(
+                    "common receiver setup failed"
+                )
+                cleanup_done.wait(timeout=CONSTRUCTOR_CLEANUP_WAIT_SEC)
+            except BaseException:
+                _LOGGER.exception(
+                    "failed to start common receiver constructor cleanup"
+                )
             raise
 
     def process_once(self) -> CommonRuntimeResult:
@@ -566,9 +577,6 @@ class CommonReceiverRuntime:
             self._lifecycle = "STOPPING"
             self._start_cleanup(reason)
 
-    def _close_resources_once(self, reason: str) -> None:
-        self._run_cleanup_attempt(reason)
-
     def _start_cleanup(self, reason: str) -> threading.Event:
         with self._resource_lock:
             if self._resources_closed:
@@ -626,12 +634,18 @@ class CommonReceiverRuntime:
             with self._resource_lock:
                 self._recorder_close_done = True
 
+        error_text = "; ".join(errors)
         with self._resource_lock:
-            self.cleanup_error = "; ".join(errors) or None
+            self.cleanup_error = error_text or None
             self._resources_closed = (
                 self._device_close_done and self._recorder_close_done
             )
-            self._cleanup_done.set()
+        try:
+            if error_text:
+                _LOGGER.error("common receiver cleanup failed: %s", error_text)
+        finally:
+            with self._resource_lock:
+                self._cleanup_done.set()
 
     def _context_for_chunk(self, chunk_id, timeout_sec):
         deadline = time.monotonic() + max(0.05, float(timeout_sec))
