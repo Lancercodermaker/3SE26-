@@ -1127,14 +1127,93 @@ def test_common_runtime_recovers_reconnect_and_resets_before_next_decode(
 
     assert result.chunk.chunk_id == 0
     reasons = [reason for reason, _context in decoder.reset_calls]
-    assert reasons == [receiver_node_module.ResetReason.STARTUP]
+    assert reasons == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
     assert decoder.reset_calls[0][1] == make_context()
+    assert runtime._pending_device_reconnect is False
     discontinuity = next(
         payload for kind, payload in recorder.events if kind == "discontinuity"
     )
     assert discontinuity["reason"] == "device_reconnect"
     assert runtime.worker_error is None
     assert runtime.acquisition.stats.reconnects == 1
+
+
+def test_common_runtime_startup_reset_failure_preserves_pending_reconnect(
+    receiver_node_module,
+):
+    class StartupResetFails(ResetTrackingDecoder):
+        def reset(self, reason, context):
+            super().reset(reason, context)
+            if reason is receiver_node_module.ResetReason.STARTUP:
+                raise RuntimeError("startup reset failed")
+
+    primary = StartupResetFails("improved_v67")
+    shadow = ResetTrackingDecoder("shadow")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+    runtime._pending_device_reconnect = True
+
+    with pytest.raises(RuntimeError, match="startup reset failed"):
+        runtime.process_once()
+    runtime.close()
+
+    assert [reason for reason, _ in primary.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP
+    ]
+    assert shadow.reset_calls == []
+    assert runtime._pending_device_reconnect is True
+
+
+def test_common_runtime_device_reset_failure_preserves_pending_reconnect(
+    receiver_node_module,
+):
+    class DeviceResetFails(ResetTrackingDecoder):
+        def reset(self, reason, context):
+            super().reset(reason, context)
+            if reason is receiver_node_module.ResetReason.DEVICE_RECONNECT:
+                raise RuntimeError("device reset failed")
+
+    primary = DeviceResetFails("improved_v67")
+    shadow = ResetTrackingDecoder("shadow")
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: FakeBackend(np.ones(2, dtype=np.complex64)),
+        config=receiver_node_module.ReceiverFoundationConfig(
+            decoder_shadow="shadow"
+        ),
+        primary=primary,
+        shadow=shadow,
+        output=FakeOutput("improved_v67"),
+        recorder=MemoryRecorder(),
+        context_provider=make_context,
+        radio_settings_provider=radio_settings,
+    )
+    runtime._pending_device_reconnect = True
+
+    with pytest.raises(RuntimeError, match="device reset failed"):
+        runtime.process_once()
+    runtime.close()
+
+    assert [reason for reason, _ in primary.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP,
+        receiver_node_module.ResetReason.DEVICE_RECONNECT,
+    ]
+    assert [reason for reason, _ in shadow.reset_calls] == [
+        receiver_node_module.ResetReason.STARTUP
+    ]
+    assert runtime._pending_device_reconnect is True
 
 
 def test_common_runtime_resets_both_decoders_for_context_target_and_gap(

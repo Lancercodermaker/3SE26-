@@ -310,6 +310,8 @@ class CommonReceiverRuntime:
             reset_diagnostics.extend(
                 self.pipeline.reset_decoders(reason, context, chunk)
             )
+            if reason is ResetReason.DEVICE_RECONNECT:
+                self._pending_device_reconnect = False
         if self.recorder is not None:
             accepted = self.recorder.write_event(
                 "rf_state",
@@ -337,7 +339,6 @@ class CommonReceiverRuntime:
         self._expected_next_sample = (
             chunk.first_sample_index + int(chunk.samples.size)
         )
-        self._pending_device_reconnect = False
         if reset_diagnostics:
             result = replace(
                 result,
@@ -356,9 +357,11 @@ class CommonReceiverRuntime:
         reasons = []
         previous = self._last_decode_context
         if previous is None:
-            return (ResetReason.STARTUP,)
+            reasons.append(ResetReason.STARTUP)
         if self._pending_device_reconnect:
             reasons.append(ResetReason.DEVICE_RECONNECT)
+        if previous is None:
+            return tuple(reasons)
         if (
             context.target_version != previous.target_version
             or context.target != previous.target
