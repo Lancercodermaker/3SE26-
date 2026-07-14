@@ -1,0 +1,26 @@
+{
+  "RX_BLUE_ganrao_1": {
+    "format": "complex64-le",
+    "sample_rate_hz": 2000000,
+    "team": "BLUE",
+    "target": "L1",
+    "verification": "confirmed",
+    "sha256": "8cde16d3fe8230334a9efcb36c81ae105b76b4118f4fe3fc63943aeb791be7cc",
+    "expected_cmd_id": 2566,
+    "expected_ascii": "fcYqTC"
+  },
+  "RX_BLUE_ganrao_2": {
+    "format": "complex64-le",
+    "sample_rate_hz": 2000000,
+    "team": "BLUE",
+    "target": "L2",
+    "verification": "candidate"
+  },
+  "RX_BLUE_ganrao_3": {
+    "format": "complex64-le",
+    "sample_rate_hz": 2000000,
+    "team": "BLUE",
+    "target": "L3",
+    "verification": "candidate"
+  }
+}
