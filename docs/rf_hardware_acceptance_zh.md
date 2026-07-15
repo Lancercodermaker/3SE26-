@@ -53,7 +53,7 @@ ros2 launch sdr_receiver_py_wrapper competition_receiver.launch.py \
 
 RF 判断以本窗口完整 `.events.jsonl` 为权威，而不是只看 1 Hz 状态快照。脚本要求每个录波 chunk 恰好对应一个 `rf_state` 事件；任一事件为 `clipped` 时，该窗口按 `clipped` 处理并禁止更高增益。峰值取所有 chunk 的最大值，剪顶比例取最大值；RMS 同时保存最小值、最大值和按 `sample_count` 加权的均方根，不能把最后一条 RMS 冒充整窗结果。最终允许使用的线性增益窗口本身必须达到 CRC16 非零阈值，不能用后续剪顶窗口的 CRC16 凑数。
 
-每个窗口记录峰值、RMS、剪顶比例、CRC16 数量、增益、RF 状态、状态消息数、请求时长、窗口/status/chunk 覆盖时长、各自首尾间隙、采集占空比、队列丢弃、读错误、重连、录波丢弃和 libiio timeout 日志计数。
+每个窗口记录峰值、RMS、剪顶比例、CRC16 数量、增益、RF 状态、状态消息数、请求时长、窗口/status/chunk 覆盖时长、status/chunk 的单向 missing 与额外覆盖、两类独立容差、采集占空比、队列丢弃、读错误、重连、录波丢弃和 libiio timeout 日志计数。
 
 ## 3. 执行命令
 
@@ -120,7 +120,7 @@ READY:radar_stopped_log_flushed
 
 任一条件失败时，该 USB 线、主机端口和当前链路组合不可上场。
 
-采集占空比没有现成的 ROS 聚合字段，且 ROS 状态接收时间不能代表 SDR 采集时间。脚本严格解析本窗口唯一 `.chunks.jsonl`：`chunk_id`、样本索引、字节范围必须从 0 连续，采样率必须始终为 2 MHz，`sample_count` 必须大于 0，`rx_monotonic_ns` 必须严格递增。计算式为：
+采集占空比没有现成的 ROS 聚合字段，且 ROS 状态接收时间不能代表 SDR 采集时间。脚本严格解析本窗口唯一 `.chunks.jsonl`：`chunk_id`、样本索引、字节范围必须从 0 连续，采样率必须始终为 2 MHz，`sample_count` 必须大于 0，`rx_monotonic_ns` 必须严格递增。这里的 `rx_monotonic_ns` 是本次 SDR read 的完成时刻；每个 chunk 的区间为 `[rx_monotonic_ns - sample_count / sample_rate_hz, rx_monotonic_ns]`。脚本逐条检查 chunk ID、样本/字节索引连续和完成时刻递增，再由下述占空比拒绝整体时间轴的 gap 或 overlap：
 
 ```text
 expected_samples = first_chunk.sample_count
@@ -131,7 +131,19 @@ acquisition_duty = sum(sample_count) / expected_samples
 
 占空比必须在 `[0.99, 1.0]`；低于 0.99 或高于 1.0 都拒绝，后者表示时间轴、采样率或记录证据自相矛盾。任何 gap、overlap、duplicate、混合采样率或坏 JSONL 都立即失败。CRC16 数量也没有现成聚合字段，脚本只统计受控录波目录 `.events.jsonl` 中结构完整、`kind=command` 且 `payload.crc16_ok=true` 的事件。
 
-占空比只证明已有 chunk 的内部时间轴连续，不能证明录满了请求时长。每次状态采集因此先写入权威 `window_start_monotonic_ns`、`window_end_monotonic_ns` 和 `requested_duration_sec`，离线分析同时计算 `window_coverage_sec`、`status_coverage_sec`、`chunk_coverage_sec` 以及 status/chunk 的首尾间隙。允许的单调时钟调度容差为 `min(1 秒, max(0.1 秒, 请求时长的 1%))`；正式 30 秒扫描对应 0.3 秒，120 秒闭环和 1800 秒长稳对应 1 秒。窗口边界、status 快照和 chunk 三种覆盖都必须达到“请求时长减容差”，首尾绝对间隙也不得超过该容差。因而 1800 秒 status 时间跨度不能掩盖只有 2 秒的 IQ chunk，尾部静默同样会失败；status 接收时间不能替代 SDR chunk 的权威覆盖证据。
+占空比只证明已有 chunk 的内部时间轴连续，不能证明录满了请求时长。每次状态采集因此先写入权威 `window_start_monotonic_ns`、`window_end_monotonic_ns` 和 `requested_duration_sec`。chunk 覆盖区间使用上述 read-completion 语义：
+
+```text
+first_start = first.rx_monotonic_ns - first.sample_count / sample_rate_hz
+last_end = last.rx_monotonic_ns
+chunk_coverage = intersection([first_start, last_end], [window_start, window_end])
+chunk_head_missing = max(0, first_start - window_start)
+chunk_tail_missing = max(0, window_end - last_end)
+```
+
+提前开始或延后结束只计入 `chunk_early_extra_sec` / `chunk_late_extra_sec`，不作为失败；例如首尾各多录 0.9 秒但完整覆盖窗口应通过。chunk 容差独立计算为 `min(0.1 秒, 最大 buffer 周期 × 0.5 + 0.002 秒调度余量, 最大 buffer 周期 × 0.9)`，其中 buffer 周期来自 `sample_count / sample_rate_hz`。该容差始终小于一个完整最大 chunk，不能掩盖整块尾部静默；例如提前 0.9 秒但结尾缺 0.9 秒必须失败。
+
+status 使用相同的窗口求交和单向 `head_missing` / `tail_missing` 语义，提前或延后的额外快照不受罚，但容差与 chunk 分开：当前明确状态周期为 1 秒，加 0.25 秒有界调度余量，因此 `status_tolerance_sec=1.25`。最后一条 status 距窗口结束 0.9 秒可以通过，30 秒窗口不会被不合理地压缩到 0.3 秒 status 容差。`metrics.json` 保存两类 tolerance、missing、extra 和求交后的 coverage。窗口单调时钟边界本身必须覆盖完整请求时长；status 与 chunk 分别必须覆盖“请求时长减各自容差”。因而 1800 秒 status 时间跨度不能掩盖只有 2 秒的 IQ chunk，尾部静默同样会失败；status 接收时间不能替代 SDR chunk 的权威覆盖证据。
 
 当前接收端没有名为 `libiio_timeouts` 的独立诊断计数。脚本只在本窗口 `ros2 launch` 的完整 stdout/stderr 中计数同时包含 `libiio`/`iio` 与 `timeout`/`timed out` 的行，并额外强制 acquisition/device read errors 为 0。这是现有接口的诊断边界，不应把“日志计数为 0”解释为驱动内部绝对没有发生过未上报的 timeout。若比赛验收需要驱动级证明，应先在接收端增加结构化 `libiio_timeouts` 计数，再重新执行本规程。
 

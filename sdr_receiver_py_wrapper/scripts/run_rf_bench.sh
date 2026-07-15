@@ -10,7 +10,10 @@ readonly IQ_BYTES_PER_SAMPLE="8"
 readonly IQ_WINDOW_HEADROOM_RATIO="1.10"
 readonly IQ_WINDOW_METADATA_HEADROOM_BYTES="67108864"
 readonly DISK_RUN_HEADROOM_BYTES="1073741824"
-readonly MAX_COVERAGE_TOLERANCE_SEC="1.0"
+readonly STATUS_PERIOD_SEC="1.0"
+readonly STATUS_SCHEDULING_MARGIN_SEC="0.25"
+readonly MAX_CHUNK_TOLERANCE_SEC="0.1"
+readonly CHUNK_SCHEDULING_MARGIN_SEC="0.002"
 readonly CONFIRMED_L1_SHA256="8cde16d3fe8230334a9efcb36c81ae105b76b4118f4fe3fc63943aeb791be7cc"
 
 readonly -a COMBINATION_IDS=(
@@ -665,7 +668,9 @@ analyze_window() {
   python3 - "$status_path" "$launch_log" "$iq_dir" "$metrics_path" \
     "$stage" "$combination" "$gain" "$SAMPLE_RATE_HZ" "$MIN_DUTY" \
     "$MIN_CRC16" "$CLIPPING_THRESHOLD" "$enforce_stability" \
-    "$requested_duration_sec" "$MAX_COVERAGE_TOLERANCE_SEC" <<'PY'
+    "$requested_duration_sec" "$STATUS_PERIOD_SEC" \
+    "$STATUS_SCHEDULING_MARGIN_SEC" "$MAX_CHUNK_TOLERANCE_SEC" \
+    "$CHUNK_SCHEDULING_MARGIN_SEC" <<'PY'
 import json
 import math
 from pathlib import Path
@@ -675,7 +680,8 @@ import sys
 (
     status_path, launch_log, iq_dir, metrics_path, stage, combination, gain,
     sample_rate, min_duty, min_crc16, clipping_threshold, enforce_stability,
-    requested_duration_sec, max_coverage_tolerance_sec,
+    requested_duration_sec, status_period_sec, status_scheduling_margin_sec,
+    max_chunk_tolerance_sec, chunk_scheduling_margin_sec,
 ) = sys.argv[1:]
 sample_rate = int(sample_rate)
 min_duty = float(min_duty)
@@ -683,15 +689,21 @@ min_crc16 = int(min_crc16)
 clipping_threshold = float(clipping_threshold)
 enforce_stability = enforce_stability == "true"
 requested_duration_sec = float(requested_duration_sec)
-max_coverage_tolerance_sec = float(max_coverage_tolerance_sec)
+status_period_sec = float(status_period_sec)
+status_scheduling_margin_sec = float(status_scheduling_margin_sec)
+max_chunk_tolerance_sec = float(max_chunk_tolerance_sec)
+chunk_scheduling_margin_sec = float(chunk_scheduling_margin_sec)
 if not math.isfinite(requested_duration_sec) or requested_duration_sec <= 0:
     raise SystemExit("requested duration is invalid")
-if not math.isfinite(max_coverage_tolerance_sec) or not 0 < max_coverage_tolerance_sec <= 1:
-    raise SystemExit("coverage tolerance limit is invalid")
-coverage_tolerance_sec = min(
-    max_coverage_tolerance_sec,
-    max(0.1, requested_duration_sec * 0.01),
-)
+if not math.isfinite(status_period_sec) or status_period_sec <= 0:
+    raise SystemExit("status period is invalid")
+if not math.isfinite(status_scheduling_margin_sec) or status_scheduling_margin_sec < 0:
+    raise SystemExit("status scheduling margin is invalid")
+if not math.isfinite(max_chunk_tolerance_sec) or max_chunk_tolerance_sec <= 0:
+    raise SystemExit("chunk tolerance limit is invalid")
+if not math.isfinite(chunk_scheduling_margin_sec) or chunk_scheduling_margin_sec < 0:
+    raise SystemExit("chunk scheduling margin is invalid")
+status_tolerance_sec = status_period_sec + status_scheduling_margin_sec
 
 def unique_object(pairs):
     result = {}
@@ -763,19 +775,18 @@ with open(status_path, encoding="utf-8") as handle:
 if window_bounds is None or not status_records:
     raise SystemExit("at least one status record is required")
 window_start_ns, window_end_ns = window_bounds
-if not all(window_start_ns <= item["captured_monotonic_ns"] <= window_end_ns for item in status_records):
-    raise SystemExit("status snapshot lies outside authoritative window bounds")
 window_coverage_sec = (window_end_ns - window_start_ns) / 1_000_000_000
-status_coverage_sec = (
-    status_records[-1]["captured_monotonic_ns"]
-    - status_records[0]["captured_monotonic_ns"]
-) / 1_000_000_000
-status_head_gap_sec = (
-    status_records[0]["captured_monotonic_ns"] - window_start_ns
-) / 1_000_000_000
-status_tail_gap_sec = (
-    window_end_ns - status_records[-1]["captured_monotonic_ns"]
-) / 1_000_000_000
+status_start_ns = status_records[0]["captured_monotonic_ns"]
+status_end_ns = status_records[-1]["captured_monotonic_ns"]
+status_intersection_start_ns = max(status_start_ns, window_start_ns)
+status_intersection_end_ns = min(status_end_ns, window_end_ns)
+status_coverage_sec = max(
+    0.0, (status_intersection_end_ns - status_intersection_start_ns) / 1_000_000_000
+)
+status_head_missing_sec = max(0.0, (status_start_ns - window_start_ns) / 1_000_000_000)
+status_tail_missing_sec = max(0.0, (window_end_ns - status_end_ns) / 1_000_000_000)
+status_early_extra_sec = max(0.0, (window_start_ns - status_start_ns) / 1_000_000_000)
+status_late_extra_sec = max(0.0, (status_end_ns - window_end_ns) / 1_000_000_000)
 
 runtimes = []
 for item in status_records:
@@ -841,6 +852,7 @@ with chunks_path.open(encoding="utf-8") as handle:
         count = exact_int(chunk["sample_count"], "sample_count", 1)
         rate = exact_int(chunk["sample_rate_hz"], "sample_rate_hz", 1)
         monotonic_ns = exact_int(chunk["rx_monotonic_ns"], "rx_monotonic_ns", 1)
+        duration_ns = math.ceil(count * 1_000_000_000 / rate)
         byte_offset = exact_int(chunk["byte_offset"], "byte_offset")
         byte_length = exact_int(chunk["byte_length"], "byte_length", 1)
         finite_number(chunk["rx_wall_time"], "rx_wall_time", 0)
@@ -864,6 +876,7 @@ with chunks_path.open(encoding="utf-8") as handle:
             "chunk_id": chunk_id,
             "first_sample_index": first_index,
             "sample_count": count,
+            "duration_ns": duration_ns,
             "rx_monotonic_ns": monotonic_ns,
             "byte_offset": byte_offset,
             "byte_length": byte_length,
@@ -881,12 +894,23 @@ acquisition_duty = actual_samples / expected_samples
 if not math.isfinite(acquisition_duty):
     raise SystemExit("acquisition duty is invalid")
 chunk_start_ns = chunks[0]["rx_monotonic_ns"]
-chunk_end_ns = chunks[-1]["rx_monotonic_ns"] + math.ceil(
-    chunks[-1]["sample_count"] * 1_000_000_000 / sample_rate
+chunk_start_ns -= chunks[0]["duration_ns"]
+chunk_end_ns = chunks[-1]["rx_monotonic_ns"]
+chunk_intersection_start_ns = max(chunk_start_ns, window_start_ns)
+chunk_intersection_end_ns = min(chunk_end_ns, window_end_ns)
+chunk_coverage_sec = max(
+    0.0, (chunk_intersection_end_ns - chunk_intersection_start_ns) / 1_000_000_000
 )
-chunk_coverage_sec = (chunk_end_ns - chunk_start_ns) / 1_000_000_000
-chunk_head_gap_sec = (chunk_start_ns - window_start_ns) / 1_000_000_000
-chunk_tail_gap_sec = (window_end_ns - chunk_end_ns) / 1_000_000_000
+chunk_head_missing_sec = max(0.0, (chunk_start_ns - window_start_ns) / 1_000_000_000)
+chunk_tail_missing_sec = max(0.0, (window_end_ns - chunk_end_ns) / 1_000_000_000)
+chunk_early_extra_sec = max(0.0, (window_start_ns - chunk_start_ns) / 1_000_000_000)
+chunk_late_extra_sec = max(0.0, (chunk_end_ns - window_end_ns) / 1_000_000_000)
+max_chunk_period_sec = max(chunk["duration_ns"] for chunk in chunks) / 1_000_000_000
+chunk_tolerance_sec = min(
+    max_chunk_tolerance_sec,
+    max_chunk_period_sec * 0.5 + chunk_scheduling_margin_sec,
+    max_chunk_period_sec * 0.9,
+)
 
 event_keys = {"kind", "payload", "wall_time", "monotonic_ns"}
 rf_payload_keys = {
@@ -971,21 +995,20 @@ libiio_timeouts = len(timeout_pattern.findall(log_text))
 violations = []
 if not min_duty <= acquisition_duty <= 1.0:
     violations.append("acquisition_duty_outside_0.99_to_1.0")
-minimum_coverage_sec = max(0.0, requested_duration_sec - coverage_tolerance_sec)
-if window_coverage_sec < minimum_coverage_sec:
+if window_coverage_sec + 1e-9 < requested_duration_sec:
     violations.append("window_coverage_shorter_than_requested")
-if status_coverage_sec < minimum_coverage_sec:
+if status_coverage_sec < max(0.0, requested_duration_sec - status_tolerance_sec):
     violations.append("status_coverage_shorter_than_requested")
-if chunk_coverage_sec < minimum_coverage_sec:
+if chunk_coverage_sec < max(0.0, requested_duration_sec - chunk_tolerance_sec):
     violations.append("chunk_coverage_shorter_than_requested")
-if abs(status_head_gap_sec) > coverage_tolerance_sec:
-    violations.append("status_head_gap_exceeds_tolerance")
-if abs(status_tail_gap_sec) > coverage_tolerance_sec:
-    violations.append("status_tail_gap_exceeds_tolerance")
-if abs(chunk_head_gap_sec) > coverage_tolerance_sec:
-    violations.append("chunk_head_gap_exceeds_tolerance")
-if abs(chunk_tail_gap_sec) > coverage_tolerance_sec:
-    violations.append("chunk_tail_gap_exceeds_tolerance")
+if status_head_missing_sec > status_tolerance_sec:
+    violations.append("status_head_missing_exceeds_tolerance")
+if status_tail_missing_sec > status_tolerance_sec:
+    violations.append("status_tail_missing_exceeds_tolerance")
+if chunk_head_missing_sec > chunk_tolerance_sec:
+    violations.append("chunk_head_missing_exceeds_tolerance")
+if chunk_tail_missing_sec > chunk_tolerance_sec:
+    violations.append("chunk_tail_missing_exceeds_tolerance")
 if counter_fields["queue_drops"] != 0:
     violations.append("queue_drops_nonzero")
 if libiio_timeouts != 0:
@@ -1008,14 +1031,23 @@ result = {
     "combination": combination,
     "gain_db": int(gain),
     "requested_duration_sec": requested_duration_sec,
-    "coverage_tolerance_sec": coverage_tolerance_sec,
+    "status_period_sec": status_period_sec,
+    "status_scheduling_margin_sec": status_scheduling_margin_sec,
+    "status_tolerance_sec": status_tolerance_sec,
+    "max_chunk_period_sec": max_chunk_period_sec,
+    "chunk_scheduling_margin_sec": chunk_scheduling_margin_sec,
+    "chunk_tolerance_sec": chunk_tolerance_sec,
     "window_coverage_sec": window_coverage_sec,
     "status_coverage_sec": status_coverage_sec,
     "chunk_coverage_sec": chunk_coverage_sec,
-    "status_head_gap_sec": status_head_gap_sec,
-    "status_tail_gap_sec": status_tail_gap_sec,
-    "chunk_head_gap_sec": chunk_head_gap_sec,
-    "chunk_tail_gap_sec": chunk_tail_gap_sec,
+    "status_head_missing_sec": status_head_missing_sec,
+    "status_tail_missing_sec": status_tail_missing_sec,
+    "status_early_extra_sec": status_early_extra_sec,
+    "status_late_extra_sec": status_late_extra_sec,
+    "chunk_head_missing_sec": chunk_head_missing_sec,
+    "chunk_tail_missing_sec": chunk_tail_missing_sec,
+    "chunk_early_extra_sec": chunk_early_extra_sec,
+    "chunk_late_extra_sec": chunk_late_extra_sec,
     "status_messages": len(status_records),
     "chunk_count": len(chunks),
     "actual_samples": actual_samples,
