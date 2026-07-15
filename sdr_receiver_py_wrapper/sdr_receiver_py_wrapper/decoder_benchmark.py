@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import tempfile
 import time
 from types import MappingProxyType
@@ -39,6 +40,7 @@ _MAX_COMMANDS_PER_CHUNK = 256
 _MAX_COUNTER = (1 << 63) - 1
 _DECODER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 MAX_IQ_BYTES = 2_147_483_648
+MAX_BENCHMARK_WORKING_SET_BYTES = 536_870_912
 DECODER_ENTRY_POINT_GROUP = "sdr_receiver_py_wrapper.decoder_plugins"
 
 
@@ -154,6 +156,16 @@ def run_benchmark(
         )
     if not callable(cpu_clock_ns):
         raise BenchmarkError("cpu_clock_ns must be callable")
+    estimated_working_set = (
+        chunk_samples
+        * _BYTES_PER_COMPLEX64
+        * (2 + len(names))
+    )
+    if estimated_working_set > MAX_BENCHMARK_WORKING_SET_BYTES:
+        raise BenchmarkError(
+            "chunk_samples and decoder count exceed the benchmark "
+            "working-set budget"
+        )
 
     trusted_context = _TrustedContext(
         team=fixture.team,
@@ -420,26 +432,42 @@ def _verified_iq_snapshot(
             )
         snapshot.flush()
         snapshot.seek(0)
-    except OSError as exc:
-        if snapshot is not None:
-            snapshot.close()
-        raise BenchmarkError(
-            f"cannot snapshot IQ file: {_safe_error_text(exc)}"
-        ) from None
-    except Exception:
-        if snapshot is not None:
-            snapshot.close()
-        raise
+    except Exception as primary:
+        cleanup = _close_snapshot_error(snapshot)
+        if isinstance(primary, BenchmarkError):
+            primary_text = _safe_error_text(primary)
+        else:
+            primary_text = (
+                "cannot snapshot IQ file: " + _safe_error_text(primary)
+            )
+        if cleanup is not None:
+            primary_text += "; cleanup failure: " + cleanup
+        raise BenchmarkError(primary_text) from None
     try:
         yield snapshot, actual, opened.st_size // _BYTES_PER_COMPLEX64
-    finally:
-        try:
-            snapshot.close()
-        except OSError as exc:
+    except Exception as primary:
+        cleanup = _close_snapshot_error(snapshot)
+        if cleanup is not None:
             raise BenchmarkError(
-                "cannot close private IQ snapshot: "
-                f"{_safe_error_text(exc)}"
+                f"{_safe_error_text(primary)}; cleanup failure: {cleanup}"
             ) from None
+        raise
+    else:
+        cleanup = _close_snapshot_error(snapshot)
+        if cleanup is not None:
+            raise BenchmarkError(
+                "cannot close private IQ snapshot: " + cleanup
+            ) from None
+
+
+def _close_snapshot_error(snapshot) -> str | None:
+    if snapshot is None:
+        return None
+    try:
+        snapshot.close()
+    except OSError as exc:
+        return _safe_error_text(exc)
+    return None
 
 
 def _validate_open_file(file_stat: os.stat_result, path: Path) -> None:
@@ -494,15 +522,15 @@ def _replay_snapshot(
                 copy=True,
             )
             source.flags.writeable = False
-            _enqueue_private_chunks(
-                runs,
-                source,
-                chunk_id=chunk_id,
-                first_sample_index=first_sample_index,
-                fixture=fixture,
-                trusted_context=trusted_context,
-            )
             for run in runs:
+                _enqueue_private_chunk(
+                    run,
+                    source,
+                    chunk_id=chunk_id,
+                    first_sample_index=first_sample_index,
+                    fixture=fixture,
+                    trusted_context=trusted_context,
+                )
                 _drain_one(
                     run,
                     fixture=fixture,
@@ -518,8 +546,8 @@ def _replay_snapshot(
         ) from None
 
 
-def _enqueue_private_chunks(
-    runs: list[_DecoderRun],
+def _enqueue_private_chunk(
+    run: _DecoderRun,
     source: np.ndarray,
     *,
     chunk_id: int,
@@ -527,45 +555,44 @@ def _enqueue_private_chunks(
     fixture: FixtureSpec,
     trusted_context: _TrustedContext,
 ) -> None:
-    for run in runs:
-        if run.error is not None:
-            continue
-        private = np.array(source, dtype=np.complex64, order="C", copy=True)
-        private.flags.writeable = False
-        sample_time = first_sample_index / fixture.sample_rate_hz
-        truth = _ChunkTruth(
-            chunk_id=chunk_id,
-            first_sample_index=first_sample_index,
-            sample_count=len(source),
-            sample_rate_hz=fixture.sample_rate_hz,
-            rx_wall_time=sample_time,
-            rx_monotonic_ns=int(sample_time * 1_000_000_000),
-            target_version=trusted_context.target_version,
-            context_version=trusted_context.context_version,
+    if run.error is not None:
+        return
+    private = np.array(source, dtype=np.complex64, order="C", copy=True)
+    private.flags.writeable = False
+    sample_time = first_sample_index / fixture.sample_rate_hz
+    truth = _ChunkTruth(
+        chunk_id=chunk_id,
+        first_sample_index=first_sample_index,
+        sample_count=len(source),
+        sample_rate_hz=fixture.sample_rate_hz,
+        rx_wall_time=sample_time,
+        rx_monotonic_ns=int(sample_time * 1_000_000_000),
+        target_version=trusted_context.target_version,
+        context_version=trusted_context.context_version,
+    )
+    chunk = IqChunk(
+        chunk_id=truth.chunk_id,
+        first_sample_index=truth.first_sample_index,
+        samples=private,
+        sample_rate_hz=truth.sample_rate_hz,
+        rx_wall_time=truth.rx_wall_time,
+        rx_monotonic_ns=truth.rx_monotonic_ns,
+        lo_hz=0,
+        rf_bandwidth_hz=0,
+        rx_gain_db=0,
+        target_version=truth.target_version,
+        context_version=truth.context_version,
+    )
+    run.queue.append(
+        _QueuedChunk(
+            chunk=chunk,
+            context=trusted_context.expose(),
+            private_samples=private,
+            source_samples=source,
+            truth=truth,
         )
-        chunk = IqChunk(
-            chunk_id=truth.chunk_id,
-            first_sample_index=truth.first_sample_index,
-            samples=private,
-            sample_rate_hz=truth.sample_rate_hz,
-            rx_wall_time=truth.rx_wall_time,
-            rx_monotonic_ns=truth.rx_monotonic_ns,
-            lo_hz=0,
-            rf_bandwidth_hz=0,
-            rx_gain_db=0,
-            target_version=truth.target_version,
-            context_version=truth.context_version,
-        )
-        run.queue.append(
-            _QueuedChunk(
-                chunk=chunk,
-                context=trusted_context.expose(),
-                private_samples=private,
-                source_samples=source,
-                truth=truth,
-            )
-        )
-        run.peak_queue_depth = max(run.peak_queue_depth, len(run.queue))
+    )
+    run.peak_queue_depth = max(run.peak_queue_depth, len(run.queue))
 
 
 def _drain_one(
@@ -719,10 +746,18 @@ def _validate_command(
         raise ValueError(
             "command payload must be exact bytes of at most 256 bytes"
         )
+    if type(command.decoder_id) is not str:
+        raise ValueError("command decoder_id must be an exact str")
     if command.decoder_id != run.decoder_id:
         raise ValueError("command decoder_id does not match its plugin")
+    if type(command.profile) is not str:
+        raise ValueError("command profile must be an exact str")
     if command.profile != trusted_context.profile:
         raise ValueError("command profile does not match benchmark context")
+    if type(command.team) is not str:
+        raise ValueError("command team must be an exact str")
+    if type(command.target) is not str:
+        raise ValueError("command target must be an exact str")
     if (
         command.team != trusted_context.team
         or command.target != trusted_context.target
@@ -730,6 +765,8 @@ def _validate_command(
         raise ValueError(
             "command team/target does not match benchmark context"
         )
+    if type(command.context_version) is not int:
+        raise ValueError("command context_version must be an exact int")
     if command.context_version != trusted_context.context_version:
         raise ValueError(
             "command context_version does not match benchmark context"
@@ -753,7 +790,7 @@ def _validate_command(
             "command sample range must be inside the source chunk"
         )
     if (
-        type(command.receive_wall_time) not in (int, float)
+        type(command.receive_wall_time) is not float
         or not math.isfinite(command.receive_wall_time)
         or command.receive_wall_time != truth.rx_wall_time
     ):
@@ -945,6 +982,49 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _assert_output_is_not_input(
+    out_path: Path,
+    iq_path: Path,
+    manifest_path: Path,
+) -> None:
+    try:
+        resolved_out = out_path.resolve(strict=False)
+        protected = (
+            iq_path.resolve(strict=False),
+            manifest_path.resolve(strict=False),
+        )
+    except OSError as exc:
+        raise BenchmarkError(
+            "cannot resolve benchmark paths: " + _safe_error_text(exc)
+        ) from None
+    if resolved_out in protected:
+        raise BenchmarkError(
+            "output path must not replace the IQ or manifest input"
+        )
+    for input_path in (iq_path, manifest_path):
+        try:
+            aliases_input = os.path.samefile(out_path, input_path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise BenchmarkError(
+                "cannot verify output path identity: "
+                f"{_safe_error_text(exc)}"
+            ) from None
+        if aliases_input:
+            raise BenchmarkError(
+                "output path aliases the IQ or manifest input"
+            )
+
+
+def _write_stderr_report(report: Mapping[str, object]) -> None:
+    try:
+        sys.stderr.write(_canonical_json(report).decode("utf-8"))
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -955,6 +1035,7 @@ def main(
 
     args = _argument_parser().parse_args(argv)
     out_path = Path(args.out)
+    safe_to_write_error_report = False
     try:
         manifest_path = Path(args.manifest)
         iq_argument = Path(args.iq)
@@ -967,14 +1048,8 @@ def main(
                 if cwd_candidate.exists()
                 else manifest_path.parent / iq_argument
             )
-        protected = {
-            iq_path.resolve(strict=False),
-            manifest_path.resolve(strict=False),
-        }
-        if out_path.resolve(strict=False) in protected:
-            raise BenchmarkError(
-                "output path must not replace the IQ or manifest input"
-            )
+        _assert_output_is_not_input(out_path, iq_path, manifest_path)
+        safe_to_write_error_report = True
         manifest = load_fixture_manifest(manifest_path)
         fixture_name = iq_path.name
         try:
@@ -1001,13 +1076,17 @@ def main(
         TypeError,
         ValueError,
     ) as exc:
-        try:
-            _write_report(
-                out_path,
-                {"error": _safe_error_text(exc), "success": False},
-            )
-        except BenchmarkError:
-            pass
+        error_report = {
+            "error": _safe_error_text(exc),
+            "success": False,
+        }
+        if safe_to_write_error_report:
+            try:
+                _write_report(out_path, error_report)
+            except BenchmarkError:
+                _write_stderr_report(error_report)
+        else:
+            _write_stderr_report(error_report)
         return 2
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -903,6 +904,203 @@ def test_iq_size_limit_is_checked_before_factory(tmp_path, monkeypatch):
         )
 
     assert calls == []
+
+
+def test_working_set_budget_is_checked_before_factory(tmp_path, monkeypatch):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    calls = []
+    monkeypatch.setattr(
+        benchmark_module,
+        "MAX_BENCHMARK_WORKING_SET_BYTES",
+        31,
+    )
+
+    with pytest.raises(BenchmarkError, match="working-set budget"):
+        run_benchmark(
+            iq_path=iq_path,
+            fixture_name=iq_path.name,
+            fixture=_fixture(samples),
+            decoder_names=("upstream", "improved_v67"),
+            decoder_registry={
+                "upstream": lambda: calls.append(1),
+                "improved_v67": lambda: calls.append(2),
+            },
+            chunk_samples=1,
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("context_version", True),
+        ("receive_wall_time", 0),
+        ("decoder_id", type("Text", (str,), {})("upstream")),
+        ("profile", type("Text", (str,), {})("BLUE-L1")),
+        ("team", type("Text", (str,), {})("BLUE")),
+        ("target", type("Text", (str,), {})("L1")),
+        ("crc_mode", type("Text", (str,), {})("test-verified")),
+    ],
+)
+def test_command_scalar_fields_require_exact_types(tmp_path, field, value):
+    decoder = FakeDecoder("upstream")
+    peer = FakeDecoder("improved_v67")
+    original_decode = decoder.decode
+
+    def forged_decode(chunk, context):
+        commands = original_decode(chunk, context)
+        return [replace(commands[0], **{field: value})] if commands else []
+
+    decoder.decode = forged_decode
+
+    report = _run(tmp_path, decoder, peer)
+
+    assert report["success"] is False
+    assert report["decoders"][0]["status"] == "error"
+    assert field in report["decoders"][0]["error"]
+
+
+def test_snapshot_preserves_primary_and_close_failures(tmp_path, monkeypatch):
+    samples = _samples(1)
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+
+    class BrokenSnapshot:
+        def write(self, raw):
+            raise OSError("primary-write")
+
+        def close(self):
+            raise OSError("cleanup-close")
+
+    monkeypatch.setattr(
+        benchmark_module.tempfile,
+        "TemporaryFile",
+        lambda **kwargs: BrokenSnapshot(),
+    )
+
+    with pytest.raises(BenchmarkError) as failure:
+        with benchmark_module._verified_iq_snapshot(
+            iq_path,
+            _fixture(samples).sha256,
+            1,
+        ):
+            pytest.fail("invalid snapshot must not be yielded")
+
+    message = str(failure.value)
+    assert "primary-write" in message
+    assert "cleanup-close" in message
+
+
+@pytest.mark.parametrize("protected", ["iq", "manifest"])
+def test_cli_never_writes_error_report_over_inputs(tmp_path, protected):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({iq_path.name: _fixture_entry(samples)}),
+        encoding="utf-8",
+    )
+    before_iq = iq_path.read_bytes()
+    before_manifest = manifest_path.read_bytes()
+    out = iq_path if protected == "iq" else manifest_path
+
+    exit_code = main(
+        [
+            "--iq", str(iq_path),
+            "--manifest", str(manifest_path),
+            "--decoders", "upstream,improved_v67",
+            "--out", str(out),
+        ]
+    )
+
+    assert exit_code == 2
+    assert iq_path.read_bytes() == before_iq
+    assert manifest_path.read_bytes() == before_manifest
+
+
+def test_cli_protects_resolved_relative_input_alias(tmp_path, monkeypatch):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({iq_path.name: _fixture_entry(samples)}),
+        encoding="utf-8",
+    )
+    before = iq_path.read_bytes()
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(
+        [
+            "--iq", iq_path.name,
+            "--manifest", manifest_path.name,
+            "--decoders", "upstream,improved_v67",
+            "--out", f"./{iq_path.name}",
+        ]
+    )
+
+    assert exit_code == 2
+    assert iq_path.read_bytes() == before
+
+
+def test_cli_protects_existing_hardlink_alias(tmp_path):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    alias = tmp_path / "result.json"
+    os.link(iq_path, alias)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({iq_path.name: _fixture_entry(samples)}),
+        encoding="utf-8",
+    )
+    before = iq_path.read_bytes()
+
+    exit_code = main(
+        [
+            "--iq", str(iq_path),
+            "--manifest", str(manifest_path),
+            "--decoders", "upstream,improved_v67",
+            "--out", str(alias),
+        ]
+    )
+
+    assert exit_code == 2
+    assert iq_path.read_bytes() == before
+    assert alias.read_bytes() == before
+
+
+def test_cli_protects_symlink_alias_when_supported(tmp_path):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    alias = tmp_path / "result.json"
+    try:
+        alias.symlink_to(iq_path)
+    except OSError:
+        pytest.skip("symlink creation is not permitted")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({iq_path.name: _fixture_entry(samples)}),
+        encoding="utf-8",
+    )
+    before = iq_path.read_bytes()
+
+    exit_code = main(
+        [
+            "--iq", str(iq_path),
+            "--manifest", str(manifest_path),
+            "--decoders", "upstream,improved_v67",
+            "--out", str(alias),
+        ]
+    )
+
+    assert exit_code == 2
+    assert iq_path.read_bytes() == before
 
 
 def test_report_fsyncs_parent_directory_on_supported_platform(
