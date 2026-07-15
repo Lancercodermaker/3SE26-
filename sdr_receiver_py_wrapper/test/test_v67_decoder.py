@@ -397,6 +397,26 @@ def test_bundled_vendor_reset_removes_stale_l1_jam_rf_gate_before_l2():
     assert module.jam_rf_gate_status() == ("L2", "rf-classified")
 
 
+def test_bundled_adapter_preserves_zero_manual_info_gain():
+    adapter = ReceiverCoreAdapter()
+    module = adapter.load(allow_adi_import_stub=True)
+
+    adapter.set_manual_gain("INFO", 0)
+
+    assert module.STATE["MANUAL_RX_GAINS"]["INFO"] == 0
+    assert adapter.get_current_radio_snapshot()["rx_gain"] == 0
+
+
+def test_bundled_adapter_clamps_manual_gain_to_hardware_upper_bound():
+    adapter = ReceiverCoreAdapter()
+    module = adapter.load(allow_adi_import_stub=True)
+
+    adapter.set_manual_gain("INFO", 74)
+
+    assert module.STATE["MANUAL_RX_GAINS"]["INFO"] == 73
+    assert adapter.get_current_radio_snapshot()["rx_gain"] == 73
+
+
 def test_adapter_demodulates_copied_iq_with_temporary_profile_and_callbacks():
     module = ModuleType("fake_v67")
     module.TUNE_CFG = {"TEAM": "RED", "TARGET": "INFO"}

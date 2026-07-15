@@ -666,6 +666,13 @@ class CommonReceiverRuntime:
             ),
         }
 
+    def applied_radio_settings(self) -> dict:
+        """Return the DeviceSession's last fully successful configuration."""
+
+        if self.device is None:
+            return {}
+        return self.device.snapshot()
+
     def _run_acquisition(self) -> None:
         try:
             while not self.stop_event.is_set():
@@ -2096,6 +2103,26 @@ class SdrReceiverPyWrapperNode(Node):
         radio = self.adapter.get_current_radio_snapshot()
         own_team = self._current_own_team()
         rx_team = self._current_team()
+        rx_gain = status.get("rx_gain")
+        if self.run_mode == "competition":
+            applied = {}
+            common_runtime = getattr(self, "common_runtime", None)
+            if common_runtime is not None:
+                applied = common_runtime.applied_radio_settings()
+            config = {
+                **config,
+                "sample_rate": applied.get("sample_rate_hz"),
+            }
+            radio = {
+                **radio,
+                "rx_lo_hz": applied.get("lo_hz"),
+                "rf_bandwidth_hz": applied.get("rf_bandwidth_hz"),
+                "rx_gain": applied.get("rx_gain_db"),
+            }
+            for key in ("rx_lo_hz", "rf_bandwidth_hz", "rx_gain"):
+                if radio[key] is not None:
+                    radio[key] = int(radio[key])
+            rx_gain = radio["rx_gain"]
         return {
             **config,
             "run_mode": self.run_mode,
@@ -2110,7 +2137,7 @@ class SdrReceiverPyWrapperNode(Node):
             "radio": radio,
             "rx_lo_hz": radio.get("rx_lo_hz"),
             "rf_bandwidth_hz": radio.get("rf_bandwidth_hz"),
-            "rx_gain": status.get("rx_gain"),
+            "rx_gain": rx_gain,
             "gain_ceiling": status.get("gain_ceiling"),
             "adc_rms": status.get("adc_rms"),
             "rf_state": status.get("rf_state"),

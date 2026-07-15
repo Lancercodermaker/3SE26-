@@ -23,6 +23,7 @@ from sdr_receiver_py_wrapper.models import (
     DecoderStats,
     IqChunk,
 )
+from sdr_receiver_py_wrapper.original_receiver_adapter import ReceiverCoreAdapter
 from sdr_receiver_py_wrapper.structured_recorder import StructuredRecorder
 
 
@@ -258,6 +259,7 @@ class SettingCountingBackend(FakeBackend):
     def __init__(self, samples):
         object.__setattr__(self, "setting_writes", {})
         object.__setattr__(self, "fail_next_rx_lo", False)
+        object.__setattr__(self, "fail_next_rx_hardwaregain", False)
         super().__init__(samples)
 
     def __setattr__(self, name, value):
@@ -267,6 +269,9 @@ class SettingCountingBackend(FakeBackend):
             if name == "rx_lo" and self.fail_next_rx_lo:
                 object.__setattr__(self, "fail_next_rx_lo", False)
                 raise RuntimeError("rx_lo write failed")
+            if name == "rx_hardwaregain_chan0" and self.fail_next_rx_hardwaregain:
+                object.__setattr__(self, "fail_next_rx_hardwaregain", False)
+                raise RuntimeError("receiver gain write failed")
         object.__setattr__(self, name, value)
 
 
@@ -281,6 +286,43 @@ def radio_settings(*, gain=20):
 
 def read_json_lines(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def make_summary_node(
+    receiver_node_module,
+    *,
+    vendor_gain,
+    vendor_sample_rate=2_000_000,
+    vendor_lo_hz=2_400_000_000,
+    vendor_rf_bandwidth_hz=1_500_000,
+):
+    node = object.__new__(receiver_node_module.SdrReceiverPyWrapperNode)
+    node.run_mode = "competition"
+    node.common_runtime = None
+    node.adapter = SimpleNamespace(
+        get_stats_snapshot=lambda: {
+            "team": "RED",
+            "target": "INFO",
+            "rx_gain": vendor_gain,
+            "gain_ceiling": vendor_gain,
+        },
+        get_core_config_snapshot=lambda: {"sample_rate": vendor_sample_rate},
+        get_current_radio_snapshot=lambda: {
+            "team": "RED",
+            "target": "INFO",
+            "rx_lo_hz": vendor_lo_hz,
+            "rf_bandwidth_hz": vendor_rf_bandwidth_hz,
+            "rx_gain": vendor_gain,
+        },
+    )
+    node.context_arbiter = SimpleNamespace(context_version=12)
+    node.profile_config = {}
+    node.get_parameter = lambda name: SimpleNamespace(
+        value={"profile_path": "", "iq_source_sample_rate": 0}[name]
+    )
+    node._current_own_team = lambda: "BLUE"
+    node._current_team = lambda: "RED"
+    return node
 
 
 def test_common_runtime_single_step_uses_real_device_acquisition_and_pipeline(
@@ -345,6 +387,195 @@ def test_common_runtime_single_step_uses_real_device_acquisition_and_pipeline(
     assert rf_event["profile"] == "competition"
     assert rf_event["adc_code_scale"] == 2048.0
     assert rf_event["rf_clipping_ratio"] == 0.001
+
+
+def test_bundled_adapter_gain_changes_follow_production_common_settings(
+    receiver_node_module,
+    tmp_path,
+):
+    adapter = ReceiverCoreAdapter()
+    adapter.load(allow_adi_import_stub=True)
+    adapter.set_manual_gain("INFO", 0)
+    node = make_summary_node(receiver_node_module, vendor_gain=61)
+    node.adapter = adapter
+    node.foundation_config = receiver_node_module.ReceiverFoundationConfig(
+        initial_rx_gain=0
+    )
+    recorder = StructuredRecorder(
+        tmp_path,
+        "production-gain-transitions",
+        summary_metadata_provider=node._iq_record_metadata,
+    )
+    backend = FakeBackend(np.ones(2, dtype=np.complex64))
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=node.foundation_config,
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=recorder,
+        context_provider=make_context,
+        radio_settings_provider=node._common_radio_settings,
+    )
+    node.common_runtime = runtime
+
+    try:
+        zero = runtime.process_once()
+        assert zero.chunk.rx_gain_db == 0
+        assert backend.rx_hardwaregain_chan0 == 0
+        assert node._iq_record_metadata()["rx_gain"] == 0
+
+        adapter.set_manual_gain("INFO", 10)
+        nonzero = runtime.process_once()
+        assert nonzero.chunk.rx_gain_db == 10
+        assert backend.rx_hardwaregain_chan0 == 10
+        assert node._iq_record_metadata()["rx_gain"] == 10
+
+        adapter.set_manual_gain("INFO", 74)
+        clamped = runtime.process_once()
+    finally:
+        runtime.close()
+
+    summary = json.loads(recorder.summary_path.read_text(encoding="utf-8"))
+    assert clamped.chunk.rx_gain_db == 73
+    assert backend.rx_hardwaregain_chan0 == 73
+    assert runtime.device.snapshot()["rx_gain_db"] == 73
+    assert summary["rx_gain"] == 73
+    assert summary["radio"]["rx_gain"] == 73
+
+
+@pytest.mark.parametrize(
+    ("applied_gain", "vendor_gain"),
+    [(0, 61), (10, 61), (73, 99)],
+    ids=["zero", "nonzero", "clamped-upper-bound"],
+)
+def test_competition_summary_uses_successfully_applied_device_gain(
+    receiver_node_module,
+    tmp_path,
+    applied_gain,
+    vendor_gain,
+):
+    node = make_summary_node(
+        receiver_node_module,
+        vendor_gain=vendor_gain,
+        vendor_sample_rate=3_000_000,
+    )
+    recorder = StructuredRecorder(
+        tmp_path,
+        f"applied-{applied_gain}",
+        summary_metadata_provider=node._iq_record_metadata,
+    )
+    backend = FakeBackend(np.ones(2, dtype=np.complex64))
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=receiver_node_module.ReceiverFoundationConfig(
+            initial_rx_gain=applied_gain
+        ),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=recorder,
+        context_provider=make_context,
+        radio_settings_provider=lambda: radio_settings(gain=applied_gain),
+    )
+    node.common_runtime = runtime
+
+    try:
+        runtime.process_once()
+    finally:
+        runtime.close()
+
+    summary = json.loads(recorder.summary_path.read_text(encoding="utf-8"))
+    assert backend.rx_hardwaregain_chan0 == applied_gain
+    assert runtime.device.snapshot()["rx_gain_db"] == applied_gain
+    assert summary["sample_rate"] == 2_000_000
+    assert summary["rx_gain"] == applied_gain
+
+
+def test_competition_summary_does_not_publish_failed_gain_configuration(
+    receiver_node_module,
+    tmp_path,
+):
+    requested_settings = radio_settings(gain=5)
+    node = make_summary_node(
+        receiver_node_module,
+        vendor_gain=10,
+        vendor_sample_rate=1_000_000,
+        vendor_lo_hz=2_500_000_000,
+        vendor_rf_bandwidth_hz=1_700_000,
+    )
+    recorder = StructuredRecorder(
+        tmp_path,
+        "failed-config",
+        summary_metadata_provider=node._iq_record_metadata,
+    )
+    backend = SettingCountingBackend(np.ones(2, dtype=np.complex64))
+    runtime = receiver_node_module.CommonReceiverRuntime(
+        backend_factory=lambda: backend,
+        config=receiver_node_module.ReceiverFoundationConfig(initial_rx_gain=5),
+        primary=RecordingDecoder("improved_v67"),
+        output=FakeOutput("improved_v67"),
+        recorder=recorder,
+        context_provider=make_context,
+        radio_settings_provider=lambda: requested_settings,
+    )
+    node.common_runtime = runtime
+    requested_settings = {
+        **radio_settings(gain=10),
+        "sample_rate_hz": 1_000_000,
+        "lo_hz": 2_500_000_000,
+        "rf_bandwidth_hz": 1_700_000,
+    }
+    backend.fail_next_rx_hardwaregain = True
+
+    with pytest.raises(RuntimeError, match="failed to configure receiver"):
+        runtime.acquire_once()
+    runtime.close()
+
+    summary = json.loads(recorder.summary_path.read_text(encoding="utf-8"))
+    assert runtime.device.snapshot()["rx_gain_db"] == 5
+    assert summary["sample_rate"] == 2_000_000
+    assert summary["rx_gain"] == 5
+    assert summary["radio"]["rx_gain"] == 5
+    assert summary["rx_lo_hz"] == 2_400_000_000
+    assert summary["radio"]["rx_lo_hz"] == 2_400_000_000
+    assert summary["rf_bandwidth_hz"] == 1_500_000
+    assert summary["radio"]["rf_bandwidth_hz"] == 1_500_000
+
+
+def test_competition_summary_has_no_gain_before_any_device_config_succeeds(
+    receiver_node_module,
+):
+    node = make_summary_node(receiver_node_module, vendor_gain=10)
+
+    metadata = node._iq_record_metadata()
+
+    assert metadata["sample_rate"] is None
+    assert metadata["rx_gain"] is None
+    assert metadata["rx_lo_hz"] is None
+    assert metadata["rf_bandwidth_hz"] is None
+    assert metadata["radio"]["rx_gain"] is None
+    assert metadata["radio"]["rx_lo_hz"] is None
+    assert metadata["radio"]["rf_bandwidth_hz"] is None
+
+
+def test_debug_summary_keeps_legacy_vendor_gain_source(
+    receiver_node_module,
+    tmp_path,
+):
+    node = make_summary_node(receiver_node_module, vendor_gain=17)
+    node.run_mode = "debug"
+    node.common_runtime = SimpleNamespace(
+        applied_radio_settings=lambda: {"rx_gain_db": 0}
+    )
+    recorder = StructuredRecorder(
+        tmp_path,
+        "legacy-debug",
+        summary_metadata_provider=node._iq_record_metadata,
+    )
+
+    recorder.close()
+
+    summary = json.loads(recorder.summary_path.read_text(encoding="utf-8"))
+    assert summary["rx_gain"] == 17
 
 
 def test_common_runtime_worker_stops_and_exposes_failure(receiver_node_module):
