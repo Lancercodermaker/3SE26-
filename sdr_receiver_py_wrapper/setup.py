@@ -35,6 +35,7 @@ setup(
             "adaptive_profile_sweep = sdr_receiver_py_wrapper.adaptive_profile_sweep:main",
             "sdr_receiver_py_wrapper_node = sdr_receiver_py_wrapper.receiver_node:main",
             "direct_original_receiver = sdr_receiver_py_wrapper.direct_original_receiver:main",
+            "decoder_benchmark = sdr_receiver_py_wrapper.decoder_benchmark:main",
             "mock_radar_context_publisher = sdr_receiver_py_wrapper.mock_radar_context_publisher:main",
             "rf_iq_diff_capture = sdr_receiver_py_wrapper.rf_iq_diff_capture:main",
             "rf_power_scan = sdr_receiver_py_wrapper.rf_power_scan:main",
