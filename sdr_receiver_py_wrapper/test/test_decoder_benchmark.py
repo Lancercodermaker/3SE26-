@@ -183,6 +183,49 @@ def test_mismatched_or_duplicate_oracle_results_fail_without_fake_success(
     assert by_name["improved_v67"]["status"] == "mismatch"
     assert by_name["upstream"]["oracle_matches"] == 0
     assert by_name["improved_v67"]["oracle_matches"] == 2
+    assert by_name["upstream"]["expected_cmd_conflicts"] == 1
+    assert by_name["improved_v67"]["expected_cmd_conflicts"] == 0
+    assert by_name["upstream"]["mismatch_reasons"] == [
+        "oracle_match_count",
+        "expected_cmd_conflict",
+    ]
+    assert by_name["improved_v67"]["mismatch_reasons"] == [
+        "oracle_match_count"
+    ]
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [
+        (EXPECTED_KEY, b"WRONG1"),
+        (b"WRONG1", EXPECTED_KEY),
+    ],
+)
+def test_correct_key_plus_conflicting_expected_command_never_passes(
+    tmp_path,
+    payloads,
+):
+    conflicted = FakeDecoder("upstream")
+    peer = FakeDecoder("improved_v67")
+    original_decode = conflicted.decode
+
+    def decode_conflict(chunk, context):
+        commands = original_decode(chunk, context)
+        if not commands:
+            return []
+        return [replace(commands[0], payload=payload) for payload in payloads]
+
+    conflicted.decode = decode_conflict
+
+    report = _run(tmp_path, conflicted, peer)
+
+    result = report["decoders"][0]
+    assert report["success"] is False
+    assert result["status"] == "mismatch"
+    assert result["expected_cmd_outputs"] == 2
+    assert result["oracle_matches"] == 1
+    assert result["expected_cmd_conflicts"] == 1
+    assert result["mismatch_reasons"] == ["expected_cmd_conflict"]
 
 
 def test_diagnostics_are_explicitly_unavailable_not_invented(tmp_path):
@@ -236,22 +279,63 @@ def test_plugin_command_contract_is_bounded_and_exact(tmp_path, bad_result):
     assert report["decoders"][0]["status"] == "error"
 
 
-def test_command_metadata_and_crc_claims_must_be_consistent(tmp_path):
+@pytest.mark.parametrize("crc_field", ["crc8_ok", "crc16_ok"])
+def test_expected_payload_with_failed_crc_is_an_oracle_conflict(
+    tmp_path,
+    crc_field,
+):
     broken = FakeDecoder("upstream")
     peer = FakeDecoder("improved_v67")
     original_decode = broken.decode
 
     def invalid_metadata(chunk, context):
         commands = original_decode(chunk, context)
-        return [replace(commands[0], crc16_ok=False)] if commands else []
+        return [replace(commands[0], **{crc_field: False})] if commands else []
 
     broken.decode = invalid_metadata
 
     report = _run(tmp_path, broken, peer)
 
     assert report["success"] is False
-    assert report["decoders"][0]["status"] == "error"
-    assert "crc16_ok" in report["decoders"][0]["error"]
+    result = report["decoders"][0]
+    assert result["status"] == "mismatch"
+    assert result["oracle_matches"] == 0
+    assert result["expected_cmd_conflicts"] == 1
+    assert result["mismatch_reasons"] == [
+        "oracle_match_count",
+        "expected_cmd_conflict",
+    ]
+
+
+def test_unrelated_diagnostic_commands_do_not_conflict_with_oracle(tmp_path):
+    decoder = FakeDecoder("upstream")
+    peer = FakeDecoder("improved_v67")
+    original_decode = decoder.decode
+
+    def decode_with_diagnostic(chunk, context):
+        commands = original_decode(chunk, context)
+        if not commands:
+            return []
+        diagnostic = replace(
+            commands[0],
+            cmd_id=0x0100,
+            payload=b"diagnostic",
+            crc8_ok=False,
+            crc16_ok=False,
+        )
+        return [diagnostic, commands[0]]
+
+    decoder.decode = decode_with_diagnostic
+
+    report = _run(tmp_path, decoder, peer)
+
+    result = report["decoders"][0]
+    assert report["success"] is True
+    assert result["status"] == "passed"
+    assert result["expected_cmd_outputs"] == 1
+    assert result["oracle_matches"] == 1
+    assert result["expected_cmd_conflicts"] == 0
+    assert result["mismatch_reasons"] == []
 
 
 def test_rejects_unconfirmed_hash_mismatch_and_misaligned_iq(tmp_path):
@@ -391,6 +475,69 @@ def test_cli_writes_deterministic_json_and_returns_nonzero_on_mismatch(
     assert raw == json.dumps(
         json.loads(raw), sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode() + b"\n"
+
+
+def test_cli_returns_nonzero_when_correct_key_has_expected_cmd_conflict(
+    tmp_path,
+):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "RX_BLUE_ganrao_1": {
+                    "format": "complex64-le",
+                    "sample_rate_hz": 4,
+                    "team": "BLUE",
+                    "target": "L1",
+                    "verification": "confirmed",
+                    "sha256": _fixture(samples).sha256,
+                    "expected_cmd_id": 0x0A06,
+                    "expected_ascii": "fcYqTC",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "result.json"
+    conflicted = FakeDecoder("upstream")
+    original_decode = conflicted.decode
+
+    def decode_conflict(chunk, context):
+        commands = original_decode(chunk, context)
+        if not commands:
+            return []
+        return [commands[0], replace(commands[0], payload=b"WRONG1")]
+
+    conflicted.decode = decode_conflict
+    registry = {
+        "upstream": lambda: conflicted,
+        "improved_v67": lambda: FakeDecoder("improved_v67"),
+    }
+
+    exit_code = main(
+        [
+            "--iq",
+            str(iq_path),
+            "--manifest",
+            str(manifest_path),
+            "--decoders",
+            "upstream,improved_v67",
+            "--out",
+            str(out_path),
+            "--chunk-samples",
+            "4",
+        ],
+        decoder_registry=registry,
+        cpu_clock_ns=iter(range(0, 1_000_000, 10)).__next__,
+    )
+
+    assert exit_code == 1
+    report = json.loads(out_path.read_text(encoding="utf-8"))
+    assert report["success"] is False
+    assert report["decoders"][0]["expected_cmd_conflicts"] == 1
 
 
 def test_default_cli_does_not_pretend_missing_production_backends_work(

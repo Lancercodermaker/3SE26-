@@ -92,6 +92,8 @@ class _DecoderRun:
     queue: deque[tuple[IqChunk, DecodeContext]] = field(default_factory=deque)
     peak_queue_depth: int = 0
     cpu_time_ns: int = 0
+    expected_cmd_outputs: int = 0
+    expected_cmd_conflicts: int = 0
     oracle_matches: int = 0
     first_key_time_s: float | None = None
     error: str | None = None
@@ -446,15 +448,21 @@ def _consume_commands(
         )
     for command in commands:
         _validate_command(command, run, chunk, context)
-        if (
-            command.cmd_id == fixture.expected_cmd_id
-            and command.payload == expected_payload
-        ):
-            run.oracle_matches += 1
-            if run.first_key_time_s is None:
-                run.first_key_time_s = (
-                    command.first_sample_index / fixture.sample_rate_hz
-                )
+        if command.cmd_id == fixture.expected_cmd_id:
+            run.expected_cmd_outputs += 1
+            oracle_match = (
+                command.payload == expected_payload
+                and command.crc8_ok is True
+                and command.crc16_ok is True
+            )
+            if oracle_match:
+                run.oracle_matches += 1
+                if run.first_key_time_s is None:
+                    run.first_key_time_s = (
+                        command.first_sample_index / fixture.sample_rate_hz
+                    )
+            else:
+                run.expected_cmd_conflicts += 1
 
 
 def _validate_command(
@@ -483,10 +491,10 @@ def _validate_command(
         raise ValueError(
             "command context_version does not match benchmark context"
         )
-    if type(command.crc8_ok) is not bool or command.crc8_ok is not True:
-        raise ValueError("command crc8_ok must be exact True")
-    if type(command.crc16_ok) is not bool or command.crc16_ok is not True:
-        raise ValueError("command crc16_ok must be exact True")
+    if type(command.crc8_ok) is not bool:
+        raise ValueError("command crc8_ok must be an exact bool")
+    if type(command.crc16_ok) is not bool:
+        raise ValueError("command crc16_ok must be an exact bool")
     if type(command.crc_mode) is not str or not command.crc_mode:
         raise ValueError("command crc_mode must be a nonempty exact str")
     chunk_last = chunk.first_sample_index + len(chunk.samples) - 1
@@ -540,9 +548,14 @@ def _collect_diagnostics(run: _DecoderRun) -> None:
 
 def _result(run: _DecoderRun) -> dict[str, object]:
     diagnostics = run.diagnostics
+    mismatch_reasons = []
+    if run.oracle_matches != 1:
+        mismatch_reasons.append("oracle_match_count")
+    if run.expected_cmd_conflicts != 0:
+        mismatch_reasons.append("expected_cmd_conflict")
     if run.error is not None:
         status = "error"
-    elif run.oracle_matches == 1:
+    elif not mismatch_reasons:
         status = "passed"
     else:
         status = "mismatch"
@@ -554,7 +567,10 @@ def _result(run: _DecoderRun) -> dict[str, object]:
         "decoder": run.name,
         "decoder_id": run.decoder_id,
         "diagnostics_status": run.diagnostics_status,
+        "expected_cmd_conflicts": run.expected_cmd_conflicts,
+        "expected_cmd_outputs": run.expected_cmd_outputs,
         "first_key_time_s": run.first_key_time_s,
+        "mismatch_reasons": mismatch_reasons,
         "oracle_matches": run.oracle_matches,
         "peak_queue_depth": run.peak_queue_depth,
         "sof": None if diagnostics is None else diagnostics.sof,
