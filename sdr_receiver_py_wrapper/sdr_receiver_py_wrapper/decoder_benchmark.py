@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -432,8 +433,11 @@ def _verified_iq_snapshot(
             )
         snapshot.flush()
         snapshot.seek(0)
-    except Exception as primary:
+    except BaseException as primary:
         cleanup = _close_snapshot_error(snapshot)
+        if isinstance(primary, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            _attach_cleanup_failure(primary, cleanup)
+            raise
         if isinstance(primary, BenchmarkError):
             primary_text = _safe_error_text(primary)
         else:
@@ -445,8 +449,11 @@ def _verified_iq_snapshot(
         raise BenchmarkError(primary_text) from None
     try:
         yield snapshot, actual, opened.st_size // _BYTES_PER_COMPLEX64
-    except Exception as primary:
+    except BaseException as primary:
         cleanup = _close_snapshot_error(snapshot)
+        if isinstance(primary, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            _attach_cleanup_failure(primary, cleanup)
+            raise
         if cleanup is not None:
             raise BenchmarkError(
                 f"{_safe_error_text(primary)}; cleanup failure: {cleanup}"
@@ -468,6 +475,20 @@ def _close_snapshot_error(snapshot) -> str | None:
     except OSError as exc:
         return _safe_error_text(exc)
     return None
+
+
+def _attach_cleanup_failure(
+    primary: BaseException,
+    cleanup: str | None,
+) -> None:
+    if cleanup is None:
+        return
+    note = f"private IQ snapshot cleanup failure: {cleanup}"
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+    else:
+        primary.args = (*primary.args, note)
 
 
 def _validate_open_file(file_stat: os.stat_result, path: Path) -> None:
@@ -915,52 +936,6 @@ def _canonical_json(report: Mapping[str, object]) -> bytes:
         ) from None
 
 
-def _write_report(path: Path, report: Mapping[str, object]) -> None:
-    encoded = _canonical_json(report)
-    parent = path.parent
-    if not parent.is_dir():
-        raise BenchmarkError("output parent directory does not exist")
-    temporary: str | None = None
-    try:
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}.",
-            dir=parent,
-        )
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        temporary = None
-        if _supports_directory_fsync():
-            _fsync_directory(parent)
-    except OSError as exc:
-        raise BenchmarkError(
-            f"cannot write benchmark report: {_safe_error_text(exc)}"
-        ) from None
-    finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-
-
-def _supports_directory_fsync() -> bool:
-    return os.name == "posix" and hasattr(os, "O_DIRECTORY")
-
-
-def _fsync_directory(parent: Path) -> None:
-    descriptor = os.open(
-        parent,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _parse_decoder_names(raw: str) -> tuple[str, ...]:
     names = tuple(raw.split(","))
     if any(not name or name != name.strip() for name in names):
@@ -1025,6 +1000,289 @@ def _write_stderr_report(report: Mapping[str, object]) -> None:
         pass
 
 
+def _path_identity(path: Path) -> tuple[int, int]:
+    file_stat = os.stat(path, follow_symlinks=True)
+    return file_stat.st_dev, file_stat.st_ino
+
+
+def _reject_parent_links(parent: Path) -> Path:
+    absolute = Path(os.path.abspath(parent))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        info = os.lstat(current)
+        attributes = getattr(info, "st_file_attributes", 0)
+        if stat.S_ISLNK(info.st_mode) or attributes & 0x400:
+            raise BenchmarkError(
+                "output parent chain must not contain symlink/reparse points"
+            )
+    try:
+        canonical = absolute.resolve(strict=True)
+    except OSError as exc:
+        raise BenchmarkError(
+            "cannot resolve output parent: " + _safe_error_text(exc)
+        ) from None
+    if not canonical.is_dir():
+        raise BenchmarkError("output parent directory does not exist")
+    return canonical
+
+
+class _StableOutputTransaction:
+    def __init__(
+        self,
+        out_path: Path,
+        protected_paths: tuple[Path, Path],
+    ) -> None:
+        if out_path.name in ("", ".", ".."):
+            raise BenchmarkError("output path must contain a file name")
+        self._parent = _reject_parent_links(out_path.parent)
+        self._name = out_path.name
+        try:
+            self._protected = {
+                _path_identity(path) for path in protected_paths
+            }
+        except OSError as exc:
+            raise BenchmarkError(
+                "cannot capture protected input identity: "
+                f"{_safe_error_text(exc)}"
+            ) from None
+        self._dir_fd: int | None = None
+        self._windows_handle = None
+        self._parent_identity: tuple[int, int] | None = None
+        self._committed = False
+
+    def __enter__(self):
+        if os.name == "posix":
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                self._dir_fd = os.open(self._parent, flags)
+                opened = os.fstat(self._dir_fd)
+                self._parent_identity = (opened.st_dev, opened.st_ino)
+            except OSError as exc:
+                self.close()
+                raise BenchmarkError(
+                    "cannot pin output parent directory: "
+                    f"{_safe_error_text(exc)}"
+                ) from None
+        elif os.name == "nt":
+            self._windows_handle, self._parent_identity = (
+                _open_windows_directory(self._parent)
+            )
+        else:
+            raise BenchmarkError(
+                "stable output transactions are unsupported on this platform"
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._dir_fd is not None:
+            descriptor, self._dir_fd = self._dir_fd, None
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if self._windows_handle is not None:
+            handle, self._windows_handle = self._windows_handle, None
+            _close_windows_handle(handle)
+
+    def write(self, report: Mapping[str, object]) -> None:
+        if self._committed:
+            raise BenchmarkError("output transaction is already committed")
+        encoded = _canonical_json(report)
+        if os.name == "posix":
+            self._write_posix(encoded)
+        elif os.name == "nt":
+            self._write_windows(encoded)
+        else:
+            raise BenchmarkError(
+                "stable output transaction became unavailable"
+            )
+        self._committed = True
+
+    def _write_posix(self, encoded: bytes) -> None:
+        assert self._dir_fd is not None
+        opened = os.fstat(self._dir_fd)
+        if (opened.st_dev, opened.st_ino) != self._parent_identity:
+            raise BenchmarkError("pinned output parent identity changed")
+        self._check_posix_target()
+        temporary = f".{self._name}.{secrets.token_hex(12)}"
+        descriptor = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=self._dir_fd,
+            )
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short output transaction write")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            self._check_posix_target()
+            os.replace(
+                temporary,
+                self._name,
+                src_dir_fd=self._dir_fd,
+                dst_dir_fd=self._dir_fd,
+            )
+            temporary = ""
+            os.fsync(self._dir_fd)
+        except OSError as exc:
+            raise BenchmarkError(
+                "cannot commit stable output transaction: "
+                f"{_safe_error_text(exc)}"
+            ) from None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary:
+                try:
+                    os.unlink(temporary, dir_fd=self._dir_fd)
+                except OSError:
+                    pass
+
+    def _check_posix_target(self) -> None:
+        assert self._dir_fd is not None
+        try:
+            target = os.stat(
+                self._name,
+                dir_fd=self._dir_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(target.st_mode):
+            raise BenchmarkError("output target must not be a symlink")
+        if (target.st_dev, target.st_ino) in self._protected:
+            raise BenchmarkError("output target aliases a protected input")
+
+    def _write_windows(self, encoded: bytes) -> None:
+        assert self._windows_handle is not None
+        current_handle, current_identity = _open_windows_directory(
+            self._parent
+        )
+        _close_windows_handle(current_handle)
+        if current_identity != self._parent_identity:
+            raise BenchmarkError("pinned output parent identity changed")
+        target = self._parent / self._name
+        if target.exists() and _path_identity(target) in self._protected:
+            raise BenchmarkError("output target aliases a protected input")
+        try:
+            target_info = os.lstat(target)
+        except FileNotFoundError:
+            target_info = None
+        if target_info is not None and (
+            stat.S_ISLNK(target_info.st_mode)
+            or getattr(target_info, "st_file_attributes", 0) & 0x400
+        ):
+            raise BenchmarkError("output target must not be a reparse point")
+        temporary = None
+        try:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{self._name}.",
+                dir=self._parent,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if target.exists() and _path_identity(target) in self._protected:
+                raise BenchmarkError("output target aliases a protected input")
+            os.replace(temporary, target)
+            temporary = None
+        except OSError as exc:
+            raise BenchmarkError(
+                "cannot commit stable output transaction: "
+                f"{_safe_error_text(exc)}"
+            ) from None
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+
+def _open_windows_directory(parent: Path):
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception as exc:
+        raise BenchmarkError(
+            "Windows stable output capability is unavailable: "
+            f"{_safe_error_text(exc)}"
+        ) from None
+
+    class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(parent),
+        0x80000000,
+        0x00000001 | 0x00000002,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if handle == invalid:
+        raise BenchmarkError(
+            "cannot pin Windows output parent: "
+            f"winerror={ctypes.get_last_error()}"
+        )
+    information = BY_HANDLE_FILE_INFORMATION()
+    if not kernel32.GetFileInformationByHandle(
+        handle,
+        ctypes.byref(information),
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        raise BenchmarkError(
+            f"cannot identify Windows output parent: winerror={error}"
+        )
+    if information.dwFileAttributes & 0x400:
+        kernel32.CloseHandle(handle)
+        raise BenchmarkError("Windows output parent is a reparse point")
+    identity = (
+        information.dwVolumeSerialNumber,
+        (information.nFileIndexHigh << 32) | information.nFileIndexLow,
+    )
+    return handle, identity
+
+
+def _close_windows_handle(handle) -> None:
+    import ctypes
+
+    ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -1035,7 +1293,6 @@ def main(
 
     args = _argument_parser().parse_args(argv)
     out_path = Path(args.out)
-    safe_to_write_error_report = False
     try:
         manifest_path = Path(args.manifest)
         iq_argument = Path(args.iq)
@@ -1049,26 +1306,45 @@ def main(
                 else manifest_path.parent / iq_argument
             )
         _assert_output_is_not_input(out_path, iq_path, manifest_path)
-        safe_to_write_error_report = True
-        manifest = load_fixture_manifest(manifest_path)
-        fixture_name = iq_path.name
-        try:
-            fixture = manifest[fixture_name]
-        except KeyError:
-            raise BenchmarkError(
-                "IQ basename is not an exact fixture name in the manifest"
-            ) from None
-        report = run_benchmark(
-            iq_path=iq_path,
-            fixture_name=fixture_name,
-            fixture=fixture,
-            decoder_names=_parse_decoder_names(args.decoders),
-            decoder_registry=decoder_registry,
-            chunk_samples=args.chunk_samples,
-            cpu_clock_ns=cpu_clock_ns,
-        )
-        _write_report(out_path, report)
-        return 0 if report["success"] is True else 1
+        with _StableOutputTransaction(
+            out_path,
+            (iq_path, manifest_path),
+        ) as output_transaction:
+            try:
+                manifest = load_fixture_manifest(manifest_path)
+                fixture_name = iq_path.name
+                try:
+                    fixture = manifest[fixture_name]
+                except KeyError:
+                    raise BenchmarkError(
+                        "IQ basename is not an exact fixture name in the "
+                        "manifest"
+                    ) from None
+                report = run_benchmark(
+                    iq_path=iq_path,
+                    fixture_name=fixture_name,
+                    fixture=fixture,
+                    decoder_names=_parse_decoder_names(args.decoders),
+                    decoder_registry=decoder_registry,
+                    chunk_samples=args.chunk_samples,
+                    cpu_clock_ns=cpu_clock_ns,
+                )
+            except (
+                BenchmarkError,
+                FixtureManifestError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                output_transaction.write(
+                    {
+                        "error": _safe_error_text(exc),
+                        "success": False,
+                    }
+                )
+                return 2
+            output_transaction.write(report)
+            return 0 if report["success"] is True else 1
     except (
         BenchmarkError,
         FixtureManifestError,
@@ -1080,13 +1356,7 @@ def main(
             "error": _safe_error_text(exc),
             "success": False,
         }
-        if safe_to_write_error_report:
-            try:
-                _write_report(out_path, error_report)
-            except BenchmarkError:
-                _write_stderr_report(error_report)
-        else:
-            _write_stderr_report(error_report)
+        _write_stderr_report(error_report)
         return 2
 
 

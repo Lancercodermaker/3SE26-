@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tempfile
 
 import numpy as np
 import pytest
@@ -1103,26 +1104,107 @@ def test_cli_protects_symlink_alias_when_supported(tmp_path):
     assert iq_path.read_bytes() == before
 
 
-def test_report_fsyncs_parent_directory_on_supported_platform(
+@pytest.mark.parametrize("factory_fails", [False, True])
+def test_output_transaction_survives_provider_parent_redirection(
+    tmp_path,
+    factory_fails,
+):
+    samples = _samples()
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    iq_path = inputs / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    manifest_path = inputs / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({iq_path.name: _fixture_entry(samples)}),
+        encoding="utf-8",
+    )
+    safe_parent = tmp_path / "safe"
+    safe_parent.mkdir()
+    moved_parent = tmp_path / "safe-pinned"
+    out_path = safe_parent / "result.json"
+    before_iq = iq_path.read_bytes()
+    before_manifest = manifest_path.read_bytes()
+    first = FakeDecoder("upstream")
+
+    def redirecting_factory():
+        try:
+            safe_parent.rename(moved_parent)
+            safe_parent.symlink_to(inputs, target_is_directory=True)
+        except OSError:
+            # Windows parent HANDLE intentionally blocks rename/reparse swap.
+            pass
+        if factory_fails:
+            raise RuntimeError("provider failed after redirection attempt")
+        return first
+
+    exit_code = main(
+        [
+            "--iq", str(iq_path),
+            "--manifest", str(manifest_path),
+            "--decoders", "upstream,improved_v67",
+            "--out", str(out_path),
+            "--chunk-samples", "4",
+        ],
+        decoder_registry={
+            "upstream": redirecting_factory,
+            "improved_v67": lambda: FakeDecoder("improved_v67"),
+        },
+        cpu_clock_ns=iter(range(0, 1_000_000, 10)).__next__,
+    )
+
+    assert iq_path.read_bytes() == before_iq
+    assert manifest_path.read_bytes() == before_manifest
+    fixed_report = moved_parent / "result.json"
+    report_path = fixed_report if fixed_report.exists() else out_path
+    assert report_path.is_file()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == (1 if factory_fails else 0)
+    assert report["success"] is (not factory_fails)
+
+
+@pytest.mark.parametrize("cancel_type", [KeyboardInterrupt, SystemExit])
+def test_snapshot_closes_and_preserves_cancellation(
     tmp_path,
     monkeypatch,
+    cancel_type,
 ):
-    calls = []
-    monkeypatch.setattr(
-        benchmark_module,
-        "_supports_directory_fsync",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        benchmark_module,
-        "_fsync_directory",
-        lambda parent: calls.append(parent),
-    )
-    out = tmp_path / "report.json"
+    samples = _samples(1)
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    real_temporary_file = tempfile.TemporaryFile
+    closed = []
 
-    benchmark_module._write_report(out, {"success": False})
+    class Snapshot:
+        def __init__(self):
+            self._stream = real_temporary_file(mode="w+b")
 
-    assert calls == [tmp_path]
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+        def close(self):
+            self._stream.close()
+            closed.append(True)
+            raise OSError("cancel-cleanup")
+
+    monkeypatch.setattr(
+        benchmark_module.tempfile,
+        "TemporaryFile",
+        lambda **kwargs: Snapshot(),
+    )
+    cancellation = cancel_type("cancel-now")
+
+    with pytest.raises(cancel_type) as raised:
+        with benchmark_module._verified_iq_snapshot(
+            iq_path,
+            _fixture(samples).sha256,
+            1,
+        ):
+            raise cancellation
+
+    assert raised.value is cancellation
+    assert closed == [True]
+    assert "cancel-cleanup" in repr(raised.value.args)
 
 
 def test_setup_registers_decoder_benchmark_console_script():
