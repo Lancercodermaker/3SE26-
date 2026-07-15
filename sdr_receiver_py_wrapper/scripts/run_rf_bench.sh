@@ -10,6 +10,7 @@ readonly IQ_BYTES_PER_SAMPLE="8"
 readonly IQ_WINDOW_HEADROOM_RATIO="1.10"
 readonly IQ_WINDOW_METADATA_HEADROOM_BYTES="67108864"
 readonly DISK_RUN_HEADROOM_BYTES="1073741824"
+readonly MAX_COVERAGE_TOLERANCE_SEC="1.0"
 readonly CONFIRMED_L1_SHA256="8cde16d3fe8230334a9efcb36c81ae105b76b4118f4fe3fc63943aeb791be7cc"
 
 readonly -a COMBINATION_IDS=(
@@ -55,6 +56,7 @@ CLIPPING_THRESHOLD="0.001"
 ALLOW_SHORT_DURATION=false
 CURRENT_PGID=""
 CURRENT_COLLECTOR_PID=""
+RADAR_LOG_FD=""
 RESULTS_JSONL=""
 AUDIT_JSONL=""
 RUN_ELIGIBLE=true
@@ -490,6 +492,7 @@ cleanup() {
       kill -KILL -- "-$CURRENT_PGID" 2>/dev/null || true
     wait "$CURRENT_PGID" 2>/dev/null || true
   fi
+  close_radar_log_fd
   exit "$exit_code"
 }
 
@@ -507,6 +510,13 @@ stop_launch() {
   fi
   wait "$pid" 2>/dev/null || true
   CURRENT_PGID=""
+}
+
+close_radar_log_fd() {
+  if [[ -n "$RADAR_LOG_FD" ]]; then
+    exec {RADAR_LOG_FD}<&-
+    RADAR_LOG_FD=""
+  fi
 }
 
 collect_status() {
@@ -600,13 +610,13 @@ while not records:
         raise SystemExit(f"invalid /sdr/status message: {exc}") from None
     records.append((time.monotonic_ns(), status))
 
-start = time.monotonic()
-deadline = start + duration
+window_start_ns = records[0][0]
+deadline_ns = window_start_ns + math.ceil(duration * 1_000_000_000)
 maximum_records = max(100, int(math.ceil(duration * 10)) + 100)
-while time.monotonic() < deadline:
+while time.monotonic_ns() < deadline_ns:
     if len(records) >= maximum_records:
         raise SystemExit("status message resource limit exceeded")
-    remaining = deadline - time.monotonic()
+    remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
     try:
         status = receive_one(max(0.05, min(10.0, remaining)))
     except subprocess.TimeoutExpired:
@@ -614,16 +624,28 @@ while time.monotonic() < deadline:
     except (RuntimeError, json.JSONDecodeError, yaml.YAMLError) as exc:
         raise SystemExit(f"invalid /sdr/status message: {exc}") from None
     records.append((time.monotonic_ns(), status))
-    common_runtime = status.get("common_runtime")
-    if isinstance(common_runtime, dict) and common_runtime.get("rf_state") == "clipped":
-        break
 
 if not records:
     raise SystemExit("no /sdr/status snapshots")
+window_end_ns = time.monotonic_ns()
 with open(path, "x", encoding="utf-8") as handle:
+    handle.write(json.dumps(
+        {
+            "record_type": "window_bounds",
+            "requested_duration_sec": duration,
+            "window_end_monotonic_ns": window_end_ns,
+            "window_start_monotonic_ns": window_start_ns,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ) + "\n")
     for captured_ns, status in records:
         handle.write(json.dumps(
-            {"captured_monotonic_ns": captured_ns, "status": status},
+            {
+                "captured_monotonic_ns": captured_ns,
+                "record_type": "status_snapshot",
+                "status": status,
+            },
             ensure_ascii=False,
             sort_keys=True,
         ) + "\n")
@@ -639,9 +661,11 @@ analyze_window() {
   local combination="$6"
   local gain="$7"
   local enforce_stability="$8"
+  local requested_duration_sec="$9"
   python3 - "$status_path" "$launch_log" "$iq_dir" "$metrics_path" \
     "$stage" "$combination" "$gain" "$SAMPLE_RATE_HZ" "$MIN_DUTY" \
-    "$MIN_CRC16" "$CLIPPING_THRESHOLD" "$enforce_stability" <<'PY'
+    "$MIN_CRC16" "$CLIPPING_THRESHOLD" "$enforce_stability" \
+    "$requested_duration_sec" "$MAX_COVERAGE_TOLERANCE_SEC" <<'PY'
 import json
 import math
 from pathlib import Path
@@ -651,12 +675,23 @@ import sys
 (
     status_path, launch_log, iq_dir, metrics_path, stage, combination, gain,
     sample_rate, min_duty, min_crc16, clipping_threshold, enforce_stability,
+    requested_duration_sec, max_coverage_tolerance_sec,
 ) = sys.argv[1:]
 sample_rate = int(sample_rate)
 min_duty = float(min_duty)
 min_crc16 = int(min_crc16)
 clipping_threshold = float(clipping_threshold)
 enforce_stability = enforce_stability == "true"
+requested_duration_sec = float(requested_duration_sec)
+max_coverage_tolerance_sec = float(max_coverage_tolerance_sec)
+if not math.isfinite(requested_duration_sec) or requested_duration_sec <= 0:
+    raise SystemExit("requested duration is invalid")
+if not math.isfinite(max_coverage_tolerance_sec) or not 0 < max_coverage_tolerance_sec <= 1:
+    raise SystemExit("coverage tolerance limit is invalid")
+coverage_tolerance_sec = min(
+    max_coverage_tolerance_sec,
+    max(0.1, requested_duration_sec * 0.01),
+)
 
 def unique_object(pairs):
     result = {}
@@ -690,18 +725,57 @@ def finite_number(value, name, minimum=None, maximum=None):
         raise SystemExit(f"{name} is invalid")
     return number
 
+window_bounds = None
 status_records = []
 with open(status_path, encoding="utf-8") as handle:
     for line_number, line in enumerate(handle, 1):
         item = load_json_line(line, f"normalized status line {line_number}")
-        if set(item) != {"captured_monotonic_ns", "status"}:
-            raise SystemExit("normalized status record shape is invalid")
+        if line_number == 1:
+            if set(item) != {
+                "record_type", "requested_duration_sec", "window_end_monotonic_ns",
+                "window_start_monotonic_ns",
+            } or item["record_type"] != "window_bounds":
+                raise SystemExit("normalized window bounds shape is invalid")
+            recorded_duration = finite_number(
+                item["requested_duration_sec"], "recorded requested duration", 0
+            )
+            if recorded_duration != requested_duration_sec:
+                raise SystemExit("recorded requested duration does not match invocation")
+            window_start_ns = exact_int(
+                item["window_start_monotonic_ns"], "window start monotonic ns", 1
+            )
+            window_end_ns = exact_int(
+                item["window_end_monotonic_ns"], "window end monotonic ns", 1
+            )
+            if window_end_ns <= window_start_ns:
+                raise SystemExit("window monotonic bounds are invalid")
+            window_bounds = (window_start_ns, window_end_ns)
+            continue
+        if set(item) != {"captured_monotonic_ns", "record_type", "status"} \
+                or item["record_type"] != "status_snapshot":
+            raise SystemExit("normalized status snapshot shape is invalid")
         exact_int(item["captured_monotonic_ns"], "captured_monotonic_ns", 1)
         if type(item["status"]) is not dict:
             raise SystemExit("normalized status payload is invalid")
+        if status_records and item["captured_monotonic_ns"] <= status_records[-1]["captured_monotonic_ns"]:
+            raise SystemExit("status capture monotonic time must strictly increase")
         status_records.append(item)
-if not status_records:
+if window_bounds is None or not status_records:
     raise SystemExit("at least one status record is required")
+window_start_ns, window_end_ns = window_bounds
+if not all(window_start_ns <= item["captured_monotonic_ns"] <= window_end_ns for item in status_records):
+    raise SystemExit("status snapshot lies outside authoritative window bounds")
+window_coverage_sec = (window_end_ns - window_start_ns) / 1_000_000_000
+status_coverage_sec = (
+    status_records[-1]["captured_monotonic_ns"]
+    - status_records[0]["captured_monotonic_ns"]
+) / 1_000_000_000
+status_head_gap_sec = (
+    status_records[0]["captured_monotonic_ns"] - window_start_ns
+) / 1_000_000_000
+status_tail_gap_sec = (
+    window_end_ns - status_records[-1]["captured_monotonic_ns"]
+) / 1_000_000_000
 
 runtimes = []
 for item in status_records:
@@ -806,6 +880,13 @@ if not math.isfinite(expected_samples) or expected_samples <= 0:
 acquisition_duty = actual_samples / expected_samples
 if not math.isfinite(acquisition_duty):
     raise SystemExit("acquisition duty is invalid")
+chunk_start_ns = chunks[0]["rx_monotonic_ns"]
+chunk_end_ns = chunks[-1]["rx_monotonic_ns"] + math.ceil(
+    chunks[-1]["sample_count"] * 1_000_000_000 / sample_rate
+)
+chunk_coverage_sec = (chunk_end_ns - chunk_start_ns) / 1_000_000_000
+chunk_head_gap_sec = (chunk_start_ns - window_start_ns) / 1_000_000_000
+chunk_tail_gap_sec = (window_end_ns - chunk_end_ns) / 1_000_000_000
 
 event_keys = {"kind", "payload", "wall_time", "monotonic_ns"}
 rf_payload_keys = {
@@ -890,6 +971,21 @@ libiio_timeouts = len(timeout_pattern.findall(log_text))
 violations = []
 if not min_duty <= acquisition_duty <= 1.0:
     violations.append("acquisition_duty_outside_0.99_to_1.0")
+minimum_coverage_sec = max(0.0, requested_duration_sec - coverage_tolerance_sec)
+if window_coverage_sec < minimum_coverage_sec:
+    violations.append("window_coverage_shorter_than_requested")
+if status_coverage_sec < minimum_coverage_sec:
+    violations.append("status_coverage_shorter_than_requested")
+if chunk_coverage_sec < minimum_coverage_sec:
+    violations.append("chunk_coverage_shorter_than_requested")
+if abs(status_head_gap_sec) > coverage_tolerance_sec:
+    violations.append("status_head_gap_exceeds_tolerance")
+if abs(status_tail_gap_sec) > coverage_tolerance_sec:
+    violations.append("status_tail_gap_exceeds_tolerance")
+if abs(chunk_head_gap_sec) > coverage_tolerance_sec:
+    violations.append("chunk_head_gap_exceeds_tolerance")
+if abs(chunk_tail_gap_sec) > coverage_tolerance_sec:
+    violations.append("chunk_tail_gap_exceeds_tolerance")
 if counter_fields["queue_drops"] != 0:
     violations.append("queue_drops_nonzero")
 if libiio_timeouts != 0:
@@ -911,6 +1007,15 @@ result = {
     "stage": stage,
     "combination": combination,
     "gain_db": int(gain),
+    "requested_duration_sec": requested_duration_sec,
+    "coverage_tolerance_sec": coverage_tolerance_sec,
+    "window_coverage_sec": window_coverage_sec,
+    "status_coverage_sec": status_coverage_sec,
+    "chunk_coverage_sec": chunk_coverage_sec,
+    "status_head_gap_sec": status_head_gap_sec,
+    "status_tail_gap_sec": status_tail_gap_sec,
+    "chunk_head_gap_sec": chunk_head_gap_sec,
+    "chunk_tail_gap_sec": chunk_tail_gap_sec,
     "status_messages": len(status_records),
     "chunk_count": len(chunks),
     "actual_samples": actual_samples,
@@ -1079,7 +1184,7 @@ run_window() {
   fi
   stop_launch
   if ! analyze_window "$status_path" "$launch_log" "$iq_dir" "$metrics_path" \
-    "$stage" "$combination" "$gain" "$enforce_stability"; then
+    "$stage" "$combination" "$gain" "$enforce_stability" "$duration"; then
     audit_event "window_failed" "$stage" "offline_analysis_failed"
     return 1
   fi
@@ -1260,54 +1365,229 @@ if len(fields) < 20 or fields[19] != expected_start:
 PY
 }
 
+hold_radar_log_identity() {
+  local identity_path="$1"
+  exec {RADAR_LOG_FD}<"$RADAR_LOG" || return 1
+  if ! python3 - "$RADAR_PID" "$RADAR_PID_START" "$RADAR_LOG" \
+    "$RADAR_LOG_FD" "$identity_path" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import os
+import stat
+import sys
+
+pid, expected_start, log_text, bash_fd_text, identity_text = sys.argv[1:]
+proc_dir = Path("/proc") / pid
+proc_stat = proc_dir / "stat"
+log_path = Path(log_text)
+identity_path = Path(identity_text)
+if not proc_stat.is_file() or proc_dir.stat().st_uid != os.getuid():
+    raise SystemExit("radar PID identity is unavailable or owned by another user")
+text = proc_stat.read_text(encoding="ascii")
+right = text.rfind(")")
+fields = text[right + 2:].split() if right >= 0 else []
+if len(fields) < 20 or fields[19] != expected_start:
+    raise SystemExit("radar PID was reused before log identity lock")
+
+bash_fd_path = Path("/proc") / str(os.getppid()) / "fd" / bash_fd_text
+held_stat = bash_fd_path.stat()
+path_stat = log_path.lstat()
+if not stat.S_ISREG(path_stat.st_mode) or (
+    path_stat.st_dev, path_stat.st_ino
+) != (held_stat.st_dev, held_stat.st_ino):
+    raise SystemExit("radar log path changed while acquiring held descriptor")
+if not stat.S_ISREG(held_stat.st_mode):
+    raise SystemExit("held radar log is not a regular file")
+
+for radar_fd_path in (proc_dir / "fd").iterdir():
+    try:
+        candidate = radar_fd_path.stat()
+    except (FileNotFoundError, PermissionError):
+        continue
+    if (candidate.st_dev, candidate.st_ino) == (held_stat.st_dev, held_stat.st_ino):
+        break
+else:
+    raise SystemExit("radar PID does not have the declared log inode open")
+
+digest = hashlib.sha256()
+with bash_fd_path.open("rb", buffering=0) as handle:
+    remaining = held_stat.st_size
+    while remaining:
+        block = handle.read(min(1024 * 1024, remaining))
+        if not block:
+            raise SystemExit("radar log prefix became unreadable")
+        digest.update(block)
+        remaining -= len(block)
+identity = {
+    "schema_version": 1,
+    "radar_pid": int(pid),
+    "radar_pid_start_ticks": expected_start,
+    "device": held_stat.st_dev,
+    "inode": held_stat.st_ino,
+    "start_size": held_stat.st_size,
+    "prefix_sha256": digest.hexdigest(),
+}
+with identity_path.open("x", encoding="utf-8") as handle:
+    json.dump(identity, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+  then
+    close_radar_log_fd
+    return 1
+  fi
+}
+
 wait_for_radar_stop_and_flush() {
-  python3 - "$RADAR_PID" "$RADAR_PID_START" "$RADAR_STOP_TIMEOUT_SEC" "$RADAR_LOG" <<'PY'
+  local identity_path="$1"
+  local delta_path="$2"
+  python3 - "$RADAR_PID" "$RADAR_PID_START" "$RADAR_STOP_TIMEOUT_SEC" \
+    "$RADAR_LOG" "$RADAR_LOG_FD" "$identity_path" "$delta_path" <<'PY'
+import hashlib
+import json
 from pathlib import Path
 import math
 import os
+import stat
 import sys
 import time
 
-pid, expected_start, timeout_text, log_text = sys.argv[1:]
+(
+    pid, expected_start, timeout_text, log_text, bash_fd_text,
+    identity_text, delta_text,
+) = sys.argv[1:]
 timeout = float(timeout_text)
 if not math.isfinite(timeout) or timeout <= 0:
     raise SystemExit("radar stop timeout is invalid")
-proc_stat = Path("/proc") / pid / "stat"
-log_path = Path(log_text)
-deadline = time.monotonic() + timeout
-while proc_stat.exists():
-    text = proc_stat.read_text(encoding="ascii")
-    right = text.rfind(")")
-    fields = text[right + 2:].split() if right >= 0 else []
-    if len(fields) < 20 or fields[19] != expected_start:
-        raise SystemExit("radar PID was reused before flush verification")
-    if time.monotonic() >= deadline:
-        raise SystemExit("radar process did not stop within the bounded flush timeout")
-    time.sleep(min(0.1, deadline - time.monotonic()))
+with open(identity_text, encoding="utf-8") as handle:
+    identity = json.load(handle)
+if type(identity) is not dict or set(identity) != {
+    "schema_version", "radar_pid", "radar_pid_start_ticks", "device", "inode",
+    "start_size", "prefix_sha256",
+}:
+    raise SystemExit("radar log identity evidence is invalid")
+if identity["schema_version"] != 1 or identity["radar_pid"] != int(pid) \
+        or identity["radar_pid_start_ticks"] != expected_start:
+    raise SystemExit("radar log identity evidence disagrees with PID")
+for name in ("device", "inode", "start_size"):
+    if type(identity[name]) is not int or identity[name] < 0:
+        raise SystemExit(f"radar log identity {name} is invalid")
+if type(identity["prefix_sha256"]) is not str or len(identity["prefix_sha256"]) != 64:
+    raise SystemExit("radar log prefix hash is invalid")
 
-stable_size = None
-stable_observations = 0
-while time.monotonic() < deadline:
-    if log_path.is_symlink() or not log_path.is_file():
-        raise SystemExit("radar log became invalid during flush verification")
-    size = log_path.stat().st_size
-    if size == stable_size:
-        stable_observations += 1
+held_proc_path = Path("/proc") / str(os.getppid()) / "fd" / bash_fd_text
+held_fd = os.open(held_proc_path, os.O_RDONLY)
+
+def prefix_sha256():
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < identity["start_size"]:
+        block = os.pread(
+            held_fd, min(1024 * 1024, identity["start_size"] - offset), offset
+        )
+        if not block:
+            raise SystemExit("held radar log prefix became unreadable")
+        digest.update(block)
+        offset += len(block)
+    return digest.hexdigest()
+
+def require_path_identity():
+    path_stat = log_path.lstat()
+    if not stat.S_ISREG(path_stat.st_mode) or (
+        path_stat.st_dev, path_stat.st_ino
+    ) != (identity["device"], identity["inode"]):
+        raise SystemExit("radar log path was rotated, renamed, or replaced")
+
+try:
+    held_stat = os.fstat(held_fd)
+    if not stat.S_ISREG(held_stat.st_mode) or (
+        held_stat.st_dev, held_stat.st_ino
+    ) != (identity["device"], identity["inode"]):
+        raise SystemExit("held radar log descriptor identity changed")
+
+    proc_stat = Path("/proc") / pid / "stat"
+    log_path = Path(log_text)
+    deadline = time.monotonic() + timeout
+    while proc_stat.exists():
+        text = proc_stat.read_text(encoding="ascii")
+        right = text.rfind(")")
+        fields = text[right + 2:].split() if right >= 0 else []
+        if len(fields) < 20 or fields[19] != expected_start:
+            raise SystemExit("radar PID was reused before flush verification")
+        if time.monotonic() >= deadline:
+            raise SystemExit("radar process did not stop within the bounded flush timeout")
+        time.sleep(min(0.1, deadline - time.monotonic()))
+
+    stable_size = None
+    stable_observations = 0
+    while time.monotonic() < deadline:
+        current = os.fstat(held_fd)
+        if (current.st_dev, current.st_ino) != (identity["device"], identity["inode"]):
+            raise SystemExit("held radar log descriptor identity changed after stop")
+        if current.st_size < identity["start_size"]:
+            raise SystemExit("held radar log was truncated")
+        if current.st_size == stable_size:
+            stable_observations += 1
+        else:
+            stable_size = current.st_size
+            stable_observations = 1
+        if stable_observations >= 3:
+            break
+        time.sleep(min(0.1, deadline - time.monotonic()))
     else:
-        stable_size = size
-        stable_observations = 1
-    if stable_observations >= 3:
-        print(size)
-        break
-    time.sleep(min(0.1, deadline - time.monotonic()))
-else:
-    raise SystemExit("radar log did not become stable after process stop")
+        raise SystemExit("held radar log did not become stable after process stop")
+
+    require_path_identity()
+    if prefix_sha256() != identity["prefix_sha256"]:
+        raise SystemExit("held radar log prefix was rewritten")
+
+    temporary_delta = delta_text + ".tmp"
+    output_fd = os.open(
+        temporary_delta,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        offset = identity["start_size"]
+        while offset < stable_size:
+            block = os.pread(held_fd, min(1024 * 1024, stable_size - offset), offset)
+            if not block:
+                raise SystemExit("held radar log delta became unreadable")
+            written = 0
+            while written < len(block):
+                written += os.write(output_fd, block[written:])
+            offset += len(block)
+        os.fsync(output_fd)
+    finally:
+        os.close(output_fd)
+    try:
+        final_stat = os.fstat(held_fd)
+        if final_stat.st_size != stable_size:
+            raise SystemExit("held radar log changed while copying evidence")
+        require_path_identity()
+        if prefix_sha256() != identity["prefix_sha256"]:
+            raise SystemExit("held radar log prefix was rewritten while copying evidence")
+        os.link(temporary_delta, delta_text, follow_symlinks=False)
+    finally:
+        try:
+            os.unlink(temporary_delta)
+        except FileNotFoundError:
+            pass
+finally:
+    os.close(held_fd)
 PY
 }
 
 run_closed_loop() {
   local gain="$1"
   require_same_radar_process || die "radar process identity is not valid for closed loop"
+  local stage_dir="$OUT_DIR/closed_loop"
+  local radar_identity="$stage_dir/radar_log_identity.json"
+  mkdir -- "$stage_dir"
+  hold_radar_log_identity "$radar_identity" \
+    || die "radar PID/log held-descriptor identity verification failed"
+  audit_event "radar_log_identity_locked" "closed_loop" \
+    "identity=closed_loop/radar_log_identity.json"
   if [[ "$CLOSED_LOOP_SOURCE" == "bench" ]]; then
     confirm_stage "confirmed_blue_l1_fcyqtc_transmitter" \
       "transmitter configured as confirmed BLUE/L1/fcYqTC source for RED receiver"
@@ -1317,16 +1597,11 @@ run_closed_loop() {
       "replay BLUE L1 fcYqTC sha256=$CONFIRMED_L1_SHA256"
   fi
   confirm_stage "closed_loop" "ROS closed loop ($CLOSED_LOOP_SOURCE, confirmed L1)"
-  local stage_dir="$OUT_DIR/closed_loop"
   local launch_log="$stage_dir/receiver.log"
   local jam_jsonl="$stage_dir/jam_codes.jsonl"
   local ready_file="$stage_dir/monitor.ready"
   local radar_delta="$stage_dir/radar.delta.log"
   local result_path="$stage_dir/result.json"
-  mkdir -- "$stage_dir"
-  local radar_start_size
-  radar_start_size="$(stat -c %s -- "$RADAR_LOG")"
-
   start_jam_collector "$jam_jsonl" "$ready_file" "$CLOSED_LOOP_DURATION_SEC" &
   CURRENT_COLLECTOR_PID=$!
   wait_for_ready_file "$ready_file" "$CURRENT_COLLECTOR_PID"
@@ -1378,14 +1653,12 @@ run_closed_loop() {
   stop_launch
 
   confirm_stage "radar_stopped_log_flushed" \
-    "radar main cleanly stopped and its current log flushed"
-  wait_for_radar_stop_and_flush >/dev/null \
-    || die "radar process/log flush verification failed"
-
-  local radar_end_size
-  radar_end_size="$(stat -c %s -- "$RADAR_LOG")"
-  ((radar_end_size >= radar_start_size)) || die "radar log was truncated or rotated during the run"
-  dd if="$RADAR_LOG" of="$radar_delta" bs=1 skip="$radar_start_size" status=none
+    "operator declaration: radar main was cleanly stopped and its log was flushed"
+  local flush_rc=0
+  wait_for_radar_stop_and_flush "$radar_identity" "$radar_delta" \
+    || flush_rc=$?
+  close_radar_log_fd
+  ((flush_rc == 0)) || die "radar process/log flush verification failed"
 
   python3 - "$jam_jsonl" "$radar_delta" "$result_path" <<'PY'
 import json

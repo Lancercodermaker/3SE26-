@@ -53,7 +53,7 @@ ros2 launch sdr_receiver_py_wrapper competition_receiver.launch.py \
 
 RF 判断以本窗口完整 `.events.jsonl` 为权威，而不是只看 1 Hz 状态快照。脚本要求每个录波 chunk 恰好对应一个 `rf_state` 事件；任一事件为 `clipped` 时，该窗口按 `clipped` 处理并禁止更高增益。峰值取所有 chunk 的最大值，剪顶比例取最大值；RMS 同时保存最小值、最大值和按 `sample_count` 加权的均方根，不能把最后一条 RMS 冒充整窗结果。最终允许使用的线性增益窗口本身必须达到 CRC16 非零阈值，不能用后续剪顶窗口的 CRC16 凑数。
 
-每个窗口记录峰值、RMS、剪顶比例、CRC16 数量、增益、RF 状态、状态消息数、采集占空比、队列丢弃、读错误、重连、录波丢弃和 libiio timeout 日志计数。
+每个窗口记录峰值、RMS、剪顶比例、CRC16 数量、增益、RF 状态、状态消息数、请求时长、窗口/status/chunk 覆盖时长、各自首尾间隙、采集占空比、队列丢弃、读错误、重连、录波丢弃和 libiio timeout 日志计数。
 
 ## 3. 执行命令
 
@@ -131,6 +131,8 @@ acquisition_duty = sum(sample_count) / expected_samples
 
 占空比必须在 `[0.99, 1.0]`；低于 0.99 或高于 1.0 都拒绝，后者表示时间轴、采样率或记录证据自相矛盾。任何 gap、overlap、duplicate、混合采样率或坏 JSONL 都立即失败。CRC16 数量也没有现成聚合字段，脚本只统计受控录波目录 `.events.jsonl` 中结构完整、`kind=command` 且 `payload.crc16_ok=true` 的事件。
 
+占空比只证明已有 chunk 的内部时间轴连续，不能证明录满了请求时长。每次状态采集因此先写入权威 `window_start_monotonic_ns`、`window_end_monotonic_ns` 和 `requested_duration_sec`，离线分析同时计算 `window_coverage_sec`、`status_coverage_sec`、`chunk_coverage_sec` 以及 status/chunk 的首尾间隙。允许的单调时钟调度容差为 `min(1 秒, max(0.1 秒, 请求时长的 1%))`；正式 30 秒扫描对应 0.3 秒，120 秒闭环和 1800 秒长稳对应 1 秒。窗口边界、status 快照和 chunk 三种覆盖都必须达到“请求时长减容差”，首尾绝对间隙也不得超过该容差。因而 1800 秒 status 时间跨度不能掩盖只有 2 秒的 IQ chunk，尾部静默同样会失败；status 接收时间不能替代 SDR chunk 的权威覆盖证据。
+
 当前接收端没有名为 `libiio_timeouts` 的独立诊断计数。脚本只在本窗口 `ros2 launch` 的完整 stdout/stderr 中计数同时包含 `libiio`/`iio` 与 `timeout`/`timed out` 的行，并额外强制 acquisition/device read errors 为 0。这是现有接口的诊断边界，不应把“日志计数为 0”解释为驱动内部绝对没有发生过未上报的 timeout。若比赛验收需要驱动级证明，应先在接收端增加结构化 `libiio_timeouts` 计数，再重新执行本规程。
 
 任一测量时长或雷达停止超时偏离默认值，都必须配合 `--allow-short-duration` 用于脚本和台架流程测试。此时最终摘要固定为 `NOT_ELIGIBLE_SHORT_DURATION`，不得作为 30 分钟硬件验收证据。正式验收保留 USB 默认 1800 秒。
@@ -139,7 +141,7 @@ acquisition_duty = sum(sample_count) / expected_samples
 
 ## 5. ROS 闭环
 
-闭环阶段要求雷达主工程在本次阶段开始前已运行，`--radar-pid` 是该进程的 Linux PID，且 `--radar-log` 指向其当前追加写入的日志文件。脚本在开始时锁定 PID 的 `/proc/<pid>/stat` 启动标识，防止 PID 复用。脚本只分析启动闭环后新增的字节，拒绝日志截断或轮转，因此旧日志不能充当本次证据。
+闭环阶段要求雷达主工程在本次阶段开始前已运行，`--radar-pid` 是该进程的 Linux PID，且 `--radar-log` 指向其当前追加写入的日志文件。脚本在开始时锁定 PID 的 `/proc/<pid>/stat` 启动标识，防止 PID 复用。闭环一开始，脚本就以只读方式持有日志文件描述符，并要求 `/proc/<pid>/fd` 中确有相同 `device+inode` 的打开文件；随后记录起始大小和起始前缀 SHA-256。脚本只从这个持续持有的 inode 读取闭环后新增字节，不会按路径重新打开日志，因此旧日志、路径替换或轮转文件不能充当本次证据。
 
 `replay` 使用已确认 L1 IQ；`bench` 使用当前完整链路和最终线性增益。两种模式都监视 `/sdr/jam_code`，要求本次窗口恰好出现一次满足以下全部条件的消息：
 
@@ -148,7 +150,7 @@ acquisition_duty = sum(sample_count) / expected_samples
 - `level=1`、`team=BLUE`、`target=L1`；
 - `ascii_code=fcYqTC` 且六个 key 字节完全一致。
 
-JamCode 收集结束后，操作员必须让雷达主工程正常退出，使 C++ ofstream 析构并 flush，然后输入 `READY:radar_stopped_log_flushed`。脚本不会发送 TERM/KILL；它只在有界时间内等待同一 PID 消失，并要求日志大小连续三次稳定。PID 仍存活、发生复用、日志未稳定或超时均失败。只有完成这一步才读取日志增量。这样避免在雷达进程仍持有用户态缓冲时把“暂时没写到磁盘”误判为闭环失败或成功。
+JamCode 收集结束后，操作员应让雷达主工程正常退出，使 C++ ofstream 析构并 flush，然后输入 `READY:radar_stopped_log_flushed`。该输入仅是“操作员声明已清洁停止并完成 flush”，不是机器对正常退出原因的证明。脚本不会发送 TERM/KILL；机器只证明同一 PID 在有界时间内消失、持续持有的 inode 大小连续三次稳定、路径仍指向同一 `device+inode`、文件未缩短且起始前缀 SHA-256 未变化。增量从持有的文件描述符读取，并在读取结束再次复核 inode、大小和前缀；任何 PID 复用、超时、rename、rotation、replacement、truncate 或 prefix rewrite 都失败。这样既不会读取替换路径中的伪证据，也不会把用户态缓冲尚未 flush 的状态误判为闭环失败或成功。
 
 雷达新增日志必须按顺序包含：
 
@@ -169,7 +171,7 @@ JamCode 收集结束后，操作员必须让雷达主工程正常退出，使 C+
 - `audit.jsonl`：操作员阶段确认、窗口开始/结束和停止原因；
 - `results.jsonl`：每个增益和长稳窗口的稳定、可解析指标，以及六组显式 `combination_summary`（最终线性增益、对应峰值/RMS/剪顶比例和 CRC16）；
 - `matrix_*`、`stability_*` 子目录：launch 日志、归一化状态、IQ/事件和窗口指标；
-- `closed_loop/`：JamCode、receiver 日志、仅本阶段的雷达日志增量和闭环结果；
+- `closed_loop/`：JamCode、receiver 日志、`radar_log_identity.json`（PID/start ticks、device/inode、起始大小和前缀 SHA-256）、从持续持有 FD 读取的本阶段雷达日志增量，以及闭环结果；
 - `acceptance_summary.json`：流程汇总。
 
 脚本成功结束仅表示所有机器可检查的规程条件满足。它明确写入 `hardware_acceptance_claimed_by_script=false`，最终硬件放行仍需负责人核对接线照片、资产编号、发射授权、原始证据和本规程未能直接观测的驱动边界。不得手工修改 JSON/JSONL 后声称通过；需要更正元数据时应使用新的输出目录重跑。
