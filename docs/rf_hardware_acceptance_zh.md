@@ -9,6 +9,7 @@
 - `execute` 必须同时提供固定确认文本，并在每次物理换线前从标准输入输入精确阶段确认。确认只证明操作员同意继续，不能证明实际接线正确。
 - 脚本不会安装软件、访问网络、调用 `sudo`、配置发射机或自动切换 LNA、SAW、衰减器和 USB 线。
 - 输出目录必须是一个尚不存在的绝对路径；脚本拒绝覆盖已有证据。
+- `execute` 必须提供当前雷达主进程 PID。脚本只校验同一用户和 Linux 进程启动标识，从不替操作员停止或强杀雷达进程。
 - 任意状态字段、录波事件、命令、日志证据缺失或格式错误均按失败处理。
 
 先确认 ROS 2 Humble 和本工作区已经 source，`ros2` 能找到 `sdr_receiver_py_wrapper`、`sdr_receiver/msg/JamCode`，雷达主工程已启动并将当前运行日志写入一个现有普通文件。执行入口为：
@@ -50,6 +51,8 @@ ros2 launch sdr_receiver_py_wrapper competition_receiver.launch.py \
 - `too_strong`、`too_weak` 或 `disconnected` 都不能作为增加增益的依据；脚本关闭接收进程并判定该组合不可上场。
 - 每组至少需要一个 `linear` 窗口，且 CRC16 合法命令累计数必须达到非零阈值；否则停止验收。
 
+RF 判断以本窗口完整 `.events.jsonl` 为权威，而不是只看 1 Hz 状态快照。脚本要求每个录波 chunk 恰好对应一个 `rf_state` 事件；任一事件为 `clipped` 时，该窗口按 `clipped` 处理并禁止更高增益。峰值取所有 chunk 的最大值，剪顶比例取最大值；RMS 同时保存最小值、最大值和按 `sample_count` 加权的均方根，不能把最后一条 RMS 冒充整窗结果。最终允许使用的线性增益窗口本身必须达到 CRC16 非零阈值，不能用后续剪顶窗口的 CRC16 凑数。
+
 每个窗口记录峰值、RMS、剪顶比例、CRC16 数量、增益、RF 状态、状态消息数、采集占空比、队列丢弃、读错误、重连、录波丢弃和 libiio timeout 日志计数。
 
 ## 3. 执行命令
@@ -68,6 +71,7 @@ bash src/sdr_receiver_py_wrapper/scripts/run_rf_bench.sh execute \
   --tx-distance-m 2.00 \
   --polarization H-H \
   --radar-log "$HOME/radar_logs/current.log" \
+  --radar-pid "$(cat "$HOME/radar_logs/current.pid")" \
   --closed-loop-source replay \
   --l1-iq "$HOME/sdr_fixtures/RX_BLUE_ganrao_1.c64"
 ```
@@ -88,8 +92,12 @@ READY:full_chain_10db
 READY:full_chain_20db
 READY:usb3_short
 READY:usb3_competition_3m
+READY:confirmed_blue_l1_fcyqtc_transmitter
 READY:closed_loop
+READY:radar_stopped_log_flushed
 ```
+
+`confirmed_blue_l1_fcyqtc_transmitter` 只在 `bench` 闭环源中要求。当前唯一 confirmed 台架源为 BLUE/L1/`fcYqTC`，因此 bench 模式强制 `--own-team RED`；BLUE 本方组合会在启动硬件前拒绝。`replay` 则通过 confirmed L1 文件 SHA-256 自动记录同一来源证据。
 
 标准输入可以来自人工终端，也可以来自已经过双人复核的受控运行器；不匹配、缺行或额外阶段不能绕过确认。
 
@@ -112,15 +120,26 @@ READY:closed_loop
 
 任一条件失败时，该 USB 线、主机端口和当前链路组合不可上场。
 
-采集占空比没有现成的 ROS 聚合字段。脚本用两条带本机单调时钟的 `/sdr/status` 快照之间的 `samples_written` 增量除以 `sample_rate_hz × elapsed_sec`，并要求至少两条状态快照。CRC16 数量也没有现成聚合字段，脚本只统计受控录波目录 `.events.jsonl` 中 `kind=command` 且 `payload.crc16_ok=true` 的事件。
+采集占空比没有现成的 ROS 聚合字段，且 ROS 状态接收时间不能代表 SDR 采集时间。脚本严格解析本窗口唯一 `.chunks.jsonl`：`chunk_id`、样本索引、字节范围必须从 0 连续，采样率必须始终为 2 MHz，`sample_count` 必须大于 0，`rx_monotonic_ns` 必须严格递增。计算式为：
+
+```text
+expected_samples = first_chunk.sample_count
+                 + (last.rx_monotonic_ns - first.rx_monotonic_ns)
+                   * sample_rate_hz / 1e9
+acquisition_duty = sum(sample_count) / expected_samples
+```
+
+占空比必须在 `[0.99, 1.0]`；低于 0.99 或高于 1.0 都拒绝，后者表示时间轴、采样率或记录证据自相矛盾。任何 gap、overlap、duplicate、混合采样率或坏 JSONL 都立即失败。CRC16 数量也没有现成聚合字段，脚本只统计受控录波目录 `.events.jsonl` 中结构完整、`kind=command` 且 `payload.crc16_ok=true` 的事件。
 
 当前接收端没有名为 `libiio_timeouts` 的独立诊断计数。脚本只在本窗口 `ros2 launch` 的完整 stdout/stderr 中计数同时包含 `libiio`/`iio` 与 `timeout`/`timed out` 的行，并额外强制 acquisition/device read errors 为 0。这是现有接口的诊断边界，不应把“日志计数为 0”解释为驱动内部绝对没有发生过未上报的 timeout。若比赛验收需要驱动级证明，应先在接收端增加结构化 `libiio_timeouts` 计数，再重新执行本规程。
 
-`--stability-duration-sec` 仅可配合 `--allow-short-duration` 用于脚本和台架流程测试。此时最终摘要固定为 `NOT_ELIGIBLE_SHORT_DURATION`，不得作为 30 分钟硬件验收证据。正式验收保留默认 1800 秒。
+任一测量时长或雷达停止超时偏离默认值，都必须配合 `--allow-short-duration` 用于脚本和台架流程测试。此时最终摘要固定为 `NOT_ELIGIBLE_SHORT_DURATION`，不得作为 30 分钟硬件验收证据。正式验收保留 USB 默认 1800 秒。
+
+每个录波窗口的 `iq_record_max_bytes` 不是固定 16 GiB，而按 `duration × 2,000,000 × 8 × 1.10 + 64 MiB` 计算。执行前还按六组最坏增益窗口数、两条 USB 长稳、bench 闭环（如有）汇总全部窗口，并额外增加 1 GiB 运行余量，使用输出目录所在文件系统的 `statvfs` 可用空间做 `disk_preflight.json` 检查；每个窗口启动前再次检查。空间不足时不得启动 ROS。正式 1800 秒窗口因此不会被 16 GiB 上限提前截断。
 
 ## 5. ROS 闭环
 
-闭环阶段要求雷达主工程在本次阶段开始前已运行，且 `--radar-log` 指向当前追加写入的日志文件。脚本只分析启动闭环后新增的字节，拒绝日志截断或轮转，因此旧日志不能充当本次证据。
+闭环阶段要求雷达主工程在本次阶段开始前已运行，`--radar-pid` 是该进程的 Linux PID，且 `--radar-log` 指向其当前追加写入的日志文件。脚本在开始时锁定 PID 的 `/proc/<pid>/stat` 启动标识，防止 PID 复用。脚本只分析启动闭环后新增的字节，拒绝日志截断或轮转，因此旧日志不能充当本次证据。
 
 `replay` 使用已确认 L1 IQ；`bench` 使用当前完整链路和最终线性增益。两种模式都监视 `/sdr/jam_code`，要求本次窗口恰好出现一次满足以下全部条件的消息：
 
@@ -129,9 +148,11 @@ READY:closed_loop
 - `level=1`、`team=BLUE`、`target=L1`；
 - `ascii_code=fcYqTC` 且六个 key 字节完全一致。
 
+JamCode 收集结束后，操作员必须让雷达主工程正常退出，使 C++ ofstream 析构并 flush，然后输入 `READY:radar_stopped_log_flushed`。脚本不会发送 TERM/KILL；它只在有界时间内等待同一 PID 消失，并要求日志大小连续三次稳定。PID 仍存活、发生复用、日志未稳定或超时均失败。只有完成这一步才读取日志增量。这样避免在雷达进程仍持有用户态缓冲时把“暂时没写到磁盘”误判为闭环失败或成功。
+
 雷达新增日志必须按顺序包含：
 
-1. `Received JamCode ... command_id: 0x0A06`；
+1. `Received JamCode ... command_id: 0x0A06`（RCLCPP 十六进制）或 `command_id: 0x2566`（当前 ofstream 将十进制 2566 加 `0x` 前缀的既有格式）；
 2. `ASCII Key: [fcYqTC]`；
 3. `Stored password:`；
 4. `key phase 2 start`；
@@ -144,6 +165,7 @@ READY:closed_loop
 每次新输出目录包含：
 
 - `run_metadata.json`：固定台架条件、阈值、持续时间和是否具备正式验收资格；
+- `disk_preflight.json`：同文件系统可用字节、最坏计划所需字节和预检结果；
 - `audit.jsonl`：操作员阶段确认、窗口开始/结束和停止原因；
 - `results.jsonl`：每个增益和长稳窗口的稳定、可解析指标，以及六组显式 `combination_summary`（最终线性增益、对应峰值/RMS/剪顶比例和 CRC16）；
 - `matrix_*`、`stability_*` 子目录：launch 日志、归一化状态、IQ/事件和窗口指标；

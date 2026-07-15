@@ -5,9 +5,12 @@ readonly ACK_TEXT="I_ACKNOWLEDGE_CONTROLLED_RF_BENCH"
 readonly DEFAULT_SCAN_DURATION_SEC="30"
 readonly DEFAULT_STABILITY_DURATION_SEC="1800"
 readonly DEFAULT_CLOSED_LOOP_DURATION_SEC="120"
+readonly DEFAULT_RADAR_STOP_TIMEOUT_SEC="30"
+readonly IQ_BYTES_PER_SAMPLE="8"
+readonly IQ_WINDOW_HEADROOM_RATIO="1.10"
+readonly IQ_WINDOW_METADATA_HEADROOM_BYTES="67108864"
+readonly DISK_RUN_HEADROOM_BYTES="1073741824"
 readonly CONFIRMED_L1_SHA256="8cde16d3fe8230334a9efcb36c81ae105b76b4118f4fe3fc63943aeb791be7cc"
-readonly CONFIRMED_L1_KEY="fcYqTC"
-readonly CONFIRMED_L1_CMD_ID="2566"
 
 readonly -a COMBINATION_IDS=(
   "sdr_direct"
@@ -34,6 +37,9 @@ POWER_SUPPLY=""
 TX_DISTANCE_M=""
 POLARIZATION=""
 RADAR_LOG=""
+RADAR_PID=""
+RADAR_PID_START=""
+RADAR_STOP_TIMEOUT_SEC="$DEFAULT_RADAR_STOP_TIMEOUT_SEC"
 CLOSED_LOOP_SOURCE="replay"
 L1_IQ=""
 ACKNOWLEDGEMENT=""
@@ -70,6 +76,7 @@ Required for execute:
   --tx-distance-m NUMBER
   --polarization H-H|V-V|H-V|V-H|RHCP-RHCP|LHCP-LHCP
   --radar-log /absolute/path/to/current-radar.log
+  --radar-pid INTEGER  (the running radar main process; script never stops it)
   --closed-loop-source replay|bench
   --l1-iq /absolute/path/RX_BLUE_ganrao_1.c64   (required for replay)
 
@@ -77,6 +84,7 @@ Execution controls:
   --scan-duration-sec NUMBER       default 30
   --stability-duration-sec NUMBER  default 1800 (30 minutes per USB cable)
   --closed-loop-duration-sec NUMBER default 120
+  --radar-stop-timeout-sec NUMBER default 30
   --gain-step-db INTEGER           default 5
   --max-gain-db INTEGER            default 70, allowed 0..73
   --sample-rate-hz INTEGER         default 2000000
@@ -119,11 +127,13 @@ parse_args() {
       --tx-distance-m) require_value "$1" "${2-}"; TX_DISTANCE_M="$2"; shift 2 ;;
       --polarization) require_value "$1" "${2-}"; POLARIZATION="$2"; shift 2 ;;
       --radar-log) require_value "$1" "${2-}"; RADAR_LOG="$2"; shift 2 ;;
+      --radar-pid) require_value "$1" "${2-}"; RADAR_PID="$2"; shift 2 ;;
       --closed-loop-source) require_value "$1" "${2-}"; CLOSED_LOOP_SOURCE="$2"; shift 2 ;;
       --l1-iq) require_value "$1" "${2-}"; L1_IQ="$2"; shift 2 ;;
       --scan-duration-sec) require_value "$1" "${2-}"; SCAN_DURATION_SEC="$2"; shift 2 ;;
       --stability-duration-sec) require_value "$1" "${2-}"; STABILITY_DURATION_SEC="$2"; shift 2 ;;
       --closed-loop-duration-sec) require_value "$1" "${2-}"; CLOSED_LOOP_DURATION_SEC="$2"; shift 2 ;;
+      --radar-stop-timeout-sec) require_value "$1" "${2-}"; RADAR_STOP_TIMEOUT_SEC="$2"; shift 2 ;;
       --gain-step-db) require_value "$1" "${2-}"; GAIN_STEP_DB="$2"; shift 2 ;;
       --max-gain-db) require_value "$1" "${2-}"; MAX_GAIN_DB="$2"; shift 2 ;;
       --sample-rate-hz) require_value "$1" "${2-}"; SAMPLE_RATE_HZ="$2"; shift 2 ;;
@@ -152,13 +162,13 @@ validate_number_fields() {
   python3 - "$CABLE_LENGTH_M" "$TX_DISTANCE_M" "$SCAN_DURATION_SEC" \
     "$STABILITY_DURATION_SEC" "$CLOSED_LOOP_DURATION_SEC" "$GAIN_STEP_DB" \
     "$MAX_GAIN_DB" "$SAMPLE_RATE_HZ" "$MIN_DUTY" "$MIN_CRC16" \
-    "$CLIPPING_THRESHOLD" <<'PY'
+    "$CLIPPING_THRESHOLD" "$RADAR_STOP_TIMEOUT_SEC" <<'PY'
 import math
 import sys
 
 (
     cable, distance, scan, stability, closed_loop, gain_step, max_gain,
-    sample_rate, min_duty, min_crc16, clipping,
+    sample_rate, min_duty, min_crc16, clipping, radar_stop_timeout,
 ) = sys.argv[1:]
 
 def finite_positive(name, text):
@@ -175,6 +185,7 @@ finite_positive("transmit distance", distance)
 finite_positive("scan duration", scan)
 finite_positive("stability duration", stability)
 finite_positive("closed-loop duration", closed_loop)
+finite_positive("radar stop timeout", radar_stop_timeout)
 duty = finite_positive("minimum duty", min_duty)
 clipping_value = finite_positive("clipping threshold", clipping)
 if duty > 1 or clipping_value > 1:
@@ -218,6 +229,30 @@ validate_execute_args() {
   [[ -n "$OUT_DIR" && "$OUT_DIR" == /* ]] || die "--out-dir must be an absolute path"
   [[ -n "$RADAR_LOG" && "$RADAR_LOG" == /* ]] || die "--radar-log must be absolute"
   [[ -f "$RADAR_LOG" && ! -L "$RADAR_LOG" ]] || die "radar log must be an existing non-symlink regular file"
+  [[ "$RADAR_PID" =~ ^[1-9][0-9]*$ ]] || die "--radar-pid must be a positive integer"
+  kill -0 "$RADAR_PID" 2>/dev/null || die "radar process is not running at validation time"
+  RADAR_PID_START="$(python3 - "$RADAR_PID" <<'PY'
+import os
+from pathlib import Path
+import sys
+pid = int(sys.argv[1])
+proc = Path("/proc") / str(pid)
+if proc.stat().st_uid != os.getuid():
+    raise SystemExit("radar process must be owned by the current user")
+stat_text = (proc / "stat").read_text(encoding="ascii")
+right = stat_text.rfind(")")
+if right < 0:
+    raise SystemExit("radar process identity is malformed")
+fields = stat_text[right + 2:].split()
+if len(fields) < 20 or not fields[19].isdigit():
+    raise SystemExit("radar process start time is missing")
+print(fields[19])
+PY
+)" || die "radar process identity validation failed"
+  [[ -n "$RADAR_PID_START" ]] || die "radar process identity validation failed"
+  if [[ "$CLOSED_LOOP_SOURCE" == "bench" && "$OWN_TEAM" != "RED" ]]; then
+    die "confirmed BLUE-L1 bench transmission requires --own-team RED"
+  fi
   if [[ "$CLOSED_LOOP_SOURCE" == "replay" ]]; then
     [[ -n "$L1_IQ" && "$L1_IQ" == /* ]] || die "--l1-iq must be absolute for replay"
     [[ -f "$L1_IQ" && ! -L "$L1_IQ" ]] || die "L1 IQ must be an existing non-symlink regular file"
@@ -229,9 +264,10 @@ validate_execute_args() {
   validate_number_fields || die "numeric validation failed"
   if [[ "$SCAN_DURATION_SEC" != "$DEFAULT_SCAN_DURATION_SEC" \
         || "$STABILITY_DURATION_SEC" != "$DEFAULT_STABILITY_DURATION_SEC" \
-        || "$CLOSED_LOOP_DURATION_SEC" != "$DEFAULT_CLOSED_LOOP_DURATION_SEC" ]]; then
+        || "$CLOSED_LOOP_DURATION_SEC" != "$DEFAULT_CLOSED_LOOP_DURATION_SEC" \
+        || "$RADAR_STOP_TIMEOUT_SEC" != "$DEFAULT_RADAR_STOP_TIMEOUT_SEC" ]]; then
     if [[ "$ALLOW_SHORT_DURATION" != true ]]; then
-      die "non-default stability duration requires --allow-short-duration"
+      die "non-default timing requires --allow-short-duration"
     fi
     RUN_ELIGIBLE=false
   fi
@@ -263,12 +299,93 @@ create_output_dir() {
   : > "$AUDIT_JSONL"
 }
 
+iq_limit_for_duration() {
+  python3 - "$1" "$SAMPLE_RATE_HZ" "$IQ_BYTES_PER_SAMPLE" \
+    "$IQ_WINDOW_HEADROOM_RATIO" "$IQ_WINDOW_METADATA_HEADROOM_BYTES" <<'PY'
+import math
+import sys
+duration, rate, bytes_per_sample, ratio, metadata = sys.argv[1:]
+value = math.ceil(float(duration) * int(rate) * int(bytes_per_sample) * float(ratio)) + int(metadata)
+if value <= 0:
+    raise SystemExit("IQ byte limit is invalid")
+print(value)
+PY
+}
+
+preflight_disk() {
+  local required
+  required="$(python3 - "$SCAN_DURATION_SEC" "$STABILITY_DURATION_SEC" \
+    "$CLOSED_LOOP_DURATION_SEC" "$GAIN_STEP_DB" "$MAX_GAIN_DB" \
+    "$SAMPLE_RATE_HZ" "$CLOSED_LOOP_SOURCE" "$IQ_BYTES_PER_SAMPLE" \
+    "$IQ_WINDOW_HEADROOM_RATIO" "$IQ_WINDOW_METADATA_HEADROOM_BYTES" \
+    "$DISK_RUN_HEADROOM_BYTES" <<'PY'
+import math
+import sys
+(
+    scan_duration, stability_duration, closed_duration, gain_step, max_gain,
+    sample_rate, source, bytes_per_sample, ratio, metadata, run_headroom,
+) = sys.argv[1:]
+gain_windows = math.ceil(int(max_gain) / int(gain_step)) + 1
+def window_bytes(duration):
+    return math.ceil(
+        float(duration) * int(sample_rate) * int(bytes_per_sample) * float(ratio)
+    ) + int(metadata)
+total = 6 * gain_windows * window_bytes(scan_duration)
+total += 2 * window_bytes(stability_duration)
+if source == "bench":
+    total += window_bytes(closed_duration)
+total += int(run_headroom)
+print(total)
+PY
+)" || die "planned disk requirement calculation failed"
+  python3 - "$OUT_DIR/disk_preflight.json" "$OUT_DIR" "$required" <<'PY'
+import json
+import os
+import sys
+path, directory, required_text = sys.argv[1:]
+required = int(required_text)
+stats = os.statvfs(directory)
+available = stats.f_bavail * stats.f_frsize
+payload = {
+    "schema_version": 1,
+    "available_bytes": available,
+    "planned_required_bytes": required,
+    "passed": available >= required,
+}
+with open(path, "x", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+if available < required:
+    raise SystemExit(
+        f"insufficient disk space: available={available} required={required}"
+    )
+PY
+}
+
+ensure_window_space() {
+  local directory="$1"
+  local required="$2"
+  python3 - "$directory" "$required" <<'PY'
+import os
+import sys
+directory, required_text = sys.argv[1:]
+required = int(required_text)
+stats = os.statvfs(directory)
+available = stats.f_bavail * stats.f_frsize
+if available < required:
+    raise SystemExit(
+        f"insufficient window disk space: available={available} required={required}"
+    )
+PY
+}
+
 write_metadata() {
   python3 - "$OUT_DIR/run_metadata.json" "$OWN_TEAM" "$CABLE_LENGTH_M" \
     "$POWER_SUPPLY" "$TX_DISTANCE_M" "$POLARIZATION" "$SCAN_DURATION_SEC" \
     "$STABILITY_DURATION_SEC" "$CLOSED_LOOP_DURATION_SEC" "$GAIN_STEP_DB" \
     "$MAX_GAIN_DB" "$SAMPLE_RATE_HZ" "$MIN_DUTY" "$MIN_CRC16" \
-    "$CLIPPING_THRESHOLD" "$CLOSED_LOOP_SOURCE" "$RUN_ELIGIBLE" <<'PY'
+    "$CLIPPING_THRESHOLD" "$CLOSED_LOOP_SOURCE" "$RUN_ELIGIBLE" \
+    "$RADAR_PID" "$RADAR_PID_START" "$RADAR_STOP_TIMEOUT_SEC" <<'PY'
 import datetime
 import json
 import sys
@@ -277,6 +394,7 @@ import sys
     path, own_team, cable_length, power_supply, tx_distance, polarization,
     scan_duration, stability_duration, closed_loop_duration, gain_step,
     max_gain, sample_rate, min_duty, min_crc16, clipping, source, eligible,
+    radar_pid, radar_pid_start, radar_stop_timeout,
 ) = sys.argv[1:]
 payload = {
     "schema_version": 1,
@@ -304,6 +422,19 @@ payload = {
         "rf_clipping_ratio": float(clipping),
     },
     "closed_loop_source": source,
+    "confirmed_source": {
+        "team": "BLUE",
+        "target": "L1",
+        "expected_ascii": "fcYqTC",
+        "expected_cmd_id": 2566,
+        "sha256": "8cde16d3fe8230334a9efcb36c81ae105b76b4118f4fe3fc63943aeb791be7cc" if source == "replay" else None,
+    },
+    "radar_log_flush": {
+        "pid": int(radar_pid),
+        "process_start_ticks": radar_pid_start,
+        "stop_timeout_sec": float(radar_stop_timeout),
+        "script_stops_process": False,
+    },
     "hardware_acceptance_eligible": eligible == "true",
     "hardware_acceptance_claimed": False,
 }
@@ -396,8 +527,33 @@ if not math.isfinite(duration) or duration <= 0:
     raise SystemExit("invalid collection duration")
 command = [
     "ros2", "topic", "echo", "/sdr/status", "std_msgs/msg/String",
-    "--field", "data", "--once",
+    "--once",
 ]
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+def construct_unique_mapping(loader, node, deep=False):
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise RuntimeError(f"duplicate YAML key: {key!r}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    construct_unique_mapping,
+)
+
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RuntimeError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
 
 def receive_one(timeout):
     completed = subprocess.run(
@@ -412,13 +568,21 @@ def receive_one(timeout):
         raise RuntimeError(
             "status echo failed: " + completed.stderr.strip()[:500]
         )
-    decoded = yaml.safe_load(completed.stdout)
-    if isinstance(decoded, dict) and set(decoded) == {"data"}:
-        decoded = decoded["data"]
-    if not isinstance(decoded, str):
+    documents = [
+        document
+        for document in yaml.load_all(completed.stdout, Loader=UniqueKeyLoader)
+        if document is not None
+    ]
+    if len(documents) != 1:
+        raise RuntimeError("status echo must contain exactly one non-empty YAML document")
+    envelope = documents[0]
+    if type(envelope) is not dict or set(envelope) != {"data"}:
+        raise RuntimeError("status echo must be an exact std_msgs/String mapping")
+    decoded = envelope["data"]
+    if type(decoded) is not str:
         raise RuntimeError("status topic did not contain a String payload")
-    status = json.loads(decoded)
-    if not isinstance(status, dict):
+    status = json.loads(decoded, object_pairs_hook=unique_json_object)
+    if type(status) is not dict:
         raise RuntimeError("status JSON must be an object")
     return status
 
@@ -432,6 +596,8 @@ while not records:
         status = receive_one(min(10.0, remaining))
     except subprocess.TimeoutExpired:
         continue
+    except (RuntimeError, json.JSONDecodeError, yaml.YAMLError) as exc:
+        raise SystemExit(f"invalid /sdr/status message: {exc}") from None
     records.append((time.monotonic_ns(), status))
 
 start = time.monotonic()
@@ -445,6 +611,8 @@ while time.monotonic() < deadline:
         status = receive_one(max(0.05, min(10.0, remaining)))
     except subprocess.TimeoutExpired:
         continue
+    except (RuntimeError, json.JSONDecodeError, yaml.YAMLError) as exc:
+        raise SystemExit(f"invalid /sdr/status message: {exc}") from None
     records.append((time.monotonic_ns(), status))
     common_runtime = status.get("common_runtime")
     if isinstance(common_runtime, dict) and common_runtime.get("rf_state") == "clipped":
@@ -490,99 +658,73 @@ min_crc16 = int(min_crc16)
 clipping_threshold = float(clipping_threshold)
 enforce_stability = enforce_stability == "true"
 
-records = []
-with open(status_path, encoding="utf-8") as handle:
-    for line in handle:
-        item = json.loads(line)
-        if not isinstance(item, dict) or set(item) != {"captured_monotonic_ns", "status"}:
-            raise SystemExit("invalid normalized status record")
-        records.append(item)
-if not records:
-    raise SystemExit("at least one status record is required")
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
 
-def runtime(record):
-    status = record["status"]
-    value = status.get("common_runtime")
-    if not isinstance(value, dict):
-        raise SystemExit("common_runtime status is missing")
+def load_json_line(line, description):
+    try:
+        value = json.loads(line, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(f"invalid {description}") from exc
+    if type(value) is not dict:
+        raise SystemExit(f"{description} must be an exact object")
     return value
 
-runtimes = [runtime(record) for record in records]
-first = runtimes[0]
-last = runtimes[-1]
-for value in runtimes:
-    for name, error in (
-        ("common_runtime.worker_error", value.get("worker_error")),
-        ("common_runtime.cleanup_error", value.get("cleanup_error")),
-    ):
-        if error is not None:
-            raise SystemExit(f"{name} is not null")
+def exact_int(value, name, minimum=0):
+    if type(value) is not int or value < minimum:
+        raise SystemExit(f"{name} is invalid")
+    return value
 
-def recorder_stats(value):
-    recorder = value.get("recorder")
-    if not isinstance(recorder, dict) or recorder.get("enabled") is not True:
+def finite_number(value, name, minimum=None, maximum=None):
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise SystemExit(f"{name} is invalid")
+    number = float(value)
+    if minimum is not None and number < minimum:
+        raise SystemExit(f"{name} is invalid")
+    if maximum is not None and number > maximum:
+        raise SystemExit(f"{name} is invalid")
+    return number
+
+status_records = []
+with open(status_path, encoding="utf-8") as handle:
+    for line_number, line in enumerate(handle, 1):
+        item = load_json_line(line, f"normalized status line {line_number}")
+        if set(item) != {"captured_monotonic_ns", "status"}:
+            raise SystemExit("normalized status record shape is invalid")
+        exact_int(item["captured_monotonic_ns"], "captured_monotonic_ns", 1)
+        if type(item["status"]) is not dict:
+            raise SystemExit("normalized status payload is invalid")
+        status_records.append(item)
+if not status_records:
+    raise SystemExit("at least one status record is required")
+
+runtimes = []
+for item in status_records:
+    runtime = item["status"].get("common_runtime")
+    if type(runtime) is not dict:
+        raise SystemExit("common_runtime status is missing")
+    if runtime.get("worker_error") is not None or runtime.get("cleanup_error") is not None:
+        raise SystemExit("common_runtime reported an error")
+    recorder = runtime.get("recorder")
+    if type(recorder) is not dict or recorder.get("enabled") is not True:
         raise SystemExit("structured recorder is not enabled")
     stats = recorder.get("stats")
-    if not isinstance(stats, dict):
-        raise SystemExit("recorder stats are missing")
-    if stats.get("worker_error") is not None:
-        raise SystemExit("recorder worker_error is not null")
-    return recorder, stats
-
-recorder_snapshots = [recorder_stats(value) for value in runtimes]
-first_recorder, first_stats = recorder_snapshots[0]
-last_recorder, last_stats = recorder_snapshots[-1]
-first_samples = first_stats.get("samples_written")
-last_samples = last_stats.get("samples_written")
-if isinstance(first_samples, bool) or not isinstance(first_samples, int):
-    raise SystemExit("first samples_written is invalid")
-if isinstance(last_samples, bool) or not isinstance(last_samples, int) or last_samples < first_samples:
-    raise SystemExit("last samples_written is invalid")
-if len(records) == 1:
-    elapsed_sec = 0.0
-    acquisition_duty = 0.0
-else:
-    elapsed_sec = (
-        int(records[-1]["captured_monotonic_ns"])
-        - int(records[0]["captured_monotonic_ns"])
-    ) / 1_000_000_000
-    if not math.isfinite(elapsed_sec) or elapsed_sec <= 0:
-        raise SystemExit("status interval is invalid")
-    acquisition_duty = (last_samples - first_samples) / (sample_rate * elapsed_sec)
-if not math.isfinite(acquisition_duty) or acquisition_duty < 0:
-    raise SystemExit("acquisition duty calculation is invalid")
-
-metric_snapshots = []
-observed_states = []
-for value, (_recorder, stats) in zip(runtimes, recorder_snapshots):
-    snapshot = stats.get("latest_rf_metrics")
-    if not isinstance(snapshot, dict):
-        raise SystemExit("latest RF metrics are missing")
-    for field in ("peak", "rms", "clipping_ratio"):
-        metric_value = snapshot.get(field)
-        if (
-            isinstance(metric_value, bool)
-            or not isinstance(metric_value, (int, float))
-            or not math.isfinite(metric_value)
-        ):
-            raise SystemExit(f"RF metric {field} is invalid")
-    state = value.get("rf_state")
+    if type(stats) is not dict or stats.get("worker_error") is not None:
+        raise SystemExit("recorder stats are missing or failed")
+    state = runtime.get("rf_state")
     if state not in {"linear", "clipped", "too_strong", "too_weak", "disconnected"}:
-        raise SystemExit("RF state is invalid")
-    if state == "clipped" and snapshot["clipping_ratio"] < clipping_threshold:
-        raise SystemExit("clipped state contradicts clipping ratio")
-    metric_snapshots.append(snapshot)
-    observed_states.append(state)
-metrics = {
-    "peak": max(float(item["peak"]) for item in metric_snapshots),
-    "rms": max(float(item["rms"]) for item in metric_snapshots),
-    "clipping_ratio": max(float(item["clipping_ratio"]) for item in metric_snapshots),
-}
-rf_state = "clipped" if "clipped" in observed_states else observed_states[-1]
-
+        raise SystemExit("status RF state is invalid")
+    runtimes.append(runtime)
+last = runtimes[-1]
+last_stats = last["recorder"]["stats"]
 acquisition = last.get("acquisition")
 device = last.get("device")
-if not isinstance(acquisition, dict) or not isinstance(device, dict):
+if type(acquisition) is not dict or type(device) is not dict:
     raise SystemExit("acquisition or device counters are missing")
 counter_fields = {
     "queue_drops": acquisition.get("queue_drops"),
@@ -593,8 +735,150 @@ counter_fields = {
     "recorder_dropped_events": last_stats.get("dropped_events"),
 }
 for name, value in counter_fields.items():
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise SystemExit(f"counter {name} is invalid")
+    exact_int(value, name)
+
+iq_root = Path(iq_dir).resolve(strict=True)
+def controlled_file(pattern, description):
+    matches = sorted(iq_root.glob(pattern))
+    if len(matches) != 1 or matches[0].is_symlink():
+        raise SystemExit(f"exactly one non-symlink {description} is required")
+    resolved = matches[0].resolve(strict=True)
+    if resolved.parent != iq_root or not resolved.is_file():
+        raise SystemExit(f"{description} escaped the controlled IQ directory")
+    return resolved
+
+chunks_path = controlled_file("*.chunks.jsonl", "chunks JSONL")
+events_path = controlled_file("*.events.jsonl", "events JSONL")
+
+chunk_keys = {
+    "chunk_id", "first_sample_index", "sample_rate_hz", "rx_wall_time",
+    "rx_monotonic_ns", "lo_hz", "rf_bandwidth_hz", "rx_gain_db",
+    "target_version", "context_version", "target", "metadata", "rf_metrics",
+    "sample_count", "byte_offset", "byte_length",
+}
+chunks = []
+with chunks_path.open(encoding="utf-8") as handle:
+    for line_number, line in enumerate(handle, 1):
+        chunk = load_json_line(line, f"chunk line {line_number}")
+        if set(chunk) != chunk_keys:
+            raise SystemExit(f"chunk line {line_number} schema is invalid")
+        chunk_id = exact_int(chunk["chunk_id"], "chunk_id")
+        first_index = exact_int(chunk["first_sample_index"], "first_sample_index")
+        count = exact_int(chunk["sample_count"], "sample_count", 1)
+        rate = exact_int(chunk["sample_rate_hz"], "sample_rate_hz", 1)
+        monotonic_ns = exact_int(chunk["rx_monotonic_ns"], "rx_monotonic_ns", 1)
+        byte_offset = exact_int(chunk["byte_offset"], "byte_offset")
+        byte_length = exact_int(chunk["byte_length"], "byte_length", 1)
+        finite_number(chunk["rx_wall_time"], "rx_wall_time", 0)
+        if rate != sample_rate or byte_length != count * 8:
+            raise SystemExit("chunk sample rate or byte length is invalid")
+        if type(chunk["metadata"]) is not dict or type(chunk["rf_metrics"]) is not dict:
+            raise SystemExit("chunk metadata or RF metrics is invalid")
+        if chunks:
+            previous = chunks[-1]
+            if chunk_id != previous["chunk_id"] + 1:
+                raise SystemExit("chunk_id gap, overlap, or duplicate detected")
+            if first_index != previous["first_sample_index"] + previous["sample_count"]:
+                raise SystemExit("sample index gap, overlap, or duplicate detected")
+            if byte_offset != previous["byte_offset"] + previous["byte_length"]:
+                raise SystemExit("chunk byte range gap, overlap, or duplicate detected")
+            if monotonic_ns <= previous["rx_monotonic_ns"]:
+                raise SystemExit("chunk monotonic time must strictly increase")
+        elif chunk_id != 0 or first_index != 0 or byte_offset != 0:
+            raise SystemExit("first chunk must start at zero")
+        chunks.append({
+            "chunk_id": chunk_id,
+            "first_sample_index": first_index,
+            "sample_count": count,
+            "rx_monotonic_ns": monotonic_ns,
+            "byte_offset": byte_offset,
+            "byte_length": byte_length,
+        })
+if not chunks:
+    raise SystemExit("chunks JSONL is empty")
+actual_samples = sum(chunk["sample_count"] for chunk in chunks)
+expected_samples = chunks[0]["sample_count"] + (
+    (chunks[-1]["rx_monotonic_ns"] - chunks[0]["rx_monotonic_ns"])
+    * sample_rate / 1_000_000_000
+)
+if not math.isfinite(expected_samples) or expected_samples <= 0:
+    raise SystemExit("expected sample calculation is invalid")
+acquisition_duty = actual_samples / expected_samples
+if not math.isfinite(acquisition_duty):
+    raise SystemExit("acquisition duty is invalid")
+
+event_keys = {"kind", "payload", "wall_time", "monotonic_ns"}
+rf_payload_keys = {
+    "chunk_id", "first_sample_index", "last_sample_index", "target_version",
+    "context_version", "target", "team", "profile", "adc_code_scale",
+    "rf_clipping_ratio", "state", "metrics",
+}
+command_payload_keys = {
+    "command_event_id", "role", "chunk_id", "chunk_first_sample_index",
+    "chunk_last_sample_index", "target_version", "context_version", "target",
+    "team", "profile", "decoder_id", "cmd_id", "payload", "crc8_ok",
+    "crc16_ok", "crc_mode", "receive_wall_time", "first_sample_index",
+    "last_sample_index", "evidence",
+}
+rf_events = []
+crc16_count = 0
+with events_path.open(encoding="utf-8") as handle:
+    for line_number, line in enumerate(handle, 1):
+        event = load_json_line(line, f"event line {line_number}")
+        if set(event) != event_keys or type(event["kind"]) is not str or type(event["payload"]) is not dict:
+            raise SystemExit(f"event line {line_number} schema is invalid")
+        finite_number(event["wall_time"], "event wall_time", 0)
+        exact_int(event["monotonic_ns"], "event monotonic_ns", 1)
+        payload = event["payload"]
+        if event["kind"] == "rf_state":
+            if set(payload) != rf_payload_keys:
+                raise SystemExit("RF event payload schema is invalid")
+            chunk_id = exact_int(payload["chunk_id"], "RF chunk_id")
+            if chunk_id >= len(chunks) or chunk_id != len(rf_events):
+                raise SystemExit("RF event chunk sequence is invalid")
+            chunk = chunks[chunk_id]
+            if (
+                payload["first_sample_index"] != chunk["first_sample_index"]
+                or payload["last_sample_index"] != chunk["first_sample_index"] + chunk["sample_count"] - 1
+            ):
+                raise SystemExit("RF event sample range is invalid")
+            state = payload["state"]
+            if state not in {"linear", "clipped", "too_strong", "too_weak", "disconnected"}:
+                raise SystemExit("RF event state is invalid")
+            metrics = payload["metrics"]
+            if type(metrics) is not dict or set(metrics) != {"rms", "peak", "clipping_ratio", "sample_count"}:
+                raise SystemExit("RF event metrics schema is invalid")
+            count = exact_int(metrics["sample_count"], "RF metric sample_count", 1)
+            if count != chunk["sample_count"]:
+                raise SystemExit("RF event sample_count disagrees with chunk")
+            peak = finite_number(metrics["peak"], "RF peak", 0)
+            rms = finite_number(metrics["rms"], "RF RMS", 0)
+            clipping = finite_number(metrics["clipping_ratio"], "RF clipping ratio", 0, 1)
+            if rms > peak:
+                raise SystemExit("RF RMS cannot exceed peak")
+            if state == "clipped" and clipping < clipping_threshold:
+                raise SystemExit("clipped RF event contradicts clipping ratio")
+            rf_events.append({"state": state, "peak": peak, "rms": rms, "clipping": clipping, "count": count})
+        elif event["kind"] == "command":
+            if set(payload) != command_payload_keys:
+                raise SystemExit("command event payload schema is invalid")
+            if type(payload["crc16_ok"]) is not bool:
+                raise SystemExit("command crc16_ok is invalid")
+            if payload["crc16_ok"] is True:
+                crc16_count += 1
+if len(rf_events) != len(chunks):
+    raise SystemExit("every chunk must have exactly one authoritative RF event")
+
+observed_states = [event["state"] for event in rf_events]
+rf_state = "clipped" if "clipped" in observed_states else observed_states[-1]
+peak_max = max(event["peak"] for event in rf_events)
+rms_min = min(event["rms"] for event in rf_events)
+rms_max = max(event["rms"] for event in rf_events)
+metric_samples = sum(event["count"] for event in rf_events)
+rms_weighted = math.sqrt(
+    sum(event["rms"] ** 2 * event["count"] for event in rf_events) / metric_samples
+)
+clipping_max = max(event["clipping"] for event in rf_events)
 
 log_text = Path(launch_log).read_text(encoding="utf-8", errors="replace")
 timeout_pattern = re.compile(
@@ -603,41 +887,22 @@ timeout_pattern = re.compile(
 )
 libiio_timeouts = len(timeout_pattern.findall(log_text))
 
-iq_root = Path(iq_dir).resolve(strict=True)
-events_files = sorted(iq_root.glob("*.events.jsonl"))
-if len(events_files) != 1 or events_files[0].is_symlink():
-    raise SystemExit("exactly one non-symlink events JSONL file is required")
-events_path = events_files[0].resolve(strict=True)
-if events_path.parent != iq_root:
-    raise SystemExit("events path escaped the controlled IQ directory")
-crc16_count = 0
-with events_path.open(encoding="utf-8") as handle:
-    for line_number, line in enumerate(handle, 1):
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"invalid event JSON at line {line_number}") from exc
-        if not isinstance(event, dict):
-            raise SystemExit("event JSON must be an object")
-        if event.get("kind") == "command":
-            payload = event.get("payload")
-            if isinstance(payload, dict) and payload.get("crc16_ok") is True:
-                crc16_count += 1
-
 violations = []
+if not min_duty <= acquisition_duty <= 1.0:
+    violations.append("acquisition_duty_outside_0.99_to_1.0")
+if counter_fields["queue_drops"] != 0:
+    violations.append("queue_drops_nonzero")
+if libiio_timeouts != 0:
+    violations.append("libiio_timeouts_nonzero")
+if counter_fields["acquisition_read_errors"] != 0 or counter_fields["device_read_errors"] != 0:
+    violations.append("read_errors_nonzero")
+if counter_fields["device_reconnects"] != 0:
+    violations.append("device_reconnects_nonzero")
+if counter_fields["recorder_dropped_chunks"] != 0 or counter_fields["recorder_dropped_events"] != 0:
+    violations.append("recorder_drops_nonzero")
 if enforce_stability:
     if rf_state != "linear":
         violations.append("rf_state_not_linear")
-    if acquisition_duty < min_duty:
-        violations.append("acquisition_duty_below_threshold")
-    if counter_fields["queue_drops"] != 0:
-        violations.append("queue_drops_nonzero")
-    if libiio_timeouts != 0:
-        violations.append("libiio_timeouts_nonzero")
-    if counter_fields["acquisition_read_errors"] != 0 or counter_fields["device_read_errors"] != 0:
-        violations.append("read_errors_nonzero")
-    if counter_fields["recorder_dropped_chunks"] != 0 or counter_fields["recorder_dropped_events"] != 0:
-        violations.append("recorder_drops_nonzero")
     if crc16_count < min_crc16:
         violations.append("crc16_below_threshold")
 
@@ -646,11 +911,16 @@ result = {
     "stage": stage,
     "combination": combination,
     "gain_db": int(gain),
-    "status_messages": len(records),
-    "measurement_interval_sec": elapsed_sec,
-    "peak": float(metrics["peak"]),
-    "rms": float(metrics["rms"]),
-    "clipping_ratio": float(metrics["clipping_ratio"]),
+    "status_messages": len(status_records),
+    "chunk_count": len(chunks),
+    "actual_samples": actual_samples,
+    "expected_samples": expected_samples,
+    "peak": peak_max,
+    "rms": rms_weighted,
+    "rms_min": rms_min,
+    "rms_max": rms_max,
+    "rms_aggregation": "sample_count_weighted_root_mean_square",
+    "clipping_ratio": clipping_max,
     "rf_state": rf_state,
     "observed_rf_states": observed_states,
     "crc16_count": crc16_count,
@@ -769,7 +1039,12 @@ run_window() {
   local launch_log="$window_dir/launch.log"
   local status_path="$window_dir/status.jsonl"
   local metrics_path="$window_dir/metrics.json"
+  local iq_max_bytes
   mkdir -- "$window_dir" "$iq_dir"
+  iq_max_bytes="$(iq_limit_for_duration "$duration")" \
+    || { audit_event "window_failed" "$stage" "iq_limit_calculation"; return 1; }
+  ensure_window_space "$iq_dir" "$iq_max_bytes" \
+    || { audit_event "window_failed" "$stage" "insufficient_disk"; return 1; }
   audit_event "window_start" "$stage" "gain_db=$gain"
 
   local fallback_self_id
@@ -780,7 +1055,7 @@ run_window() {
     iq_record_dir:="$iq_dir" \
     iq_record_prefix:="$stage" \
     iq_record_max_sec:="$(python3 -c 'import sys; print(float(sys.argv[1]) + 60)' "$duration")" \
-    iq_record_max_bytes:=17179869184 \
+    iq_record_max_bytes:="$iq_max_bytes" \
     iq_record_every_n:=1 \
     rf_clipping_ratio:="$CLIPPING_THRESHOLD" \
     fallback_self_id:="$fallback_self_id" \
@@ -803,9 +1078,15 @@ run_window() {
     return 1
   fi
   stop_launch
-  analyze_window "$status_path" "$launch_log" "$iq_dir" "$metrics_path" \
-    "$stage" "$combination" "$gain" "$enforce_stability"
-  append_result "$metrics_path" "$label" "$usb_cable"
+  if ! analyze_window "$status_path" "$launch_log" "$iq_dir" "$metrics_path" \
+    "$stage" "$combination" "$gain" "$enforce_stability"; then
+    audit_event "window_failed" "$stage" "offline_analysis_failed"
+    return 1
+  fi
+  if ! append_result "$metrics_path" "$label" "$usb_cable"; then
+    audit_event "window_failed" "$stage" "result_append_failed"
+    return 1
+  fi
   audit_event "window_complete" "$stage" "metrics=$metrics_path"
   printf '%s\n' "$metrics_path"
 }
@@ -823,7 +1104,9 @@ run_combination() {
   while ((gain <= MAX_GAIN_DB)); do
     local stage metrics state crc16
     stage="$(printf 'matrix_%02d_%s_gain_%02d' "$ordinal" "$combination" "$gain")"
-    metrics="$(run_window "$stage" "$combination" "$label" "$gain" "$SCAN_DURATION_SEC" false "")"
+    if ! metrics="$(run_window "$stage" "$combination" "$label" "$gain" "$SCAN_DURATION_SEC" false "")"; then
+      die "$label measurement window failed at gain $gain"
+    fi
     state="$(json_field "$metrics" rf_state)"
     crc16="$(json_field "$metrics" crc16_count)"
     total_crc16=$((total_crc16 + crc16))
@@ -961,8 +1244,78 @@ wait_for_ready_file() {
   [[ -f "$path" && ! -L "$path" ]] || die "collector readiness marker is invalid"
 }
 
+require_same_radar_process() {
+  python3 - "$RADAR_PID" "$RADAR_PID_START" <<'PY'
+from pathlib import Path
+import sys
+pid, expected_start = sys.argv[1:]
+stat_path = Path("/proc") / pid / "stat"
+if not stat_path.is_file():
+    raise SystemExit("radar process stopped before closed-loop collection")
+text = stat_path.read_text(encoding="ascii")
+right = text.rfind(")")
+fields = text[right + 2:].split() if right >= 0 else []
+if len(fields) < 20 or fields[19] != expected_start:
+    raise SystemExit("radar PID was reused or changed identity")
+PY
+}
+
+wait_for_radar_stop_and_flush() {
+  python3 - "$RADAR_PID" "$RADAR_PID_START" "$RADAR_STOP_TIMEOUT_SEC" "$RADAR_LOG" <<'PY'
+from pathlib import Path
+import math
+import os
+import sys
+import time
+
+pid, expected_start, timeout_text, log_text = sys.argv[1:]
+timeout = float(timeout_text)
+if not math.isfinite(timeout) or timeout <= 0:
+    raise SystemExit("radar stop timeout is invalid")
+proc_stat = Path("/proc") / pid / "stat"
+log_path = Path(log_text)
+deadline = time.monotonic() + timeout
+while proc_stat.exists():
+    text = proc_stat.read_text(encoding="ascii")
+    right = text.rfind(")")
+    fields = text[right + 2:].split() if right >= 0 else []
+    if len(fields) < 20 or fields[19] != expected_start:
+        raise SystemExit("radar PID was reused before flush verification")
+    if time.monotonic() >= deadline:
+        raise SystemExit("radar process did not stop within the bounded flush timeout")
+    time.sleep(min(0.1, deadline - time.monotonic()))
+
+stable_size = None
+stable_observations = 0
+while time.monotonic() < deadline:
+    if log_path.is_symlink() or not log_path.is_file():
+        raise SystemExit("radar log became invalid during flush verification")
+    size = log_path.stat().st_size
+    if size == stable_size:
+        stable_observations += 1
+    else:
+        stable_size = size
+        stable_observations = 1
+    if stable_observations >= 3:
+        print(size)
+        break
+    time.sleep(min(0.1, deadline - time.monotonic()))
+else:
+    raise SystemExit("radar log did not become stable after process stop")
+PY
+}
+
 run_closed_loop() {
   local gain="$1"
+  require_same_radar_process || die "radar process identity is not valid for closed loop"
+  if [[ "$CLOSED_LOOP_SOURCE" == "bench" ]]; then
+    confirm_stage "confirmed_blue_l1_fcyqtc_transmitter" \
+      "transmitter configured as confirmed BLUE/L1/fcYqTC source for RED receiver"
+    audit_event "confirmed_source" "closed_loop" "bench BLUE L1 fcYqTC cmd_id=2566"
+  else
+    audit_event "confirmed_source" "closed_loop" \
+      "replay BLUE L1 fcYqTC sha256=$CONFIRMED_L1_SHA256"
+  fi
   confirm_stage "closed_loop" "ROS closed loop ($CLOSED_LOOP_SOURCE, confirmed L1)"
   local stage_dir="$OUT_DIR/closed_loop"
   local launch_log="$stage_dir/receiver.log"
@@ -990,13 +1343,20 @@ run_closed_loop() {
       </dev/null >"$launch_log" 2>&1 &
   else
     local fallback_self_id
+    local closed_iq_max_bytes
     if [[ "$OWN_TEAM" == "RED" ]]; then fallback_self_id=9; else fallback_self_id=109; fi
     mkdir -- "$stage_dir/iq"
+    closed_iq_max_bytes="$(iq_limit_for_duration "$CLOSED_LOOP_DURATION_SEC")" \
+      || die "closed-loop IQ limit calculation failed"
+    ensure_window_space "$stage_dir/iq" "$closed_iq_max_bytes" \
+      || die "insufficient disk space for closed-loop IQ"
     setsid ros2 launch sdr_receiver_py_wrapper competition_receiver.launch.py \
       initial_rx_gain:="$gain" \
       record_iq:=true \
       iq_record_dir:="$stage_dir/iq" \
       iq_record_prefix:=closed_loop \
+      iq_record_max_sec:="$(python3 -c 'import sys; print(float(sys.argv[1]) + 60)' "$CLOSED_LOOP_DURATION_SEC")" \
+      iq_record_max_bytes:="$closed_iq_max_bytes" \
       fallback_self_id:="$fallback_self_id" \
       enable_fallback_topics:=true \
       key_retry_limit:=1 \
@@ -1016,6 +1376,11 @@ run_closed_loop() {
     die "closed-loop receiver exited before collection ended"
   fi
   stop_launch
+
+  confirm_stage "radar_stopped_log_flushed" \
+    "radar main cleanly stopped and its current log flushed"
+  wait_for_radar_stop_and_flush >/dev/null \
+    || die "radar process/log flush verification failed"
 
   local radar_end_size
   radar_end_size="$(stat -c %s -- "$RADAR_LOG")"
@@ -1056,7 +1421,13 @@ else:
 
 radar_text = Path(radar_path).read_text(encoding="utf-8", errors="replace")
 patterns = [
-    ("callback", re.compile(r"Received JamCode[^\n]*command_id:\s*0x0*A06", re.I)),
+    (
+        "callback",
+        re.compile(
+            r"Received JamCode[^\n]*command_id:\s*(?:0x0*A06|0x2566)(?![0-9A-Fa-f])",
+            re.I,
+        ),
+    ),
     ("ascii_key", re.compile(r"ASCII Key:\s*\[fcYqTC\]")),
     ("stored", re.compile(r"Stored password:")),
     ("phase2", re.compile(r"key phase 2 start")),
@@ -1134,6 +1505,7 @@ main() {
   validate_execute_args
   create_output_dir
   write_metadata
+  preflight_disk
   audit_event "run_start" "run" "execute"
 
   local final_full_chain_gain=""
