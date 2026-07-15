@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import sdr_receiver_py_wrapper.decoder_benchmark as benchmark_module
 from sdr_receiver_py_wrapper.decoder_benchmark import (
     BenchmarkDiagnostics,
     BenchmarkError,
@@ -57,11 +58,20 @@ class FakeDecoder:
         self.seen: list[tuple[int, int, str, int, bool, bool]] = []
         self._counters = BenchmarkDiagnostics(ac=0, sof=0, crc8=0, crc16=0)
         self._emitted = False
+        self.seen_contexts = []
 
     def reset(self, reason, context) -> None:
         self.reset_context = context
 
     def decode(self, chunk, context):
+        self.seen_contexts.append(
+            (
+                context.team,
+                context.target,
+                context.profile,
+                context.context_version,
+            )
+        )
         before = hashlib.sha256(chunk.samples.tobytes()).hexdigest()
         self.seen.append(
             (
@@ -139,8 +149,10 @@ def test_same_source_metadata_and_private_iq_reach_each_decoder(tmp_path):
 
     report = _run(tmp_path, mutator, observer)
 
-    assert report["success"] is True
-    assert mutator.seen == observer.seen
+    assert report["success"] is False
+    assert report["decoders"][0]["status"] == "error"
+    assert report["decoders"][1]["status"] == "passed"
+    assert mutator.seen == observer.seen[:1]
     assert all(owns and not writeable for *_, owns, writeable in observer.seen)
     assert [entry[:2] for entry in observer.seen] == [(0, 0), (1, 4)]
     expected_hashes = [
@@ -149,17 +161,14 @@ def test_same_source_metadata_and_private_iq_reach_each_decoder(tmp_path):
     ]
     assert [entry[2] for entry in observer.seen] == expected_hashes
 
-    by_name = {entry["decoder"]: entry for entry in report["decoders"]}
-    for decoder in ("upstream", "improved_v67"):
-        result = by_name[decoder]
-        assert result["status"] == "passed"
-        assert result["first_key_time_s"] == pytest.approx(1.25)
-        assert result["ac"] == 2
-        assert result["sof"] == 4
-        assert result["crc8"] == 6
-        assert result["crc16"] == 8
-        assert result["cpu_time_ns"] == 20
-        assert result["peak_queue_depth"] == 1
+    result = report["decoders"][1]
+    assert result["first_key_time_s"] == pytest.approx(1.25)
+    assert result["ac"] == 2
+    assert result["sof"] == 4
+    assert result["crc8"] == 6
+    assert result["crc16"] == 8
+    assert result["cpu_time_ns"] == 20
+    assert result["peak_queue_depth"] == 1
 
 
 def test_mismatched_or_duplicate_oracle_results_fail_without_fake_success(
@@ -336,6 +345,162 @@ def test_unrelated_diagnostic_commands_do_not_conflict_with_oracle(tmp_path):
     assert result["oracle_matches"] == 1
     assert result["expected_cmd_conflicts"] == 0
     assert result["mismatch_reasons"] == []
+
+
+@pytest.mark.parametrize("level", [None, 2, True])
+def test_expected_command_must_pass_production_validation_for_fixture_level(
+    tmp_path,
+    level,
+):
+    decoder = FakeDecoder("upstream")
+    peer = FakeDecoder("improved_v67")
+    original_decode = decoder.decode
+
+    def decode_bad_evidence(chunk, context):
+        commands = original_decode(chunk, context)
+        if not commands:
+            return []
+        evidence = {} if level is None else {"level": level}
+        return [replace(commands[0], evidence=evidence)]
+
+    decoder.decode = decode_bad_evidence
+
+    result = _run(tmp_path, decoder, peer)["decoders"][0]
+
+    assert result["status"] == "mismatch"
+    assert result["oracle_matches"] == 0
+    assert result["expected_cmd_conflicts"] == 1
+
+
+def test_source_is_snapshotted_before_factory_can_replace_path(tmp_path):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    original_hash = hashlib.sha256(samples.tobytes()).hexdigest()
+    first = FakeDecoder("upstream")
+    second = FakeDecoder("improved_v67")
+
+    def replacing_factory():
+        replacement = np.full(32, np.complex64(88 + 77j))
+        iq_path.write_bytes(replacement.tobytes())
+        return first
+
+    report = run_benchmark(
+        iq_path=iq_path,
+        fixture_name=iq_path.name,
+        fixture=_fixture(samples),
+        decoder_names=("upstream", "improved_v67"),
+        decoder_registry={
+            "upstream": replacing_factory,
+            "improved_v67": lambda: second,
+        },
+        chunk_samples=4,
+        cpu_clock_ns=iter(range(0, 1_000_000, 10)).__next__,
+    )
+
+    assert report["success"] is True
+    assert report["iq_sha256"] == original_hash
+    assert all(entry[2] != hashlib.sha256(iq_path.read_bytes()).hexdigest()
+               for entry in second.seen)
+    assert [entry[2] for entry in first.seen] == [
+        hashlib.sha256(samples[start:start + 4].tobytes()).hexdigest()
+        for start in (0, 4)
+    ]
+
+
+def test_exposed_metadata_and_samples_cannot_poison_peer(tmp_path):
+    attacker = FakeDecoder("upstream")
+    observer = FakeDecoder("improved_v67")
+
+    def malicious_decode(chunk, context):
+        object.__setattr__(context, "team", "RED")
+        object.__setattr__(chunk, "first_sample_index", 999)
+        chunk.samples.flags.writeable = True
+        chunk.samples[:] = np.complex64(55 + 44j)
+        return []
+
+    attacker.decode = malicious_decode
+
+    report = _run(tmp_path, attacker, observer)
+
+    assert report["success"] is False
+    assert report["decoders"][0]["status"] == "error"
+    assert "mutated" in report["decoders"][0]["error"]
+    assert observer.seen_contexts == [
+        ("BLUE", "L1", "BLUE-L1", 1),
+        ("BLUE", "L1", "BLUE-L1", 1),
+    ]
+    assert [entry[:2] for entry in observer.seen] == [(0, 0), (1, 4)]
+
+
+def test_reset_context_mutation_is_detected_without_reaching_peer(tmp_path):
+    attacker = FakeDecoder("upstream")
+    observer = FakeDecoder("improved_v67")
+
+    def malicious_reset(reason, context):
+        object.__setattr__(context, "target", "L3")
+
+    attacker.reset = malicious_reset
+
+    report = _run(tmp_path, attacker, observer)
+
+    assert report["decoders"][0]["status"] == "error"
+    assert "reset context" in report["decoders"][0]["error"]
+    assert report["decoders"][1]["status"] == "passed"
+
+
+def test_diagnostics_are_snapshotted_before_later_plugin_mutates_alias(
+    tmp_path,
+):
+    shared = BenchmarkDiagnostics(ac=1, sof=2, crc8=3, crc16=4)
+    first = FakeDecoder("upstream")
+    second = FakeDecoder("improved_v67")
+    first.benchmark_diagnostics = lambda: shared
+
+    def mutate_shared():
+        object.__setattr__(shared, "ac", 999)
+        return BenchmarkDiagnostics(ac=5, sof=6, crc8=7, crc16=8)
+
+    second.benchmark_diagnostics = mutate_shared
+
+    report = _run(tmp_path, first, second)
+
+    assert report["success"] is True
+    assert report["decoders"][0]["ac"] == 1
+    assert report["decoders"][0]["sof"] == 2
+    assert report["decoders"][1]["ac"] == 5
+
+
+@pytest.mark.parametrize(
+    "samples, message",
+    [
+        (np.asarray([], dtype=np.complex64), "at least one"),
+        (np.asarray([complex(float("nan"), 0)], dtype=np.complex64), "finite"),
+        (np.asarray([complex(float("inf"), 0)], dtype=np.complex64), "finite"),
+        (
+            np.asarray([complex(0, -float("inf"))], dtype=np.complex64),
+            "finite",
+        ),
+    ],
+)
+def test_invalid_iq_is_rejected_before_any_factory(tmp_path, samples, message):
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    calls = []
+
+    with pytest.raises(BenchmarkError, match=message):
+        run_benchmark(
+            iq_path=iq_path,
+            fixture_name=iq_path.name,
+            fixture=_fixture(samples),
+            decoder_names=("upstream", "improved_v67"),
+            decoder_registry={
+                "upstream": lambda: calls.append("upstream"),
+                "improved_v67": lambda: calls.append("improved_v67"),
+            },
+        )
+
+    assert calls == []
 
 
 def test_rejects_unconfirmed_hash_mismatch_and_misaligned_iq(tmp_path):
@@ -581,6 +746,185 @@ def test_default_cli_does_not_pretend_missing_production_backends_work(
 
     assert exit_code != 0
     assert json.loads(out_path.read_text(encoding="utf-8"))["success"] is False
+
+
+def test_console_discovers_audited_entry_point_factories_end_to_end(
+    tmp_path,
+    monkeypatch,
+):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                iq_path.name: {
+                    "format": "complex64-le",
+                    "sample_rate_hz": 4,
+                    "team": "BLUE",
+                    "target": "L1",
+                    "verification": "confirmed",
+                    "sha256": _fixture(samples).sha256,
+                    "expected_cmd_id": 0x0A06,
+                    "expected_ascii": "fcYqTC",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "result.json"
+
+    class EntryPoint:
+        def __init__(self, name, factory):
+            self.name = name
+            self.group = benchmark_module.DECODER_ENTRY_POINT_GROUP
+            self._factory = factory
+
+        def load(self):
+            return self._factory
+
+    class EntryPoints(tuple):
+        def select(self, *, group):
+            return EntryPoints(ep for ep in self if ep.group == group)
+
+    providers = EntryPoints(
+        (
+            EntryPoint("upstream", lambda: FakeDecoder("upstream")),
+            EntryPoint(
+                "improved_v67",
+                lambda: FakeDecoder("improved_v67"),
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        benchmark_module.importlib_metadata,
+        "entry_points",
+        lambda: providers,
+    )
+
+    exit_code = main(
+        [
+            "--iq",
+            str(iq_path),
+            "--manifest",
+            str(manifest_path),
+            "--decoders",
+            "upstream,improved_v67",
+            "--out",
+            str(out_path),
+            "--chunk-samples",
+            "4",
+        ],
+        cpu_clock_ns=iter(range(0, 1_000_000, 10)).__next__,
+    )
+
+    assert exit_code == 0
+    assert json.loads(out_path.read_text(encoding="utf-8"))["success"] is True
+
+
+def test_duplicate_entry_point_provider_is_a_stable_cli_error(
+    tmp_path,
+    monkeypatch,
+):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({iq_path.name: _fixture_entry(samples)}),
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "result.json"
+
+    class EntryPoint:
+        name = "upstream"
+        group = "sdr_receiver_py_wrapper.decoder_plugins"
+
+        def load(self):
+            return lambda: FakeDecoder("upstream")
+
+    class EntryPoints(tuple):
+        def select(self, *, group):
+            return self
+
+    monkeypatch.setattr(
+        benchmark_module.importlib_metadata,
+        "entry_points",
+        lambda: EntryPoints((EntryPoint(), EntryPoint())),
+    )
+
+    exit_code = main(
+        [
+            "--iq", str(iq_path),
+            "--manifest", str(manifest_path),
+            "--decoders", "upstream,improved_v67",
+            "--out", str(out_path),
+        ]
+    )
+
+    assert exit_code == 2
+    report = json.loads(out_path.read_text(encoding="utf-8"))
+    assert report["success"] is False
+    assert "duplicate" in report["error"]
+
+
+def _fixture_entry(samples):
+    fixture = _fixture(samples)
+    return {
+        "format": fixture.format,
+        "sample_rate_hz": fixture.sample_rate_hz,
+        "team": fixture.team,
+        "target": fixture.target,
+        "verification": fixture.verification,
+        "sha256": fixture.sha256,
+        "expected_cmd_id": fixture.expected_cmd_id,
+        "expected_ascii": fixture.expected_ascii,
+    }
+
+
+def test_iq_size_limit_is_checked_before_factory(tmp_path, monkeypatch):
+    samples = _samples()
+    iq_path = tmp_path / "RX_BLUE_ganrao_1"
+    iq_path.write_bytes(samples.tobytes())
+    calls = []
+    monkeypatch.setattr(benchmark_module, "MAX_IQ_BYTES", 8)
+
+    with pytest.raises(BenchmarkError, match="size limit"):
+        run_benchmark(
+            iq_path=iq_path,
+            fixture_name=iq_path.name,
+            fixture=_fixture(samples),
+            decoder_names=("upstream", "improved_v67"),
+            decoder_registry={
+                "upstream": lambda: calls.append(1),
+                "improved_v67": lambda: calls.append(2),
+            },
+        )
+
+    assert calls == []
+
+
+def test_report_fsyncs_parent_directory_on_supported_platform(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        benchmark_module,
+        "_supports_directory_fsync",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "_fsync_directory",
+        lambda parent: calls.append(parent),
+    )
+    out = tmp_path / "report.json"
+
+    benchmark_module._write_report(out, {"success": False})
+
+    assert calls == [tmp_path]
 
 
 def test_setup_registers_decoder_benchmark_console_script():
