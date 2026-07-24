@@ -1,0 +1,3 @@
+# Tool-generated caches (not part of project source)
+.codegraph/
+.pytest_cache/
